@@ -61,9 +61,6 @@ title/position/size). This app:
 4. closes the clicked window by pressing its real close button via the
    Accessibility API. Mission Control stays open and re-flows.
 
-This is the same overlay technique Mission Control Plus is understood to use —
-no SIP changes, no code injection.
-
 Closing fullscreen windows needs extra machinery: apps stop reporting their
 AX windows entirely while Mission Control is open, and most only report
 current-space windows even normally. The app therefore keeps an accumulative
