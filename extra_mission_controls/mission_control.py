@@ -307,22 +307,20 @@ class MissionControlButtons(NSObject):
         spaces = ax.mission_control_spaces(group)
         self._log_geometry(group, thumbs, spaces)
 
-        # Suppress buttons whenever the layout is animating. Opening Mission
-        # Control, panning between spaces, and sliding into a fullscreen space
-        # all move the tiles/thumbnails (the Spaces Bar can hold still while the
-        # window thumbnails slide across and off screen). Placing buttons then
-        # makes them chase moving elements to the wrong, unclickable spot. Only
-        # place buttons once two consecutive frames are identical (still).
-        layout = self._layout_positions(spaces, thumbs)
-        moving = layout != self._prev_layout
-        self._prev_layout = layout
-        if moving:
-            return []
-
-        # Only place buttons in the settled overview, where the Spaces Bar is
-        # expanded at the top; otherwise it is collapsed off the top edge.
-        if not self._bar_settled(spaces):
-            return []
+        # Track the Spaces Bar and the window thumbnails for motion SEPARATELY.
+        # They animate independently: opening Mission Control and panning move
+        # the window thumbnails, while hovering the top slides the bar in/out
+        # without touching the windows. A button is only placed once its own
+        # layer holds still (two identical consecutive frames), so window ✕
+        # stay put while the bar slides and vice-versa — never chasing a moving
+        # element to a wrong, unclickable spot.
+        spaces_sig, thumbs_sig = self._layout_positions(spaces, thumbs)
+        prev = self._prev_layout
+        self._prev_layout = (spaces_sig, thumbs_sig)
+        if prev is None:
+            return []  # first frame after (re)activation: establish baseline
+        spaces_still = spaces_sig == prev[0]
+        thumbs_still = thumbs_sig == prev[1]
 
         # Distinguish an empty desktop overview from a fullscreen/split-space
         # view — the two states are otherwise identical in the AX tree, but in
@@ -335,9 +333,19 @@ class MissionControlButtons(NSObject):
         if not on_screen and ax.mission_control_window_count(group) > 0:
             return []
 
-        targets = [("window", thumb)
-                   for thumb in on_screen
-                   if ("window", thumb["title"]) not in self._recently_closed]
+        # Window-thumbnail ✕ do not depend on the Spaces Bar: they show as soon
+        # as the window layer is still, even while the bar is collapsed.
+        targets = []
+        if thumbs_still:
+            targets = [("window", thumb)
+                       for thumb in on_screen
+                       if ("window", thumb["title"]) not in self._recently_closed]
+
+        # Bar-tile ✕ only exist while the bar is still AND expanded at the top
+        # of the screen; collapsed tiles sit above the screen edge (negative y)
+        # so there is nowhere to draw them until the user hovers the bar open.
+        if not (spaces_still and self._bar_settled(spaces)):
+            return targets
         for space in spaces:
             if not self._on_screen(space):
                 continue
