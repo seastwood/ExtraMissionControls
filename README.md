@@ -5,7 +5,7 @@
 <h1 align="center">ExtraMissionControls</h1>
 
 <p align="center">
-  Close buttons for macOS Mission Control
+  Close buttons for macOS Mission Control <br></br>
   close any window or fullscreen space right from the overview.
 </p>
 
