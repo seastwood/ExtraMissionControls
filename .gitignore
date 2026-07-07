@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Build output
+build/
+dist/
+assets/icon.iconset/
+
+# Editors / local tooling
+.idea/
+.claude/
+.DS_Store
+
+# Never commit signing material
+*.p12
+*.pem
+
