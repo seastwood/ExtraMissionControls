@@ -81,24 +81,72 @@ Steam), the ✕ raises the window, clicks its real traffic-light close button
 with a synthetic mouse click — guarded by a frontmost-window check, cursor
 restored — and puts you back into Mission Control afterwards.
 
-## Requirements
-
-- macOS 13+ (developed on macOS 26)
-- Python 3.9+ with [PyObjC](https://pyobjc.readthedocs.io/) (development)
-- Or just install the DMG
-
 ## Install
 
-**From the DMG:** build or download `ExtraMissionControls-<version>.dmg`,
-drag the app to Applications, launch it, and grant the permissions below.
+Requires macOS 13 or later (developed and tested on macOS 26).
 
-**From source:**
+### 1. Download
+
+Grab the latest `ExtraMissionControls-<version>.dmg` from the
+**[Releases page](../../releases)**.
+
+### 2. Install
+
+Open the DMG and drag **ExtraMissionControls** into the **Applications**
+folder.
+
+### 3. First launch (unsigned-app hoop, one time only)
+
+This is a free, open-source app and is **not notarized by Apple** (that
+requires a paid Apple Developer subscription), so macOS blocks the very first
+launch. Getting past it is a one-time step:
+
+**macOS 15 Sequoia and later** (the right-click trick no longer works):
+
+1. Double-click the app once — macOS shows *"Apple could not verify…"* /
+   *"was not opened"*. Click **Done**.
+2. Open **System Settings → Privacy & Security**, scroll to the bottom — you
+   will see *"ExtraMissionControls" was blocked…* Click **Open Anyway**.
+3. Confirm **Open Anyway** in the dialog (authenticate if asked).
+
+**macOS 13–14:** right-click (Control-click) the app in Applications →
+**Open** → **Open**.
+
+Every later launch opens normally.
+
+### 4. Grant permissions
+
+The app prompts for both on first launch; grant them in
+**System Settings → Privacy & Security**:
+
+| Permission | Why the app needs it | Without it |
+|---|---|---|
+| **Accessibility** | Detecting Mission Control, receiving ✕ clicks, pressing windows' close buttons | Nothing works |
+| **Screen Recording** | Window *titles* only (matches thumbnails to windows in fallback close paths) — nothing is recorded | Apps with broken accessibility (e.g. Steam) can't be closed |
+
+Then **quit and relaunch the app** (menu-bar icon → Quit) — macOS applies
+permissions only to newly launched processes.
+
+That's it: the grid icon sits in your menu bar; open Mission Control and
+every window gets its ✕.
+
+**Updating:** just replace the app with the one from a newer DMG — builds are
+signed with a stable identity, so your permissions carry over.
+
+## Development
+
+### From source
 
 ```sh
+git clone https://github.com/seastwood/ExtraMissionControls.git
+cd ExtraMissionControls
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python main.py
 ```
+
+Python 3.9+ with [PyObjC](https://pyobjc.readthedocs.io/) (installed by
+`requirements.txt`).
 
 ### Running from PyCharm
 
@@ -107,20 +155,9 @@ python3 -m venv .venv
    pick `.venv/bin/python`.
 3. Run `main.py`.
 
-### Permissions (important!)
-
-Granted to **whichever app launches the Python process** — PyCharm during
-development, ExtraMissionControls.app when installed from the DMG:
-
-| Permission | Grants | Without it |
-|---|---|---|
-| **Accessibility** | Mission Control detection, click interception, closing windows | Nothing works |
-| **Screen Recording** | Window titles in the CG window list, used to match thumbnails to windows in the fallback close paths | Apps with broken accessibility (e.g. Steam) can't be closed |
-
-Grant both in **System Settings → Privacy & Security**, then fully restart
-the launching app — permissions only apply to newly launched processes. The
-app prompts for both on first launch and prints a console warning when either
-is missing.
+When running from source, the permissions above must be granted to
+**whichever app launches the Python process** (PyCharm or your terminal),
+and that app must be fully restarted after granting.
 
 ## Building the DMG
 
@@ -160,9 +197,10 @@ ad-hoc build, grant the permissions once more (and remove any stale
 ExtraMissionControls entries in System Settings → Privacy & Security first).
 Every update after that keeps them.
 
-**Gatekeeper:** a self-signed app isn't notarized, so the first launch is
-blocked — right-click the app → **Open** (once). For clean distribution to
-others, use a Developer ID certificate and notarize.
+**Gatekeeper:** a self-signed app isn't notarized, so macOS blocks the first
+launch — see [First launch](#3-first-launch-unsigned-app-hoop-one-time-only)
+above for the one-time steps. Distribution without that hoop would require a
+paid Developer ID certificate and notarization.
 
 ## Testing
 
