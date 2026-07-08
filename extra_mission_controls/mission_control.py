@@ -139,26 +139,44 @@ class MissionControlButtons(NSObject):
         self._pending_close_attempts = 0
         self._pending_close_window = None
         self._pending_close_exit_title = None
-        self._verify_title = None
-        self._verify_element = None
-        self._exit_close_title = None
-        self._exit_close_attempts = 0
         # Remaining split members to close after the current pending close
         # (the ✕2 button closes every app of a Split View tile in sequence).
         self._after_close_queue = []
         # Split halves no-op the AX close press, so ✕2 chains skip straight
         # to the traffic-light click; solo fullscreen tiles keep press-first.
         self._chain_click_first = False
-        # {app name: (window el, close el, ax title)} — windows
-        # un-fullscreened in place (AXRemoveDesktop) whose close is
-        # finished/re-verified once MC exits.
+        # {app name: (window el, close el, ax title)} — fullscreen closes
+        # deferred until Mission Control exits (closing in place ghosts the
+        # tile); applied/verified/escalated by processDeferredCloses.
         self._deferred_close = {}
+        self._deferred_verify_title = None
+        self._deferred_exit_title = None
         # (kind, title) -> deadline; keeps a just-closed target's ✕ from
         # flashing back during Mission Control's re-layout animation.
         self._recently_closed = {}
         # [(action, title)] window closes/minimizes queued to run once Mission
         # Control is dismissed (closing in place leaves a ghost thumbnail).
         self._deferred_actions = []
+        # Synthetic traffic-light clicks for AX-opaque windows (Steam etc.)
+        # whose deferred AX close/minimize no-oped — [(action, title, pid, x, y)].
+        self._tl_queue = []
+        self._tl_pending = None
+        # App names whose (just un-fullscreened) main window is closed on MC
+        # exit, by name with retries while the window un-parks.
+        self._deferred_app_closes = []
+        self._app_close_attempts = 0
+        # To scrim the desktop thumbnail a closed full-screen app reappears as
+        # (its title is unpredictable): the thumbnail titles present when the ✕
+        # was clicked, so a title that appears afterwards can be marked.
+        self._prev_thumb_titles = set()
+        self._pending_unfs_baseline = None
+        self._pending_unfs_expires = 0.0
+        # Make-fullscreen (⤢) after MC exits: AX full-screen button, then a
+        # green-button click fallback (the ⌃⌘F shortcut is ignored by
+        # Electron/CEF apps). Staged across steps via these.
+        self._fs_make_title = None
+        self._fs_make_rect = None
+        self._fs_make_owner = None
         # {title: glyph} thumbnails marked for a deferred action — shown with a
         # dim overlay so it is clear which windows will close on exit.
         self._marked = {}
@@ -172,11 +190,7 @@ class MissionControlButtons(NSObject):
                     fh.write("ExtraMissionControls geometry log\n")
             except OSError:
                 pass
-        if self._timer is None:
-            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                _DETECT_INTERVAL, self, "tick:", None, True)
-            # Let macOS coalesce the idle wake-ups with other system work.
-            self._timer.setTolerance_(0.15)
+        self._start_detect_timer()
         center = NSWorkspace.sharedWorkspace().notificationCenter()
         center.addObserver_selector_name_object_(
             self, "spaceChanged:", NSWorkspaceActiveSpaceDidChangeNotification, None)
@@ -186,12 +200,38 @@ class MissionControlButtons(NSObject):
         center.addObserver_selector_name_object_(
             self, "appActivated:",
             "NSWorkspaceDidActivateApplicationNotification", None)
+        # Stop the detect poll entirely while the display sleeps — Mission
+        # Control can't be opened then, so there is nothing to look for.
+        center.addObserver_selector_name_object_(
+            self, "screensSlept:", "NSWorkspaceScreensDidSleepNotification", None)
+        center.addObserver_selector_name_object_(
+            self, "screensWoke:", "NSWorkspaceScreensDidWakeNotification", None)
 
-    def stop(self):
-        NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(self)
+    @objc.python_method
+    def _start_detect_timer(self):
+        if self._timer is None:
+            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                _DETECT_INTERVAL, self, "tick:", None, True)
+            # Let macOS coalesce the idle wake-ups with other system work.
+            self._timer.setTolerance_(0.15)
+
+    @objc.python_method
+    def _stop_detect_timer(self):
         if self._timer is not None:
             self._timer.invalidate()
             self._timer = None
+
+    def screensSlept_(self, note):
+        if self._active:
+            self._deactivate()
+        self._stop_detect_timer()
+
+    def screensWoke_(self, note):
+        self._start_detect_timer()
+
+    def stop(self):
+        NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(self)
+        self._stop_detect_timer()
         if self._active:
             self._deactivate()
 
@@ -244,16 +284,23 @@ class MissionControlButtons(NSObject):
         self._last_registry_scan = 0.0  # spaces likely changed; rescan soon
         self._recently_closed = {}  # session-scoped suppression ends with MC
         self._marked = {}           # dim overlays clear with MC
+        self._pending_unfs_baseline = None
         if self._deferred_actions:
             # Window closes/minimizes clicked during Mission Control land now,
             # with Mission Control gone, so they leave no ghost thumbnail.
             self.performSelector_withObject_afterDelay_(
                 "applyDeferredActions", None, 0.35)
         if self._deferred_close:
-            # Apps expose AX again shortly after Mission Control closes;
-            # finish/verify any in-place fullscreen closes then.
+            # Apps expose (and un-park) their AX windows shortly after Mission
+            # Control closes; apply any deferred fullscreen closes then.
             self.performSelector_withObject_afterDelay_(
                 "processDeferredCloses", None, 0.9)
+        if self._deferred_app_closes:
+            # Un-fullscreened apps: close their main window by name once MC is
+            # gone and the window has un-parked (applyDeferredAppCloses retries).
+            self._app_close_attempts = 0
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredAppCloses", None, 0.5)
 
     def syncTick_(self, timer):
         try:
@@ -326,6 +373,21 @@ class MissionControlButtons(NSObject):
         spaces = ax.mission_control_spaces(group)
         self._log_geometry(group, thumbs, spaces)
 
+        # A full-screen app closed from the Spaces Bar un-fullscreens in place
+        # and reappears as a desktop thumbnail with an unpredictable title. Mark
+        # whichever thumbnail title shows up that wasn't present when the ✕ was
+        # clicked, so it gets the centred ✕ scrim like a desktop close.
+        current_titles = {t["title"] for t in thumbs if t["title"]}
+        if self._pending_unfs_baseline is not None:
+            if now < self._pending_unfs_expires:
+                for title in current_titles - self._pending_unfs_baseline:
+                    if title not in self._marked:
+                        self._marked[title] = "✕"
+                        _geom_log("UNFS-SCRIM: %r reappeared -> marked" % title)
+            else:
+                self._pending_unfs_baseline = None
+        self._prev_thumb_titles = current_titles
+
         # Track the Spaces Bar and the window thumbnails for motion SEPARATELY.
         # They animate independently: opening Mission Control and panning move
         # the window thumbnails, while hovering the top slides the bar in/out
@@ -361,7 +423,7 @@ class MissionControlButtons(NSObject):
         targets, marks = [], []
         if thumbs_still:
             for thumb in on_screen:
-                glyph = self._marked.get(thumb["title"])
+                glyph = self._mark_glyph_for(thumb["title"])
                 if glyph is not None:
                     marks.append((thumb, glyph))
                     continue
@@ -383,6 +445,10 @@ class MissionControlButtons(NSObject):
                 continue
             if ("acted", space["title"]) in self._recently_closed:
                 continue
+            glyph = self._mark_glyph_for(space["title"])
+            if glyph is not None:  # queued for a deferred close → dim scrim
+                marks.append((space, glyph))
+                continue
             apps = self._split_apps(space)
             if apps:
                 # Split View: closing one half reliably is not possible (most
@@ -398,6 +464,19 @@ class MissionControlButtons(NSObject):
             targets.append(("unfullscreen",
                             self._slot(space, 1, "❏", ui.HOVER_GREEN)))
         return targets, marks
+
+    @objc.python_method
+    def _mark_glyph_for(self, title):
+        """The dim-scrim glyph for a tile/thumbnail title, or None. Exact match
+        first, else a UNIQUE prefix relation — a full-screen app un-fullscreened
+        by the ✕ reappears as a desktop thumbnail whose title the Dock may
+        shorten relative to the window's AX title we marked it under."""
+        glyph = self._marked.get(title)
+        if glyph is not None:
+            return glyph
+        related = [g for t, g in self._marked.items()
+                   if ax.titles_related(title, t)]
+        return related[0] if len(related) == 1 else None
 
     @objc.python_method
     def _slot(self, tile, slot, label=None, hover=None):
@@ -789,7 +868,108 @@ class MissionControlButtons(NSObject):
             else:
                 ok = (ax.close_window_by_title(title, pids)
                       or self._press_held_window(title, infos))
+            if not ok:
+                # AX-opaque window (Steam and other CEF/game windows expose no
+                # close/minimize button): fall back to a synthetic click on the
+                # native traffic light, queued so we can raise then click.
+                info = self._match_window_info(title, infos)
+                if info is not None:
+                    self._tl_queue.append(
+                        (action, title, info.pid, info.x, info.y))
             _geom_log("APPLY-DEFERRED %s %r -> %s" % (action, title, ok))
+        if self._tl_queue:
+            self.performSelector_withObject_afterDelay_(
+                "processTrafficLightQueue", None, 0.05)
+
+    @objc.python_method
+    def _match_window_info(self, title, infos):
+        """The on-screen CG window best matching a thumbnail title — exact
+        title or owner, else a unique prefix relation (the Dock shortens the
+        titles it shows, and a window may be owned by a helper process, e.g.
+        Steam's visible window belongs to 'Steam Helper')."""
+        exact = [i for i in infos if title in (i.title, i.owner)]
+        if exact:
+            return exact[0]
+        related = [i for i in infos
+                   if ax.titles_related(title, i.title)
+                   or ax.titles_related(title, i.owner)]
+        return related[0] if len(related) == 1 else None
+
+    def processTrafficLightQueue(self):
+        if not self._tl_queue:
+            return
+        action, title, pid, x, y = self._tl_queue[0]
+        # These windows ignore clicks unless active — raise the app first, then
+        # click after a beat so the raise has landed.
+        ax.activate_pid(pid)
+        self._tl_pending = (action, title, x, y)
+        self.performSelector_withObject_afterDelay_(
+            "clickTrafficLight", None, 0.3)
+
+    def clickTrafficLight(self):
+        pending, self._tl_pending = self._tl_pending, None
+        if self._tl_queue:
+            self._tl_queue.pop(0)
+        if pending is not None:
+            action, title, x, y = pending
+            # Traffic lights sit at the window's top-left corner: close (red)
+            # ~x+20, minimize (yellow) ~x+40, both ~19px below the top edge.
+            cx = x + (40 if action == "minimize" else 20)
+            cy = y + 19
+            self._post_mouse(Quartz.kCGEventMouseMoved, cx, cy)
+            self._post_mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
+            self._post_mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
+            _geom_log("TRAFFIC-LIGHT %s %r at (%.0f,%.0f)"
+                      % (action, title, cx, cy))
+        if self._tl_queue:
+            self.performSelector_withObject_afterDelay_(
+                "processTrafficLightQueue", None, 0.4)
+
+    def applyDeferredAppCloses(self):
+        """Close a just-un-fullscreened app's main window once Mission Control
+        is gone. By name (not title — the AX title changes across the
+        fullscreen→desktop move), retrying while the window finishes un-parking,
+        then a close traffic-light click for AX-opaque apps (Steam)."""
+        if not self._deferred_app_closes:
+            return
+        if ax.mission_control_group() is not None:
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredAppCloses", None, 0.4)
+            return
+        app = self._deferred_app_closes[0]
+        if ax.close_main_window(app):
+            _geom_log("APPLY-APP-CLOSE %r -> closed (attempt %d)"
+                      % (app, self._app_close_attempts))
+            self._finish_app_close(app)
+            return
+        self._app_close_attempts += 1
+        if self._app_close_attempts < 6:  # window may still be un-parking
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredAppCloses", None, 0.4)
+            return
+        _geom_log("APPLY-APP-CLOSE %r -> AX close failed; traffic-light" % app)
+        self._click_app_close(app)
+        self._finish_app_close(app)
+
+    @objc.python_method
+    def _finish_app_close(self, app):
+        if app in self._deferred_app_closes:
+            self._deferred_app_closes.remove(app)
+        self._app_close_attempts = 0
+        if self._deferred_app_closes:
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredAppCloses", None, 0.3)
+
+    @objc.python_method
+    def _click_app_close(self, app_name):
+        info = self._match_window_info(
+            app_name, windows.list_windows(exclude_pid=os.getpid()))
+        if info is None:
+            return False
+        self._tl_queue.append(("close", app_name, info.pid, info.x, info.y))
+        self.performSelector_withObject_afterDelay_(
+            "processTrafficLightQueue", None, 0.05)
+        return True
 
     @objc.python_method
     def _press_held_window(self, title, infos):
@@ -831,28 +1011,71 @@ class MissionControlButtons(NSObject):
         """Send a window thumbnail's window to full screen. A thumbnail has no
         AX 'enter full screen' action, and while Mission Control is open apps
         park their windows so setting AXFullScreen on a held reference is a
-        silent no-op (verified) — there is no way to fullscreen a window while
-        staying in Mission Control. So we AXPress the thumbnail — which focuses
-        that window and leaves Mission Control (you end up looking at it) —
-        then press ⌃⌘F, the system Enter Full Screen shortcut."""
+        silent no-op (verified). So we AXPress the thumbnail — which focuses
+        that window and leaves Mission Control (you end up looking at it) — then
+        CLICK its green full-screen traffic light. The old ⌃⌘F shortcut was
+        ignored by Electron/CEF apps (Claude, Steam) and needed exact focus;
+        the button click works on any app with standard window controls."""
         if element is None:
             return
         self._panels[index].orderOut_(None)
         self._rects.pop(index, None)
         _geom_log("MAKE-FULLSCREEN window=%r" % title)
         ax.press_element(element)  # focus the window, exit Mission Control
+        self._fs_make_title = title
         self.performSelector_withObject_afterDelay_(
-            "sendFullscreenShortcut", None, 0.6)
+            "makeFullscreenStep", None, 0.6)
 
-    def sendFullscreenShortcut(self):
-        # ⌃⌘F = View → Enter Full Screen (system default shortcut).
-        F_KEYCODE = 3
-        flags = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskCommand
-        for down in (True, False):
-            event = Quartz.CGEventCreateKeyboardEvent(None, F_KEYCODE, down)
-            Quartz.CGEventSetFlags(event, flags)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-            time.sleep(0.03)
+    def makeFullscreenStep(self):
+        title = self._fs_make_title
+        self._fs_make_title = None
+        if not title:
+            return
+        # Mission Control has exited and the window is un-parked. Find it and
+        # raise its app frontmost.
+        info = self._match_window_info(
+            title, windows.list_windows(exclude_pid=os.getpid()))
+        if info is None:
+            _geom_log("MAKE-FULLSCREEN %r: no CG window match" % title)
+            return
+        ax.activate_pid(info.pid)
+        self._fs_make_rect = (title, info.x, info.y)
+        self._fs_make_owner = info.owner
+        # Prefer the AX full-screen button — no pixel coordinates, so it works
+        # for apps like Claude whose traffic lights are inset off the standard
+        # position. Verify shortly; if it didn't take (or the window is AX-opaque
+        # like Steam), fall back to a synthetic click on the green button.
+        if ax.fullscreen_window_of(info.owner):
+            self.performSelector_withObject_afterDelay_(
+                "verifyMakeFullscreen", None, 1.0)
+        else:
+            self.clickFullscreenButton()
+
+    def verifyMakeFullscreen(self):
+        data = self._fs_make_rect
+        if not data:
+            return
+        title = data[0]
+        if (ax.find_fullscreen_window(self._fs_make_owner) is not None
+                or ax.find_fullscreen_window_by_title(title) is not None):
+            self._fs_make_rect = None
+            _geom_log("MAKE-FULLSCREEN %r via AX button" % title)
+            return
+        _geom_log("MAKE-FULLSCREEN %r AX no-op; clicking green button" % title)
+        self.clickFullscreenButton()
+
+    def clickFullscreenButton(self):
+        data, self._fs_make_rect = self._fs_make_rect, None
+        if not data:
+            return
+        title, x, y = data
+        # The green full-screen button is the third traffic light: ~x+60, and
+        # ~19px below the window's top edge (close is x+20, minimize x+40).
+        cx, cy = x + 60, y + 19
+        self._post_mouse(Quartz.kCGEventMouseMoved, cx, cy)
+        self._post_mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
+        self._post_mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
+        _geom_log("MAKE-FULLSCREEN click %r at (%.0f,%.0f)" % (title, cx, cy))
 
     @objc.python_method
     def _unfullscreen_tile(self, index, title, element):
@@ -919,96 +1142,42 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _close_fullscreen(self, index, title, element):
+        """Close a full-screen app from the Spaces Bar the way the user prefers:
+        first drop it back to the desktop — the Dock's own AXRemoveDesktop, the
+        same action as the ❏ button, so it stays in Mission Control and the app
+        reappears as an ordinary window thumbnail — then mark THAT thumbnail for
+        a deferred close. It shows the centred ✕ scrim and closes on Mission
+        Control exit, exactly like a window closed from the desktop (no ghost)."""
         entry = self._fullscreen_registry.get(title)
-        _geom_log("CLOSE-FULLSCREEN %r: has_registry=%s" % (title, entry is not None))
-        if os.environ.get("EMC_FORCE_UNFS") and entry is not None:
-            # Test hook: pretend the direct close press no-ops, to exercise
-            # the stay-in-MC AXRemoveDesktop path.
-            self._panels[index].orderOut_(None)
-            self._rects.pop(index, None)
-            self._unfullscreen_and_close_held(title, element, entry)
-            return
-        pressed = entry is not None and ax.press_element(entry[1])
-        if not pressed:
-            # Held reference went stale; try a live lookup (works for apps
-            # that report cross-space windows, e.g. Electron).
-            pressed = ax.close_fullscreen_window(title)
-        if pressed:
-            # The press was delivered, but some apps no-op their close button
-            # while fullscreen. Believe only the Spaces Bar: the tile
-            # disappears once the window is really gone.
+        self._panels[index].orderOut_(None)
+        self._rects.pop(index, None)
+        if element is not None and ax.remove_space(element):
+            _geom_log("CLOSE-FULLSCREEN %r: un-fullscreened, deferring close"
+                      % title)
+            # Suppress the collapsing tile's own buttons during the transition.
             self._recently_closed[("acted", title)] = time.time() + 2.5
-            self._panels[index].orderOut_(None)
-            self._rects.pop(index, None)
-            self._verify_title = title
-            self._verify_element = element
-            self.performSelector_withObject_afterDelay_(
-                "verifyFullscreenPress", None, 1.2)
+            self._fullscreen_registry.pop(title, None)
+            # Scrim the desktop thumbnail it reappears as. Its title is
+            # unpredictable, so _collect_targets marks whichever thumbnail
+            # appears that isn't in this baseline (captured pre-transition).
+            self._pending_unfs_baseline = set(self._prev_thumb_titles)
+            self._pending_unfs_expires = time.time() + 4.0
+            # Reliable close once MC exits: close the app's MAIN window BY NAME.
+            # (Title matching is unreliable for a just-un-fullscreened window —
+            # its AX title often differs from the full-screen-era title we held —
+            # and close_main_window also retries while the window un-parks.)
+            if title not in self._deferred_app_closes:
+                self._deferred_app_closes.append(title)
+            return
+        # AXRemoveDesktop unavailable/failed. Fall back to the held-ref deferred
+        # close, else the switch-to-space close (both leave no ghost).
+        if entry is not None:
+            _geom_log("CLOSE-FULLSCREEN %r: no un-fullscreen; held deferred close"
+                      % title)
+            self._deferred_close[title] = entry
+            self._marked[title] = "✕"
             return
         self._fallback_close_fullscreen(title, element)
-
-    def verifyFullscreenPress(self):
-        title, element = self._verify_title, self._verify_element
-        self._verify_title = None
-        self._verify_element = None
-        if not title:
-            return
-        if not any(s["title"] == title
-                   for s in ax.mission_control_spaces()):
-            self._fullscreen_registry.pop(title, None)  # really closed
-            return
-        _debug("fullscreen close press no-oped for %r" % title)
-        entry = self._fullscreen_registry.get(title)
-        if entry is not None:
-            # Stay in Mission Control: have the Dock un-fullscreen the space
-            # (AXRemoveDesktop), then close the now-normal window through the
-            # held reference.
-            self._unfullscreen_and_close_held(title, element, entry)
-        else:
-            self._recently_closed.pop(("acted", title), None)
-            self._fallback_close_fullscreen(title, element)
-
-    @objc.python_method
-    def _unfullscreen_and_close_held(self, title, element, entry):
-        if element is None or not ax.remove_space(element):
-            self._recently_closed.pop(("acted", title), None)
-            self._fallback_close_fullscreen(title, element)
-            return
-        _debug("AXRemoveDesktop on %r — un-fullscreened in place" % title)
-        self._recently_closed[("acted", title)] = time.time() + 3.0
-        self._fullscreen_registry.pop(title, None)
-        self._deferred_close[title] = entry
-        self._exit_close_title = title
-        self._exit_close_attempts = 4
-        self.performSelector_withObject_afterDelay_(
-            "closeAfterExitFullscreen", None, 1.7)
-
-    def closeAfterExitFullscreen(self):
-        title = self._exit_close_title
-        if not title:
-            return
-        entry = self._deferred_close.get(title)
-        if entry is None:
-            self._exit_close_title = None
-            return
-        window = entry[0]
-        # The traffic lights are recreated when a window leaves fullscreen —
-        # the held close-button ref is stale. Re-read it from the window.
-        button = ax.close_button_of(window) or entry[1]
-        if ax.press_element(button):
-            _debug("pressed close on un-fullscreened %r" % title)
-            self._exit_close_title = None
-            # Entry stays in _deferred_close: verified once MC exits.
-            return
-        self._exit_close_attempts -= 1
-        if self._exit_close_attempts > 0:
-            # Transition still animating, or the app's AX is walled off
-            # while MC is open; try again shortly.
-            self.performSelector_withObject_afterDelay_(
-                "closeAfterExitFullscreen", None, 1.0)
-        else:
-            self._exit_close_title = None
-            _debug("in-MC close of %r failed; finishing after MC exits" % title)
 
     @objc.python_method
     def _fallback_close_fullscreen(self, title, element):
@@ -1165,24 +1334,67 @@ class MissionControlButtons(NSObject):
         time.sleep(0.06)
 
     def processDeferredCloses(self):
-        for title, entry in list(self._deferred_close.items()):
-            self._deferred_close.pop(title, None)
-            window, held_button, ax_title = entry
-            # The window element itself can be recreated by the fullscreen
-            # transition; re-find it now that the app's AX is visible again.
-            if ax.element_alive(window):
-                target = window
-            else:
-                target = ax.find_app_window(title, window, ax_title)
-            if target is None:
-                _debug("deferred close of %r: already gone" % title)
-                continue
-            button = ax.close_button_of(target) or held_button
-            if ax.press_element(button):
-                _debug("deferred close of %r completed" % title)
-            else:
-                print("ExtraMissionControls: could not finish closing %r"
-                      % title)
+        # One title at a time so the verify/escalate steps below can use single
+        # ivars; each finishes by chaining to the next via _next_deferred_close.
+        if not self._deferred_close:
+            return
+        title, entry = next(iter(self._deferred_close.items()))
+        self._deferred_close.pop(title, None)
+        window, held_button, ax_title = entry
+        # The window element can be recreated by the fullscreen transition;
+        # re-find it now that the app's AX is visible again post-exit.
+        if not ax.element_alive(window):
+            window = ax.find_app_window(title, window, ax_title)
+        if window is None:
+            _debug("deferred close of %r: already gone" % title)
+            self._next_deferred_close()
+            return
+        button = ax.close_button_of(window) or held_button
+        if button is not None:
+            ax.press_element(button)
+        self._deferred_verify_title = title
+        self.performSelector_withObject_afterDelay_(
+            "verifyDeferredClose", None, 0.8)
+
+    def verifyDeferredClose(self):
+        title = self._deferred_verify_title
+        self._deferred_verify_title = None
+        if not title:
+            return
+        window = ax.find_fullscreen_target(title)
+        if window is None:  # tile/window gone — the close landed
+            _debug("deferred close of %r completed" % title)
+            self._fullscreen_registry.pop(title, None)
+            self._next_deferred_close()
+            return
+        # The close press was ignored while still fullscreen; un-fullscreen it
+        # (works once Mission Control is gone), then close the normal window.
+        if ax.set_fullscreen(window, False):
+            self._deferred_exit_title = title
+            self.performSelector_withObject_afterDelay_(
+                "finishDeferredExitClose", None, 1.9)
+        else:
+            print("ExtraMissionControls: could not finish closing %r" % title)
+            self._next_deferred_close()
+
+    def finishDeferredExitClose(self):
+        title = self._deferred_exit_title
+        self._deferred_exit_title = None
+        if not title:
+            return
+        if ax.close_main_window(title):
+            _debug("deferred close of %r completed after un-fullscreen" % title)
+            self._fullscreen_registry.pop(title, None)
+        else:
+            print("ExtraMissionControls: un-fullscreened %r but could not "
+                  "close it" % title)
+        self._next_deferred_close()
+
+    @objc.python_method
+    def _next_deferred_close(self):
+        if self._deferred_close:
+            self.performSelector_withObject_afterDelay_(
+                "processDeferredCloses", None, 0.3)
 
     def finishExitedClose(self):
         title = self._pending_close_exit_title

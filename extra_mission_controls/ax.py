@@ -282,11 +282,20 @@ def focus_window(window):
     AX.AXUIElementPerformAction(window, AX.kAXRaiseAction)
     err, pid = AX.AXUIElementGetPid(window, None)
     if err == AX.kAXErrorSuccess and pid:
-        from AppKit import (NSApplicationActivateIgnoringOtherApps,
-                            NSRunningApplication)
-        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-        if app is not None:
-            app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        activate_pid(pid)
+
+
+def activate_pid(pid):
+    """Bring the app with this pid frontmost. Needed before a synthetic click
+    on a window that only accepts clicks while active (e.g. Steam's helper
+    window, which exposes no AX close button)."""
+    from AppKit import (NSApplicationActivateIgnoringOtherApps,
+                        NSRunningApplication)
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app is not None:
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        return True
+    return False
 
 
 def running_app_names():
@@ -383,6 +392,29 @@ def find_app_window(app_name, held_window=None, title=None):
 def set_fullscreen(window, flag):
     return AX.AXUIElementSetAttributeValue(
         window, "AXFullScreen", flag) == AX.kAXErrorSuccess
+
+
+def fullscreen_window_of(app_name):
+    """Put the app's main/focused window into full screen via its AX
+    full-screen button (preferred — needs no pixel coordinates, so it works
+    for apps like Claude whose traffic lights are inset off the standard
+    position), else the AXFullScreen attribute. Returns True if the action was
+    accepted; AX-opaque windows (Steam) expose neither, returning False so the
+    caller can fall back to a synthetic green-button click. Verify separately —
+    a window can report success without actually entering full screen."""
+    for pid in _pids_named(app_name):
+        app = AX.AXUIElementCreateApplication(pid)
+        AX.AXUIElementSetMessagingTimeout(app, 0.5)
+        window = (_attribute(app, "AXMainWindow")
+                  or _attribute(app, "AXFocusedWindow"))
+        if window is None:
+            continue
+        button = _attribute(window, "AXFullScreenButton")
+        if button is not None:
+            return AX.AXUIElementPerformAction(
+                button, AX.kAXPressAction) == AX.kAXErrorSuccess
+        return set_fullscreen(window, True)
+    return False
 
 
 def close_main_window(app_name):
