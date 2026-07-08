@@ -18,31 +18,43 @@
 ---
 
 Apple never shipped a close button in Mission Control. This menu-bar app adds
-one: open Mission Control the way you always do (swipe up / ⌃↑ / F3) and every
-window thumbnail — and every fullscreen app's tile in the Spaces Bar — gains
-an **✕ in its top-left corner**, with hover highlighting. Click it and the
-window closes while **Mission Control stays open**.
+a whole row of them: open Mission Control the way you always do (swipe up / ⌃↑
+/ F3) and every window thumbnail gains **macOS-style controls in its top-left
+corner** — close, minimize, full screen, and quit — with hover highlighting.
+Fullscreen apps in the Spaces Bar get their own close and exit-full-screen
+buttons. Click one and it applies as you leave Mission Control, so the
+overview never breaks.
 
 ## Features
 
-- ✕ buttons on all window thumbnails on the current space, each with a **⤢**
-  button (top-right) that sends that window to full screen
-- ✕ buttons on fullscreen apps in the Spaces Bar (top section) — closes the
-  fullscreen window and its space, staying inside Mission Control
-- A second **❏** button (top-right of a fullscreen/split tile) exits full
-  screen without closing the app — it becomes a normal window again
+- **Four controls on every window thumbnail**, laid out like the macOS traffic
+  lights in the top-left corner:
+  - **✕ close** (red)
+  - **− minimize** (yellow) — to the Dock
+  - **⤢ full screen** (green)
+  - **⏻ quit** (purple) — quits the whole app with ⌘Q, so it can still prompt
+    to save unsaved work
+- Close, minimize, and quit are **deferred until you leave Mission Control**:
+  the thumbnail dims with the pending symbol so you can see what's queued, and
+  nothing is left behind as a dead "ghost" thumbnail
+- **Fullscreen apps in the Spaces Bar (top section)** get a **✕** that drops
+  the app back to the desktop and closes it as you leave, plus a **❏** that
+  only exits full screen — the app becomes a normal window and Mission Control
+  stays open
 - Split View tiles get a single **✕2** button that closes both apps of the
   split (closing just one half is not reliably possible on macOS)
-- Hover effect (macOS traffic-light red)
+- Works even on apps with **broken accessibility** (e.g. Steam): close and
+  minimize fall back to a synthetic click on the real traffic-light button,
+  and full screen uses the window's own full-screen button
+- Hover highlighting in the matching traffic-light color
 - Buttons track Mission Control's layout live (thumbnail re-flow, Spaces Bar
-  expanding/shrinking)
-- Closes even apps with broken accessibility support (e.g. Steam) via a
-  clicking fallback
+  expanding/shrinking) and scale down on small tiles
 - Just a menu-bar item — no Dock icon, no windows of its own
 - Near-zero idle cost: one cheap WindowServer query 4×/s (with timer
-  tolerance so macOS coalesces wake-ups); window references refresh only on
-  real events (launch, space switches, app activations) instead of polling,
-  so no other app is ever woken while you're not using Mission Control
+  tolerance so macOS coalesces wake-ups) that **stops entirely while the
+  display is asleep**; window references refresh only on real events (launch,
+  space switches, app activations) instead of polling, so no other app is ever
+  woken while you're not using Mission Control
 
 ## How it works
 
@@ -61,25 +73,28 @@ title/position/size). This app:
    is up, WindowServer routes mouse events to the Dock even though our panels
    render on top — the tap claims clicks on our buttons before the Dock sees
    them, and only those clicks), and
-4. closes the clicked window by pressing its real close button via the
-   Accessibility API. Mission Control stays open and re-flows.
+4. queues the action and applies it the instant Mission Control closes.
+   Closing, minimizing, or quitting a window *in place* while the overview is
+   still open leaves a dead "ghost" thumbnail the Dock keeps for the rest of
+   the session (clicking it would reopen the app), so instead the thumbnail
+   dims with the pending symbol and the real action — pressing the window's
+   close/minimize button, or asking its app to quit (⌘Q) — runs as you leave.
 
-Closing fullscreen windows needs extra machinery: apps stop reporting their
-AX windows entirely while Mission Control is open, and most only report
-current-space windows even normally. The app therefore keeps an accumulative
-registry of fullscreen windows — scanned while Mission Control is closed and
-refreshed on every space switch — whose held AX references remain pressable
-from anywhere. A close press is never trusted blindly: the app verifies the
-tile actually disappeared, and if the press was silently ignored (some apps
-disable their close button while fullscreen) it has the Dock exit the space's
-fullscreen state in place (`AXRemoveDesktop` — you stay in Mission Control)
-and closes the now-normal window through a freshly resolved close button,
-double-checking once Mission Control exits.
+Fullscreen apps take a different route. Closing one from the Spaces Bar first
+drops it back to the desktop in place (`AXRemoveDesktop` — you stay in Mission
+Control), where it reappears as an ordinary window thumbnail with the dim ✕
+scrim; the app's window is then closed by name as you leave, exactly like a
+desktop close. The **❏** button uses the same `AXRemoveDesktop` step but stops
+there, leaving the app windowed. (An accumulative registry of fullscreen
+windows — scanned while Mission Control is closed, refreshed on every space
+switch — keeps AX references pressable from any space for the fallback paths.)
 
-When nothing else works (an app with a hollow accessibility tree, like
-Steam), the ✕ raises the window, clicks its real traffic-light close button
-with a synthetic mouse click — guarded by a frontmost-window check, cursor
-restored — and puts you back into Mission Control afterwards.
+Apps with a hollow accessibility tree (Steam) expose no close/minimize button
+at all. For those, the deferred action falls back to a synthetic click on the
+real traffic-light button once Mission Control is gone — it raises the window
+and clicks the button at the window's top-left corner. Full screen likewise
+falls back from the window's own AX full-screen button to a click on the green
+button.
 
 ## Install
 
@@ -128,7 +143,7 @@ Then **quit and relaunch the app** (menu-bar icon → Quit) — macOS applies
 permissions only to newly launched processes.
 
 That's it: the grid icon sits in your menu bar; open Mission Control and
-every window gets its ✕.
+every window gets its row of controls.
 
 **Updating:** just replace the app with the one from a newer DMG — builds are
 signed with a stable identity, so your permissions carry over.

@@ -298,6 +298,17 @@ def activate_pid(pid):
     return False
 
 
+def quit_pid(pid):
+    """Ask the app with this pid to quit normally — the ⌘Q / 'Quit' path, so
+    the app can prompt to save unsaved work (not a force kill). Returns True if
+    the request was delivered."""
+    from AppKit import NSRunningApplication
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app is not None:
+        return bool(app.terminate())
+    return False
+
+
 def running_app_names():
     """Localized names of all regular (Dock-visible) running apps."""
     from AppKit import NSApplicationActivationPolicyRegular, NSWorkspace

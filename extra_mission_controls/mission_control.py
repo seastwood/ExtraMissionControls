@@ -432,6 +432,8 @@ class MissionControlButtons(NSObject):
                                 self._slot(thumb, 1, "−", ui.HOVER_YELLOW)))
                 targets.append(("makefullscreen",
                                 self._slot(thumb, 2, "⤢", ui.HOVER_GREEN)))
+                targets.append(("quit",
+                                self._slot(thumb, 3, "⏻", ui.HOVER_PURPLE)))
 
         # Bar-tile buttons only exist while the bar is still AND expanded at the
         # top of the screen; collapsed tiles sit above the screen edge (negative
@@ -826,6 +828,11 @@ class MissionControlButtons(NSObject):
         if kind == "minimize":
             self._defer_window_action("minimize", title)
             return
+        if kind == "quit":
+            # Quit the whole app (⌘Q), not just this window — deferred like a
+            # close so the app (and all its thumbnails) leave no ghost.
+            self._defer_window_action("quit", title)
+            return
         # kind == "window": close it. Closing (or minimizing) a windowed
         # thumbnail *while Mission Control is open* leaves a ghost thumbnail the
         # Dock never removes — clicking it reopens the app (verified). So defer
@@ -835,14 +842,14 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _defer_window_action(self, action, title):
-        """Queue a window close/minimize to run when Mission Control exits.
-        The buttons vanish now and the thumbnail gets a dim '✕'/'−' scrim for
-        the rest of the session, so it's clear what will act on exit and the
-        buttons can never reappear on a lingering thumbnail."""
+        """Queue a window close/minimize/quit to run when Mission Control exits.
+        The buttons vanish now and the thumbnail gets a dim scrim (✕ close, −
+        minimize, ⏻ quit) for the rest of the session, so it's clear what will
+        act on exit and the buttons can never reappear on a lingering thumbnail."""
         if not any(t == title for _, t in self._deferred_actions):
             self._deferred_actions.append((action, title))
         # Show a dim "marked" overlay on this thumbnail instead of its buttons.
-        self._marked[title] = "−" if action == "minimize" else "✕"
+        self._marked[title] = {"minimize": "−", "quit": "⏻"}.get(action, "✕")
         for i, (k, t, e) in list(self._targets.items()):
             if t == title:
                 self._panels[i].orderOut_(None)
@@ -865,10 +872,13 @@ class MissionControlButtons(NSObject):
             if action == "minimize":
                 ok = (ax.minimize_window_by_title(title, pids)
                       or self._press_held_minimize(title, infos))
+            elif action == "quit":
+                # Quit the whole app (⌘Q), by pid — no title/AX-button matching.
+                ok = self._quit_app_for(title, infos)
             else:
                 ok = (ax.close_window_by_title(title, pids)
                       or self._press_held_window(title, infos))
-            if not ok:
+            if not ok and action in ("close", "minimize"):
                 # AX-opaque window (Steam and other CEF/game windows expose no
                 # close/minimize button): fall back to a synthetic click on the
                 # native traffic light, queued so we can raise then click.
@@ -880,6 +890,15 @@ class MissionControlButtons(NSObject):
         if self._tl_queue:
             self.performSelector_withObject_afterDelay_(
                 "processTrafficLightQueue", None, 0.05)
+
+    @objc.python_method
+    def _quit_app_for(self, title, infos):
+        """Quit the app owning the thumbnail titled `title` (⌘Q, graceful — it
+        may prompt to save). By pid, so it works regardless of AX buttons."""
+        info = self._match_window_info(title, infos)
+        if info is None:
+            return False
+        return ax.quit_pid(info.pid)
 
     @objc.python_method
     def _match_window_info(self, title, infos):

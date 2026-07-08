@@ -22,15 +22,17 @@ from Foundation import NSMakePoint, NSMakeRect
 CLOSE_BUTTON_SIZE = 24.0
 
 # Hover fills, echoing the macOS traffic lights: close → red, minimize →
-# yellow, full screen / exit full screen (the zoom button) → green.
+# yellow, full screen / exit full screen (the zoom button) → green. Quit the
+# whole app → purple, off the traffic-light palette to set it apart.
 HOVER_RED = (1.0, 0.37, 0.34)
 HOVER_YELLOW = (1.0, 0.74, 0.18)
 HOVER_GREEN = (0.22, 0.74, 0.32)
+HOVER_PURPLE = (0.66, 0.42, 0.94)
 
-# Glyphs whose drawing sits small inside its em-box (arrows/box/dash look tiny
-# next to ✕ at the same point size) → drawn larger and heavier so they stay
-# legible in the same circle.
-_SYMBOL_GLYPHS = ("⤢", "❏", "−")
+# Glyphs whose drawing sits small inside its em-box (arrows/box/dash/power look
+# tiny next to ✕ at the same point size) → drawn larger and heavier so they
+# stay legible in the same circle.
+_SYMBOL_GLYPHS = ("⤢", "❏", "−", "⏻")
 
 
 class CloseButton(NSButton):
