@@ -59,6 +59,7 @@ _SYNC_INTERVAL = 0.1      # button re-positioning while MC is active
 _HOVER_INTERVAL = 1 / 30.0  # mouse-position polling while MC is active
 _REGISTRY_MIN_GAP = 1.0   # coalesce event-driven registry scans
 _BUTTON_INSET = 4.0
+_BUTTON_GAP = 5.0         # spacing between the traffic-light-style buttons
 _MIN_BUTTON_SIZE = 14.0   # shrink ✕ on collapsed Spaces Bar tiles
 _DEBUG = bool(os.environ.get("EMC_DEBUG"))
 # When EMC_DEBUG is set, also append to this file so geometry can be captured
@@ -138,8 +139,6 @@ class MissionControlButtons(NSObject):
         self._pending_close_attempts = 0
         self._pending_close_window = None
         self._pending_close_exit_title = None
-        self._pending_click_close = None
-        self._click_verify_id = None
         self._verify_title = None
         self._verify_element = None
         self._exit_close_title = None
@@ -157,6 +156,13 @@ class MissionControlButtons(NSObject):
         # (kind, title) -> deadline; keeps a just-closed target's ✕ from
         # flashing back during Mission Control's re-layout animation.
         self._recently_closed = {}
+        # [(action, title)] window closes/minimizes queued to run once Mission
+        # Control is dismissed (closing in place leaves a ghost thumbnail).
+        self._deferred_actions = []
+        # {title: glyph} thumbnails marked for a deferred action — shown with a
+        # dim overlay so it is clear which windows will close on exit.
+        self._marked = {}
+        self._mark_panels = []       # reusable dim-overlay pool
         return self
 
     def start(self):
@@ -223,7 +229,7 @@ class MissionControlButtons(NSObject):
         self._start_hover_polling()
         self._sync_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             _SYNC_INTERVAL, self, "syncTick:", None, True)
-        self._sync_panels(self._collect_targets(group))
+        self._sync(group)
 
     @objc.python_method
     def _deactivate(self):
@@ -236,6 +242,13 @@ class MissionControlButtons(NSObject):
         self._hide_all()
         self._prev_layout = None  # next open re-detects "still" from scratch
         self._last_registry_scan = 0.0  # spaces likely changed; rescan soon
+        self._recently_closed = {}  # session-scoped suppression ends with MC
+        self._marked = {}           # dim overlays clear with MC
+        if self._deferred_actions:
+            # Window closes/minimizes clicked during Mission Control land now,
+            # with Mission Control gone, so they leave no ghost thumbnail.
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredActions", None, 0.35)
         if self._deferred_close:
             # Apps expose AX again shortly after Mission Control closes;
             # finish/verify any in-place fullscreen closes then.
@@ -250,9 +263,15 @@ class MissionControlButtons(NSObject):
             if group is None:
                 self._deactivate()
                 return
-            self._sync_panels(self._collect_targets(group))
+            self._sync(group)
         except Exception:
             traceback.print_exc()
+
+    @objc.python_method
+    def _sync(self, group):
+        targets, marks = self._collect_targets(group)
+        self._sync_panels(targets)
+        self._sync_marks(marks)
 
     # -- fullscreen-window registry --------------------------------------------
 
@@ -318,7 +337,7 @@ class MissionControlButtons(NSObject):
         prev = self._prev_layout
         self._prev_layout = (spaces_sig, thumbs_sig)
         if prev is None:
-            return []  # first frame after (re)activation: establish baseline
+            return [], []  # first frame after (re)activation: baseline
         spaces_still = spaces_sig == prev[0]
         thumbs_still = thumbs_sig == prev[1]
 
@@ -331,23 +350,38 @@ class MissionControlButtons(NSObject):
         # fullscreen apps are closed from a desktop overview's bar tiles.
         on_screen = [t for t in thumbs if self._on_screen(t)]
         if not on_screen and ax.mission_control_window_count(group) > 0:
-            return []
+            return [], []
 
-        # Window-thumbnail ✕ do not depend on the Spaces Bar: they show as soon
-        # as the window layer is still, even while the bar is collapsed.
-        targets = []
+        # Window-thumbnail buttons do not depend on the Spaces Bar: they show
+        # as soon as the window layer is still, even while the bar is collapsed.
+        # Ordered along the top-left like the macOS traffic lights:
+        # ✕ close (red) · − minimize (yellow) · ⤢ full screen (green).
+        # A window already marked (deferred close/minimize) shows a dim overlay
+        # instead of buttons — a clear "this will close when you leave".
+        targets, marks = [], []
         if thumbs_still:
-            targets = [("window", thumb)
-                       for thumb in on_screen
-                       if ("window", thumb["title"]) not in self._recently_closed]
+            for thumb in on_screen:
+                glyph = self._marked.get(thumb["title"])
+                if glyph is not None:
+                    marks.append((thumb, glyph))
+                    continue
+                targets.append(("window", self._slot(thumb, 0)))
+                targets.append(("minimize",
+                                self._slot(thumb, 1, "−", ui.HOVER_YELLOW)))
+                targets.append(("makefullscreen",
+                                self._slot(thumb, 2, "⤢", ui.HOVER_GREEN)))
 
-        # Bar-tile ✕ only exist while the bar is still AND expanded at the top
-        # of the screen; collapsed tiles sit above the screen edge (negative y)
-        # so there is nowhere to draw them until the user hovers the bar open.
+        # Bar-tile buttons only exist while the bar is still AND expanded at the
+        # top of the screen; collapsed tiles sit above the screen edge (negative
+        # y) so there is nowhere to draw them until the user hovers the bar open.
+        # Ordered top-left: ✕ close (red) · ❏ exit full screen (green). A
+        # fullscreen space cannot be minimized, so no minimize button here.
         if not (spaces_still and self._bar_settled(spaces)):
-            return targets
+            return targets, marks
         for space in spaces:
             if not self._on_screen(space):
+                continue
+            if ("acted", space["title"]) in self._recently_closed:
                 continue
             apps = self._split_apps(space)
             if apps:
@@ -355,15 +389,27 @@ class MissionControlButtons(NSObject):
                 # apps no-op their close button while tiled and macOS tears
                 # the pair apart regardless), so a single button closes BOTH,
                 # labeled ✕2 to say so.
-                if ("splitall", space["title"]) in self._recently_closed:
-                    continue
-                tile = dict(space)
-                tile["label"] = "✕%d" % len(apps)
-                targets.append(("splitall", tile))
-            elif self._is_fullscreen_tile(space) \
-                    and ("fullscreen", space["title"]) not in self._recently_closed:
-                targets.append(("fullscreen", space))
-        return targets
+                targets.append(("splitall",
+                                self._slot(space, 0, "✕%d" % len(apps))))
+            elif self._is_fullscreen_tile(space):
+                targets.append(("fullscreen", self._slot(space, 0)))
+            else:
+                continue
+            targets.append(("unfullscreen",
+                            self._slot(space, 1, "❏", ui.HOVER_GREEN)))
+        return targets, marks
+
+    @objc.python_method
+    def _slot(self, tile, slot, label=None, hover=None):
+        """A per-button copy of a tile/thumbnail dict placed in the given
+        top-left slot (0,1,2,...), with an optional glyph and hover colour."""
+        out = dict(tile)
+        out["slot"] = slot
+        if label is not None:
+            out["label"] = label
+        if hover is not None:
+            out["hover"] = hover
+        return out
 
     @objc.python_method
     def _layout_positions(self, spaces, thumbs):
@@ -562,12 +608,14 @@ class MissionControlButtons(NSObject):
             size = min(ui.CLOSE_BUTTON_SIZE,
                        max(_MIN_BUTTON_SIZE, tile["height"] * 0.45))
             self._targets[index] = (kind, tile["title"], tile.get("element"))
-            x = tile["x"] + _BUTTON_INSET
+            # Lay the buttons out left-to-right from the tile's top-left corner.
+            x = tile["x"] + _BUTTON_INSET + tile.get("slot", 0) * (size + _BUTTON_GAP)
             y_top = tile["y"] + _BUTTON_INSET
             self._rects[index] = (x, y_top, size, size)
             y = self._screen_height - y_top - size  # flip to bottom-left origin
             panel.setFrame_display_(NSMakeRect(x, y, size, size), True)
             button.setLabel_(tile.get("label", "✕"))
+            button.setHoverRGB_(tile.get("hover", ui.HOVER_RED))
             if abs(button.frame().size.width - size) > 0.5:
                 button.setFrame_(NSMakeRect(0, 0, size, size))
                 button.layer().setCornerRadius_(size / 2)
@@ -613,8 +661,61 @@ class MissionControlButtons(NSObject):
         self._buttons.append(button)
         return panel
 
+    # -- "marked for close" dim overlays --------------------------------------
+
+    @objc.python_method
+    def _sync_marks(self, marks):
+        """Draw a dim scrim + glyph over each thumbnail queued for a deferred
+        action; hide any leftover overlay panels from a previous frame."""
+        for index, (tile, glyph) in enumerate(marks):
+            panel = self._mark_panel_at(index)
+            w, h = tile["width"], tile["height"]
+            y = self._screen_height - tile["y"] - h  # flip to bottom-left origin
+            panel.setFrame_display_(NSMakeRect(tile["x"], y, w, h), True)
+            view = panel.contentView()
+            if (abs(view.frame().size.width - w) > 0.5
+                    or abs(view.frame().size.height - h) > 0.5):
+                view.setFrame_(NSMakeRect(0, 0, w, h))
+                view.setNeedsDisplay_(True)
+            view.setGlyph_(glyph)
+            if not panel.isVisible():
+                panel.orderFrontRegardless()
+        for index in range(len(marks), len(self._mark_panels)):
+            self._mark_panels[index].orderOut_(None)
+
+    @objc.python_method
+    def _mark_panel_at(self, index):
+        while len(self._mark_panels) <= index:
+            self._mark_panels.append(self._make_mark_panel())
+        return self._mark_panels[index]
+
+    @objc.python_method
+    def _make_mark_panel(self):
+        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, 10, 10),
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+            NSBackingStoreBuffered, False)
+        panel.setReleasedWhenClosed_(False)
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(NSColor.clearColor())
+        panel.setHasShadow_(False)
+        panel.setHidesOnDeactivate_(False)
+        panel.setIgnoresMouseEvents_(True)  # decorative; let pans/clicks pass
+        # Just under the button panels so a ✕/− button is never covered by a
+        # scrim, but above the Mission Control backdrop.
+        panel.setLevel_(NSPopUpMenuWindowLevel - 1)
+        panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorIgnoresCycle)
+        panel.setContentView_(ui.make_mark_overlay(NSMakeRect(0, 0, 10, 10)))
+        return panel
+
     def _hide_all(self):
         for panel in self._panels:
+            panel.orderOut_(None)
+        for panel in self._mark_panels:
             panel.orderOut_(None)
         self._targets = {}
         self._rects = {}
@@ -637,52 +738,138 @@ class MissionControlButtons(NSObject):
         if kind == "splitall":
             self._close_split_all(index, title, element)
             return
-        infos = windows.list_windows(exclude_pid=os.getpid())
-        pids = []
-        for info in infos:
-            if info.pid not in pids:
-                pids.append(info.pid)
-        # Live lookup works for apps that keep reporting AX windows during
-        # Mission Control (e.g. Finder); most apps need the held references.
-        closed = (ax.close_window_by_title(title, pids)
-                  or self._press_held_window(title, infos))
-        if closed:
-            # Hide immediately; Mission Control re-lays out and the next
-            # sync repositions the remaining buttons.
-            self._recently_closed[("window", title)] = time.time() + 1.5
-            self._panels[index].orderOut_(None)
-            self._rects.pop(index, None)
-        elif element is not None:
-            # Last resort for apps with broken AX (Steam/CEF: window exposes
-            # no close button at all). Press the thumbnail — the Dock exits
-            # Mission Control and raises the window — then click the real
-            # traffic-light close button on the raised window.
-            _debug("fallback: raising %r to click its close button" % title)
-            self._pending_click_close = title
-            ax.press_element(element)
+        if kind == "unfullscreen":
+            self._unfullscreen_tile(index, title, element)
+            return
+        if kind == "makefullscreen":
+            self._make_fullscreen(index, title, element)
+            return
+        if kind == "minimize":
+            self._defer_window_action("minimize", title)
+            return
+        # kind == "window": close it. Closing (or minimizing) a windowed
+        # thumbnail *while Mission Control is open* leaves a ghost thumbnail the
+        # Dock never removes — clicking it reopens the app (verified). So defer
+        # the action until Mission Control is dismissed, when it lands like an
+        # ordinary close with no ghost.
+        self._defer_window_action("close", title)
+
+    @objc.python_method
+    def _defer_window_action(self, action, title):
+        """Queue a window close/minimize to run when Mission Control exits.
+        The buttons vanish now and the thumbnail gets a dim '✕'/'−' scrim for
+        the rest of the session, so it's clear what will act on exit and the
+        buttons can never reappear on a lingering thumbnail."""
+        if not any(t == title for _, t in self._deferred_actions):
+            self._deferred_actions.append((action, title))
+        # Show a dim "marked" overlay on this thumbnail instead of its buttons.
+        self._marked[title] = "−" if action == "minimize" else "✕"
+        for i, (k, t, e) in list(self._targets.items()):
+            if t == title:
+                self._panels[i].orderOut_(None)
+                self._rects.pop(i, None)
+        _geom_log("DEFER %s window=%r (applies on MC exit)" % (action, title))
+
+    def applyDeferredActions(self):
+        if not self._deferred_actions:
+            return
+        if ax.mission_control_group() is not None:
+            # Mission Control re-opened before we could apply — wait again so
+            # we never act in place (which would leave a ghost).
             self.performSelector_withObject_afterDelay_(
-                "finishClickClose", None, 0.9)
-        else:
-            print("ExtraMissionControls: no closable window titled %r" % title)
+                "applyDeferredActions", None, 0.4)
+            return
+        actions, self._deferred_actions = self._deferred_actions, []
+        infos = windows.list_windows(exclude_pid=os.getpid())
+        pids = list({i.pid for i in infos})
+        for action, title in actions:
+            if action == "minimize":
+                ok = (ax.minimize_window_by_title(title, pids)
+                      or self._press_held_minimize(title, infos))
+            else:
+                ok = (ax.close_window_by_title(title, pids)
+                      or self._press_held_window(title, infos))
+            _geom_log("APPLY-DEFERRED %s %r -> %s" % (action, title, ok))
 
     @objc.python_method
     def _press_held_window(self, title, infos):
         """Close via references captured before Mission Control opened.
         Stale references (window already gone) fail the press harmlessly."""
-        # Exact AX-title match among held windows.
-        for entries in self._window_registry.values():
-            for held_title, close_button in entries:
-                if held_title == title and ax.press_element(close_button):
-                    return True
-        # Some apps (e.g. Steam) report a different/empty AX title than the
-        # thumbnail shows. If the CG window list says a pid owns a window by
-        # this name and we hold exactly one window for that pid, close it.
-        for info in infos:
+        return self._press_held_button(title, infos, 1)
+
+    @objc.python_method
+    def _press_held_minimize(self, title, infos):
+        """Minimize via the held minimize button (index 2). None for windows
+        that expose no minimize button."""
+        return self._press_held_button(title, infos, 2)
+
+    @objc.python_method
+    def _press_held_button(self, title, infos, slot):
+        """Press a held window button captured before Mission Control opened —
+        slot 1 = close, slot 2 = minimize. Match the thumbnail title to a held
+        window: exact title, else a UNIQUE prefix match (the Dock shortens the
+        title it shows), else the pid single-window fallback."""
+        entries = [e for es in self._window_registry.values() for e in es]
+        for entry in entries:  # exact title
+            if entry[0] == title and entry[slot] is not None \
+                    and ax.press_element(entry[slot]):
+                return True
+        related = [e for e in entries
+                   if e[slot] is not None and ax.titles_related(title, e[0])]
+        if len(related) == 1 and ax.press_element(related[0][slot]):
+            return True
+        for info in infos:  # a pid that owns exactly one held window
             if info.title == title:
-                entries = self._window_registry.get(info.pid) or []
-                if len(entries) == 1 and ax.press_element(entries[0][1]):
+                es = self._window_registry.get(info.pid) or []
+                if len(es) == 1 and es[0][slot] is not None \
+                        and ax.press_element(es[0][slot]):
                     return True
         return False
+
+    @objc.python_method
+    def _make_fullscreen(self, index, title, element):
+        """Send a window thumbnail's window to full screen. A thumbnail has no
+        AX 'enter full screen' action, and while Mission Control is open apps
+        park their windows so setting AXFullScreen on a held reference is a
+        silent no-op (verified) — there is no way to fullscreen a window while
+        staying in Mission Control. So we AXPress the thumbnail — which focuses
+        that window and leaves Mission Control (you end up looking at it) —
+        then press ⌃⌘F, the system Enter Full Screen shortcut."""
+        if element is None:
+            return
+        self._panels[index].orderOut_(None)
+        self._rects.pop(index, None)
+        _geom_log("MAKE-FULLSCREEN window=%r" % title)
+        ax.press_element(element)  # focus the window, exit Mission Control
+        self.performSelector_withObject_afterDelay_(
+            "sendFullscreenShortcut", None, 0.6)
+
+    def sendFullscreenShortcut(self):
+        # ⌃⌘F = View → Enter Full Screen (system default shortcut).
+        F_KEYCODE = 3
+        flags = Quartz.kCGEventFlagMaskControl | Quartz.kCGEventFlagMaskCommand
+        for down in (True, False):
+            event = Quartz.CGEventCreateKeyboardEvent(None, F_KEYCODE, down)
+            Quartz.CGEventSetFlags(event, flags)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            time.sleep(0.03)
+
+    @objc.python_method
+    def _unfullscreen_tile(self, index, title, element):
+        """Exit full screen for a Spaces Bar tile without closing the app —
+        the Dock's own AXRemoveDesktop action, which turns the fullscreen (or
+        split) space back into ordinary window(s) while Mission Control stays
+        open. No space switch, no window close."""
+        if element is None:
+            return
+        self._panels[index].orderOut_(None)
+        self._rects.pop(index, None)
+        if ax.remove_space(element):
+            _geom_log("UNFULLSCREEN tile=%r" % title)
+            self._recently_closed[("acted", title)] = time.time() + 2.5
+        else:
+            print("ExtraMissionControls: could not exit full screen for %r"
+                  % title)
 
     @objc.python_method
     def _close_split_all(self, index, title, element):
@@ -695,7 +882,7 @@ class MissionControlButtons(NSObject):
             return
         self._panels[index].orderOut_(None)
         self._rects.pop(index, None)
-        self._recently_closed[("splitall", title)] = time.time() + 6.0
+        self._recently_closed[("acted", title)] = time.time() + 6.0
         apps = [p.strip() for p in title.split(" & ") if p.strip()]
         _geom_log("SPLIT-CLOSE-ALL tile=%r apps=%s" % (title, apps))
         self._after_close_queue = apps[1:]
@@ -733,6 +920,7 @@ class MissionControlButtons(NSObject):
     @objc.python_method
     def _close_fullscreen(self, index, title, element):
         entry = self._fullscreen_registry.get(title)
+        _geom_log("CLOSE-FULLSCREEN %r: has_registry=%s" % (title, entry is not None))
         if os.environ.get("EMC_FORCE_UNFS") and entry is not None:
             # Test hook: pretend the direct close press no-ops, to exercise
             # the stay-in-MC AXRemoveDesktop path.
@@ -749,7 +937,7 @@ class MissionControlButtons(NSObject):
             # The press was delivered, but some apps no-op their close button
             # while fullscreen. Believe only the Spaces Bar: the tile
             # disappears once the window is really gone.
-            self._recently_closed[("fullscreen", title)] = time.time() + 2.5
+            self._recently_closed[("acted", title)] = time.time() + 2.5
             self._panels[index].orderOut_(None)
             self._rects.pop(index, None)
             self._verify_title = title
@@ -777,17 +965,17 @@ class MissionControlButtons(NSObject):
             # held reference.
             self._unfullscreen_and_close_held(title, element, entry)
         else:
-            self._recently_closed.pop(("fullscreen", title), None)
+            self._recently_closed.pop(("acted", title), None)
             self._fallback_close_fullscreen(title, element)
 
     @objc.python_method
     def _unfullscreen_and_close_held(self, title, element, entry):
         if element is None or not ax.remove_space(element):
-            self._recently_closed.pop(("fullscreen", title), None)
+            self._recently_closed.pop(("acted", title), None)
             self._fallback_close_fullscreen(title, element)
             return
         _debug("AXRemoveDesktop on %r — un-fullscreened in place" % title)
-        self._recently_closed[("fullscreen", title)] = time.time() + 3.0
+        self._recently_closed[("acted", title)] = time.time() + 3.0
         self._fullscreen_registry.pop(title, None)
         self._deferred_close[title] = entry
         self._exit_close_title = title
@@ -838,54 +1026,6 @@ class MissionControlButtons(NSObject):
         self.performSelector_withObject_afterDelay_(
             "finishPendingClose", None, 0.6)
 
-    def finishClickClose(self):
-        title = self._pending_click_close
-        if not title:
-            return
-        self._pending_click_close = None
-        info = next((i for i in windows.list_windows(exclude_pid=os.getpid())
-                     if i.title == title), None)
-        if info is None:
-            print("ExtraMissionControls: %r not found to click-close" % title)
-            return
-        # Traffic lights sit ~20pt into the window from its top-left corner.
-        cx = info.x + 20.0
-        cy = info.y + 19.0
-        if not self._point_hits_window(cx, cy, info.window_id):
-            print("ExtraMissionControls: %r is not frontmost at its close "
-                  "button; not clicking" % title)
-            return
-        saved = NSEvent.mouseLocation()
-        for kind in (Quartz.kCGEventMouseMoved,
-                     Quartz.kCGEventLeftMouseDown,
-                     Quartz.kCGEventLeftMouseUp):
-            event = Quartz.CGEventCreateMouseEvent(
-                None, kind, Quartz.CGPointMake(cx, cy),
-                Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-        # Put the cursor back (mouseLocation is bottom-left origin).
-        height = NSScreen.screens()[0].frame().size.height
-        restore = Quartz.CGEventCreateMouseEvent(
-            None, Quartz.kCGEventMouseMoved,
-            Quartz.CGPointMake(saved.x, height - saved.y),
-            Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, restore)
-        # If the click worked, put the user back in Mission Control.
-        self._click_verify_id = info.window_id
-        self.performSelector_withObject_afterDelay_("verifyClickClose", None, 0.7)
-
-    def verifyClickClose(self):
-        window_id = self._click_verify_id
-        if window_id is None:
-            return
-        self._click_verify_id = None
-        still_open = any(i.window_id == window_id
-                         for i in windows.list_windows(exclude_pid=os.getpid()))
-        if still_open:
-            print("ExtraMissionControls: click-close did not close the window")
-            return
-        self._reopen_mission_control(0.3)
-
     @objc.python_method
     def _reopen_mission_control(self, delay):
         self.performSelector_withObject_afterDelay_(
@@ -896,21 +1036,6 @@ class MissionControlButtons(NSObject):
         # exposelauncher toggle would close an already-open Mission Control.
         if ax.mission_control_group() is None:
             subprocess.Popen(["open", "-b", "com.apple.exposelauncher"])
-
-    @objc.python_method
-    def _point_hits_window(self, x, y, window_id):
-        """True if window_id is the frontmost normal window at (x, y)."""
-        raw = Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly,
-            Quartz.kCGNullWindowID) or []
-        for entry in raw:  # front-to-back
-            if entry.get(Quartz.kCGWindowLayer, 0) != 0:
-                continue
-            bounds = entry.get(Quartz.kCGWindowBounds) or {}
-            if bounds.get("X", 0) <= x <= bounds.get("X", 0) + bounds.get("Width", 0) \
-                    and bounds.get("Y", 0) <= y <= bounds.get("Y", 0) + bounds.get("Height", 0):
-                return entry.get(Quartz.kCGWindowNumber) == window_id
-        return False
 
     def finishPendingClose(self):
         title = self._pending_close_title

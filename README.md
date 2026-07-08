@@ -25,9 +25,12 @@ window closes while **Mission Control stays open**.
 
 ## Features
 
-- ✕ buttons on all window thumbnails on the current space
+- ✕ buttons on all window thumbnails on the current space, each with a **⤢**
+  button (top-right) that sends that window to full screen
 - ✕ buttons on fullscreen apps in the Spaces Bar (top section) — closes the
   fullscreen window and its space, staying inside Mission Control
+- A second **❏** button (top-right of a fullscreen/split tile) exits full
+  screen without closing the app — it becomes a normal window again
 - Split View tiles get a single **✕2** button that closes both apps of the
   split (closing just one half is not reliably possible on macOS)
 - Hover effect (macOS traffic-light red)

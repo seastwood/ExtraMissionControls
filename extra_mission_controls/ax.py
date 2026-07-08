@@ -304,7 +304,8 @@ def scan_closable_windows():
 
     - fullscreen_by_app: {app_name: (window_el, close_button_el, ax_title)}
     - visible_app_names: apps that reported any AX windows at all
-    - windows_by_pid: {pid: [(ax_title, close_button_element), ...]}
+    - windows_by_pid: {pid: [(ax_title, close_button_el, minimize_button_el),
+      ...]} (minimize_button_el may be None)
 
     Must be called while Mission Control is CLOSED: apps stop reporting
     their AX windows entirely while it is open, and most (Notes, Steam,
@@ -331,7 +332,8 @@ def scan_closable_windows():
             if close_button is None:
                 continue
             title = _attribute(window, AX.kAXTitleAttribute) or ""
-            entries.append((title, close_button))
+            minimize_button = _attribute(window, AX.kAXMinimizeButtonAttribute)
+            entries.append((title, close_button, minimize_button))
             if name not in fullscreen and _attribute(window, "AXFullScreen"):
                 fullscreen[name] = (window, close_button, title)
         if entries:
@@ -413,21 +415,51 @@ def close_fullscreen_window(tile_title):
         close_button, AX.kAXPressAction) == AX.kAXErrorSuccess
 
 
+def titles_related(a, b):
+    """True when two window titles refer to the same window despite the Dock
+    showing a shortened form for the Mission Control thumbnail — e.g. thumbnail
+    'Songs' vs the window's AX title 'Songs – 1 note'. Exact match, or one
+    title is a prefix of the other."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    return a.startswith(b) or b.startswith(a)
+
+
 def close_window_by_title(title, pids):
-    """Find a window titled `title` among the given pids and press its close
-    button. Used to close windows behind Mission Control thumbnails."""
+    """Find the window matching a Mission Control thumbnail title among the
+    given pids and press its close button."""
+    return _press_window_button_by_title(title, pids, AX.kAXCloseButtonAttribute)
+
+
+def minimize_window_by_title(title, pids):
+    """Find the window matching a thumbnail title among the given pids and
+    press its minimize button (apps that report windows during MC)."""
+    return _press_window_button_by_title(
+        title, pids, AX.kAXMinimizeButtonAttribute)
+
+
+def _press_window_button_by_title(title, pids, button_attr):
+    """Press a window's close/minimize button, matching the thumbnail title to
+    the live window: exact title first, else a UNIQUE prefix match (the Dock
+    routinely shortens the title it shows on the thumbnail). Ambiguous prefix
+    matches are ignored so the wrong window is never touched."""
     if not title:
         return False
+    exact, related = [], []
     for pid in pids:
         for window in _ax_windows(pid):
-            if _attribute(window, AX.kAXTitleAttribute) != title:
+            button = _attribute(window, button_attr)
+            if button is None:
                 continue
-            close_button = _attribute(window, AX.kAXCloseButtonAttribute)
-            if close_button is None:
-                continue
-            if AX.AXUIElementPerformAction(
-                    close_button, AX.kAXPressAction) == AX.kAXErrorSuccess:
-                return True
-    return False
+            window_title = _attribute(window, AX.kAXTitleAttribute) or ""
+            if window_title == title:
+                exact.append(button)
+            elif titles_related(title, window_title):
+                related.append(button)
+    target = exact[0] if exact else (related[0] if len(related) == 1 else None)
+    return target is not None and AX.AXUIElementPerformAction(
+        target, AX.kAXPressAction) == AX.kAXErrorSuccess
 
 
