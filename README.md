@@ -15,6 +15,13 @@
   </a>
 </p>
 
+<p align="center">
+  <video src="https://github.com/seastwood/ExtraMissionControls/raw/main/assets/ExtraMissionControls.mp4" autoplay loop muted playsinline controls width="720">
+    Your browser doesn't play inline video —
+    <a href="https://github.com/seastwood/ExtraMissionControls/raw/main/assets/ExtraMissionControls.mp4">watch the demo</a>.
+  </video>
+</p>
+
 ---
 
 Apple never shipped a close button in Mission Control. This menu-bar app adds
