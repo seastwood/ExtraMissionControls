@@ -16,10 +16,7 @@
 </p>
 
 <p align="center">
-  <video src="https://github.com/seastwood/ExtraMissionControls/raw/main/assets/ExtraMissionControls.mp4" autoplay loop muted playsinline controls width="720">
-    Your browser doesn't play inline video —
-    <a href="https://github.com/seastwood/ExtraMissionControls/raw/main/assets/ExtraMissionControls.mp4">watch the demo</a>.
-  </video>
+  <img src="assets/demo.gif" width="720" alt="ExtraMissionControls demo: macOS-style close, minimize, full-screen, and quit buttons on Mission Control window thumbnails">
 </p>
 
 ---
