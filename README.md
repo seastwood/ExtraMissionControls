@@ -31,16 +31,26 @@ overview never breaks.
 
 ## Features
 
-- **Four controls on every window thumbnail**, laid out like the macOS traffic
+- **Five controls on every window thumbnail**, laid out like the macOS traffic
   lights in the top-left corner:
   - **✕ close** (red)
   - **− minimize** (yellow) — to the Dock
   - **⤢ full screen** (green)
+  - **◫ arrange** (teal) — hover it for a moment (or click) for a menu to snap
+    the window to the **left** or **right half** of its screen, or **maximize**
+    it to fill the desktop (below the menu bar, clear of the Dock — not macOS
+    full screen)
   - **⏻ quit** (purple) — quits the whole app with ⌘Q, so it can still prompt
-    to save unsaved work
-- Close, minimize, and quit are **deferred until you leave Mission Control**:
+    to save unsaved work. Hover it for a moment (or right-click) to open a menu
+    with **Force Quit** and **Force Kill** for apps that won't go quietly
+- Close, minimize, quit, and arrange are **deferred until you leave Mission
+  Control**:
   the thumbnail dims with the pending symbol so you can see what's queued, and
   nothing is left behind as a dead "ghost" thumbnail
+- Changed your mind? Any dimmed thumbnail or tile shows a **↺ cancel** button
+  (blue) — click it to call off the pending action and bring the buttons back,
+  so you can pick a different one or leave the window alone (for a fullscreen
+  app that already dropped to the desktop, cancel keeps it open as a window)
 - **Fullscreen apps in the Spaces Bar (top section)** get a **✕** that drops
   the app back to the desktop and closes it as you leave, plus a **❏** that
   only exits full screen — the app becomes a normal window and Mission Control
@@ -50,7 +60,9 @@ overview never breaks.
 - Works even on apps with **broken accessibility** (e.g. Steam): close and
   minimize fall back to a synthetic click on the real traffic-light button,
   and full screen uses the window's own full-screen button
-- Hover highlighting in the matching traffic-light color
+- Buttons and menus render with **Liquid Glass** on macOS 26+ (a translucent
+  dark disc on older systems), and highlight in the matching traffic-light color
+  on hover
 - Buttons track Mission Control's layout live (thumbnail re-flow, Spaces Bar
   expanding/shrinking) and scale down on small tiles
 - Just a menu-bar item — no Dock icon, no windows of its own

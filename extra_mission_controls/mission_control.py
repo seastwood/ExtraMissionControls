@@ -57,6 +57,8 @@ from . import ax, ui, windows
 _DETECT_INTERVAL = 0.25   # Mission Control open/close detection
 _SYNC_INTERVAL = 0.1      # button re-positioning while MC is active
 _HOVER_INTERVAL = 1 / 30.0  # mouse-position polling while MC is active
+_QUIT_HOVER_DELAY = 0.4   # dwell on the quit button before its menu opens
+_QUIT_HOVER_CLOSE_DELAY = 0.35  # grace before a hover-opened menu self-closes
 _REGISTRY_MIN_GAP = 1.0   # coalesce event-driven registry scans
 _BUTTON_INSET = 4.0
 _BUTTON_GAP = 5.0         # spacing between the traffic-light-style buttons
@@ -79,6 +81,12 @@ _GEOMETRY_LOG = os.environ.get(
 # buttons in that state puts them in the wrong spot and they can't be clicked,
 # so we suppress all buttons until the bar settles.
 _MIN_BAR_TILE_HEIGHT = 50.0
+
+# Flyout menu rows, top to bottom, parallel to the ui.*_MENU_ITEMS glyph lists.
+# Quit menu: graceful ⌘Q, Force Quit (forceTerminate), a raw SIGKILL backstop.
+# Arrange menu: left half / right half / maximize on the window's own screen.
+_QUIT_MENU_ACTIONS = ("quit", "forcequit", "kill")
+_ARRANGE_MENU_ACTIONS = ("snapleft", "snapright", "snapmax")
 
 
 def _debug(message):
@@ -126,6 +134,7 @@ class MissionControlButtons(NSObject):
         self._tap = None
         self._tap_source = None
         self._swallow_mouse_up = False
+        self._swallow_right_up = False
         # {app name: (window element, close button element)} accumulated
         # across space visits; see module docstring, quirk 2.
         self._fullscreen_registry = {}
@@ -171,6 +180,13 @@ class MissionControlButtons(NSObject):
         self._prev_thumb_titles = set()
         self._pending_unfs_baseline = None
         self._pending_unfs_expires = 0.0
+        # {reappeared thumbnail title: app title} — a closed full-screen app
+        # drops back to the desktop and its close is queued (by app name) in
+        # _deferred_app_closes; this maps the scrimmed thumbnail back to that app
+        # so a cancel (↺) on it can call the close off. _pending_unfs_app is the
+        # app the current baseline is still watching for.
+        self._pending_unfs_app = None
+        self._unfs_pending = {}
         # Make-fullscreen (⤢) after MC exits: AX full-screen button, then a
         # green-button click fallback (the ⌃⌘F shortcut is ignored by
         # Electron/CEF apps). Staged across steps via these.
@@ -181,6 +197,26 @@ class MissionControlButtons(NSObject):
         # dim overlay so it is clear which windows will close on exit.
         self._marked = {}
         self._mark_panels = []       # reusable dim-overlay pool
+        self._tray_panels = []       # Liquid Glass tray behind each button row
+        # Flyout menu (the quit menu, or the arrange/tile menu): our own panel,
+        # hit-tested through the same event tap as the buttons (an NSMenu can't
+        # receive events while the Dock owns the mouse during Mission Control).
+        self._menu_open = False
+        self._menu_title = None       # the thumbnail the open menu acts on
+        self._menu_rects = {}         # row index -> (x, y_top, w, h), screen
+        self._menu_actions = ()       # action per row for the currently-open menu
+        self._menu_panel = None
+        self._menu_view = None
+        # A flyout also opens by dwelling the cursor on its button — the quit or
+        # the arrange button — not just clicking it; a hover-opened menu
+        # self-closes when the cursor leaves the button and the menu. These
+        # track that gesture.
+        self._hover_quit_index = None   # menu button the cursor is dwelling on
+        self._hover_quit_since = 0.0    # when the dwell began (0 = don't open)
+        self._menu_via_hover = False    # menu opened by hover (so it self-closes)
+        self._menu_away_since = 0.0     # when the cursor left the hover hot zone
+        self._menu_anchor_rect = None   # quit button rect the open menu belongs to
+        self._menu_panel_rect = None    # open menu panel rect (top-left coords)
         return self
 
     def start(self):
@@ -285,6 +321,8 @@ class MissionControlButtons(NSObject):
         self._recently_closed = {}  # session-scoped suppression ends with MC
         self._marked = {}           # dim overlays clear with MC
         self._pending_unfs_baseline = None
+        self._pending_unfs_app = None
+        self._unfs_pending = {}
         if self._deferred_actions:
             # Window closes/minimizes clicked during Mission Control land now,
             # with Mission Control gone, so they leave no ghost thumbnail.
@@ -383,9 +421,12 @@ class MissionControlButtons(NSObject):
                 for title in current_titles - self._pending_unfs_baseline:
                     if title not in self._marked:
                         self._marked[title] = "✕"
+                        if self._pending_unfs_app is not None:
+                            self._unfs_pending[title] = self._pending_unfs_app
                         _geom_log("UNFS-SCRIM: %r reappeared -> marked" % title)
             else:
                 self._pending_unfs_baseline = None
+                self._pending_unfs_app = None
         self._prev_thumb_titles = current_titles
 
         # Track the Spaces Bar and the window thumbnails for motion SEPARATELY.
@@ -426,14 +467,27 @@ class MissionControlButtons(NSObject):
                 glyph = self._mark_glyph_for(thumb["title"])
                 if glyph is not None:
                     marks.append((thumb, glyph))
+                    # The pending action can be taken back: float a cancel (↺)
+                    # button over the scrim. Click it to clear the mark and get
+                    # the buttons back — to pick a different action or none at
+                    # all. This covers a deferred window action, and the close
+                    # queued for a full-screen app that has just dropped back to
+                    # the desktop as this thumbnail (cancel keeps it open, though
+                    # it has already left full screen).
+                    if (self._deferred_action_for(thumb["title"]) is not None
+                            or thumb["title"] in self._unfs_pending):
+                        targets.append(("cancel",
+                                        self._slot(thumb, 0, "↺", ui.HOVER_BLUE)))
                     continue
                 targets.append(("window", self._slot(thumb, 0)))
                 targets.append(("minimize",
                                 self._slot(thumb, 1, "−", ui.HOVER_YELLOW)))
                 targets.append(("makefullscreen",
                                 self._slot(thumb, 2, "⤢", ui.HOVER_GREEN)))
+                targets.append(("arrange",
+                                self._slot(thumb, 3, "◫", ui.HOVER_TEAL)))
                 targets.append(("quit",
-                                self._slot(thumb, 3, "⏻", ui.HOVER_PURPLE)))
+                                self._slot(thumb, 4, "⏻", ui.HOVER_PURPLE)))
 
         # Bar-tile buttons only exist while the bar is still AND expanded at the
         # top of the screen; collapsed tiles sit above the screen edge (negative
@@ -450,6 +504,12 @@ class MissionControlButtons(NSObject):
             glyph = self._mark_glyph_for(space["title"])
             if glyph is not None:  # queued for a deferred close → dim scrim
                 marks.append((space, glyph))
+                # A held-reference full-screen close still sits in the Spaces
+                # Bar (it never left full screen), so it is fully reversible —
+                # give it the same cancel (↺) button.
+                if space["title"] in self._deferred_close:
+                    targets.append(("cancel",
+                                    self._slot(space, 0, "↺", ui.HOVER_BLUE)))
                 continue
             apps = self._split_apps(space)
             if apps:
@@ -477,6 +537,20 @@ class MissionControlButtons(NSObject):
         if glyph is not None:
             return glyph
         related = [g for t, g in self._marked.items()
+                   if ax.titles_related(title, t)]
+        return related[0] if len(related) == 1 else None
+
+    @objc.python_method
+    def _deferred_action_for(self, title):
+        """The pending (action, title) queued for this thumbnail, or None.
+        Matched exactly or by the same unique-prefix relation _mark_glyph_for
+        uses, so the cancel button lines up with the scrim even when the Dock
+        shows a shortened title. Only window actions (_defer_window_action) live
+        in _deferred_actions, so this is None for fullscreen-tile scrims."""
+        exact = [(a, t) for a, t in self._deferred_actions if t == title]
+        if exact:
+            return exact[0]
+        related = [(a, t) for a, t in self._deferred_actions
                    if ax.titles_related(title, t)]
         return related[0] if len(related) == 1 else None
 
@@ -606,7 +680,9 @@ class MissionControlButtons(NSObject):
             if not enabled:
                 return
             mask = (Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
-                    | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp))
+                    | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
+                    | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDown)
+                    | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseUp))
             self._tap = Quartz.CGEventTapCreate(
                 Quartz.kCGSessionEventTap,
                 Quartz.kCGHeadInsertEventTap,
@@ -625,6 +701,8 @@ class MissionControlButtons(NSObject):
         Quartz.CGEventTapEnable(self._tap, enabled)
         if not enabled:
             self._swallow_mouse_up = False
+            self._swallow_right_up = False
+            self._close_menu()
 
     @objc.python_method
     def _tap_callback(self, proxy, event_type, event, refcon):
@@ -634,14 +712,46 @@ class MissionControlButtons(NSObject):
                 Quartz.CGEventTapEnable(self._tap, True)
             return event
         location = Quartz.CGEventGetLocation(event)
+        x, y = location.x, location.y
         if event_type == Quartz.kCGEventLeftMouseDown:
-            index = self._button_index_at(location.x, location.y)
+            if self._menu_open:
+                # A click while the quit menu is up: pick its row, or dismiss
+                # (like a real menu, the dismiss click is consumed).
+                self._swallow_mouse_up = True
+                row = self._menu_row_at(x, y)
+                if row is not None:
+                    AppHelper.callAfter(self._menu_pick, row)
+                else:
+                    AppHelper.callAfter(self._close_menu)
+                return None
+            index = self._button_index_at(x, y)
             if index is not None:
                 self._swallow_mouse_up = True
-                AppHelper.callAfter(self._close_index, index)
+                if self._targets.get(index, (None,))[0] == "arrange":
+                    # The arrange button has no default action — a left-click
+                    # opens its Left/Right flyout (like a menu button).
+                    AppHelper.callAfter(self._open_menu_for, index)
+                else:
+                    AppHelper.callAfter(self._close_index, index)
                 return None  # consumed: don't let Mission Control see it
+        elif event_type == Quartz.kCGEventRightMouseDown:
+            if self._menu_open:
+                self._swallow_right_up = True
+                AppHelper.callAfter(self._close_menu)
+                return None
+            index = self._button_index_at(x, y)
+            if index is not None and \
+                    self._targets.get(index, (None,))[0] in ("quit", "arrange"):
+                # Right-click the quit or arrange button → its flyout menu.
+                # Other buttons ignore right-clicks (event passes through).
+                self._swallow_right_up = True
+                AppHelper.callAfter(self._open_menu_for, index)
+                return None
         elif event_type == Quartz.kCGEventLeftMouseUp and self._swallow_mouse_up:
             self._swallow_mouse_up = False
+            return None
+        elif event_type == Quartz.kCGEventRightMouseUp and self._swallow_right_up:
+            self._swallow_right_up = False
             return None
         return event
 
@@ -669,19 +779,205 @@ class MissionControlButtons(NSObject):
             self._hover_timer = None
         for button in self._buttons:
             button.setHovered_(False)
+        self._hover_quit_index = None
+        self._hover_quit_since = 0.0
 
     def hoverTick_(self, timer):
         location = NSEvent.mouseLocation()  # global, bottom-left origin
         x = location.x
         y_top = self._screen_height - location.y
+        if self._menu_open:
+            # Highlight the quit menu's hovered row; keep the buttons quiet.
+            row = self._menu_row_at(x, y_top)
+            if self._menu_view is not None:
+                self._menu_view.set_highlight(row if row is not None else -1)
+            for button in self._buttons:
+                button.setHovered_(False)
+            self._maybe_autoclose_menu(x, y_top)
+            return
         hit = self._button_index_at(x, y_top)
         for index, button in enumerate(self._buttons):
             button.setHovered_(index == hit)
+        self._update_quit_hover(hit)
+
+    @objc.python_method
+    def _update_quit_hover(self, hit):
+        """Open a button's flyout when the cursor dwells on it — the quit menu
+        for the quit button, the arrange menu for the arrange button — so both
+        are reachable by hovering as well as by clicking. Merely passing over
+        the button does nothing; the cursor has to rest there for
+        _QUIT_HOVER_DELAY."""
+        has_menu = (hit is not None
+                    and self._targets.get(hit, (None,))[0] in ("quit", "arrange"))
+        if not has_menu:
+            self._hover_quit_index = None
+            self._hover_quit_since = 0.0
+            return
+        if self._hover_quit_index != hit:
+            self._hover_quit_index = hit   # just arrived; start the dwell clock
+            self._hover_quit_since = time.time()
+            return
+        # Same button as last tick. A zeroed clock means the dwell already fired
+        # (or is suppressed just after a close) — wait for the cursor to leave
+        # (hit changes) before it can open again.
+        if (self._hover_quit_since
+                and time.time() - self._hover_quit_since >= _QUIT_HOVER_DELAY):
+            self._hover_quit_since = 0.0
+            self._open_menu_for(hit, via_hover=True)
+
+    @objc.python_method
+    def _maybe_autoclose_menu(self, x, y):
+        """A hover-opened menu closes itself once the cursor rests away from
+        both the quit button and the menu for a moment. Right-click menus are
+        left untouched — dismissed by a click, as before."""
+        if not self._menu_via_hover:
+            return
+        if self._menu_hot(x, y):
+            self._menu_away_since = 0.0
+            return
+        if not self._menu_away_since:
+            self._menu_away_since = time.time()
+        elif time.time() - self._menu_away_since >= _QUIT_HOVER_CLOSE_DELAY:
+            self._close_menu()
+
+    @objc.python_method
+    def _menu_hot(self, x, y, slop=6.0):
+        """True while the cursor is over the open menu or the quit button it
+        belongs to — with a little slop to bridge the 2px gap between them — so
+        travelling from the button into the menu counts as staying inside."""
+        for rect in (self._menu_anchor_rect, self._menu_panel_rect):
+            if rect is None:
+                continue
+            rx, ry, rw, rh = rect
+            if rx - slop <= x <= rx + rw + slop \
+                    and ry - slop <= y <= ry + rh + slop:
+                return True
+        return False
+
+    # -- flyout menus (quit / arrange) -----------------------------------------
+    # The quit button (hover-dwell or right-click) and the arrange button
+    # (click) open a small list menu, drawn as our own panel and hit-tested
+    # through the event tap because the Dock owns the mouse while Mission Control
+    # is up (an NSMenu wouldn't work).
+
+    @objc.python_method
+    def _open_menu_for(self, index, via_hover=False):
+        """Open the flyout that belongs to the button at `index`: the quit menu
+        for a quit button, the arrange menu for an arrange button."""
+        kind = self._targets.get(index, (None,))[0]
+        if kind == "quit":
+            self._open_menu(index, "quit", ui.QUIT_MENU_ITEMS,
+                            _QUIT_MENU_ACTIONS, via_hover)
+        elif kind == "arrange":
+            self._open_menu(index, "arrange", ui.ARRANGE_MENU_ITEMS,
+                            _ARRANGE_MENU_ACTIONS, via_hover)
+
+    @objc.python_method
+    def _open_menu(self, index, kind, items, actions, via_hover=False):
+        entry = self._targets.get(index)
+        rect = self._rects.get(index)
+        if entry is None or rect is None or entry[0] != kind:
+            return
+        title = entry[1]
+        bx, by, bw, bh = rect
+        width = ui.MENU_WIDTH
+        height = ui.menu_height(items)
+        sw = self._screen_width or 0.0
+        sh = self._screen_height or 0.0
+        # Anchor the menu just under the button, kept fully on screen.
+        mx = max(2.0, min(bx, sw - width - 2.0))
+        my_top = by + bh + 2.0
+        if my_top + height > sh:
+            my_top = max(2.0, by - height - 2.0)
+        self._menu_rects = {
+            i: (mx, my_top + ui.MENU_PAD + i * ui.MENU_ROW_HEIGHT,
+                width, ui.MENU_ROW_HEIGHT)
+            for i in range(len(actions))
+        }
+        self._menu_title = title
+        self._menu_actions = actions
+        self._menu_anchor_rect = (bx, by, bw, bh)
+        self._menu_panel_rect = (mx, my_top, width, height)
+        self._menu_via_hover = via_hover
+        self._menu_away_since = 0.0
+        panel = self._menu_panel_ensure()
+        self._menu_view.set_items(items)
+        self._menu_view.set_highlight(-1)
+        y = sh - my_top - height  # flip to bottom-left origin
+        panel.setFrame_display_(NSMakeRect(mx, y, width, height), True)
+        self._menu_view.setFrame_(NSMakeRect(0, 0, width, height))
+        self._menu_open = True
+        panel.orderFrontRegardless()
+        _geom_log("MENU(%s) open for %r at (%.0f,%.0f)" % (kind, title, mx, my_top))
+
+    @objc.python_method
+    def _menu_panel_ensure(self):
+        if self._menu_panel is None:
+            width = ui.MENU_WIDTH
+            height = ui.menu_height(ui.QUIT_MENU_ITEMS)  # any; resized per open
+            panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, width, height),
+                NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+                NSBackingStoreBuffered, False)
+            panel.setReleasedWhenClosed_(False)
+            panel.setOpaque_(False)
+            panel.setBackgroundColor_(NSColor.clearColor())
+            panel.setHasShadow_(True)  # a menu casts a shadow, unlike the buttons
+            panel.setHidesOnDeactivate_(False)
+            # One level above the button panels so it overlays them like a menu.
+            panel.setLevel_(NSPopUpMenuWindowLevel + 1)
+            panel.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+                | NSWindowCollectionBehaviorIgnoresCycle)
+            root, menu_view = ui.make_menu(NSMakeRect(0, 0, width, height))
+            panel.setContentView_(root)
+            self._menu_panel = panel
+            self._menu_view = menu_view
+        return self._menu_panel
+
+    @objc.python_method
+    def _menu_row_at(self, x, y):
+        for i, (rx, ry, rw, rh) in self._menu_rects.items():
+            if rx <= x <= rx + rw and ry <= y <= ry + rh:
+                return i
+        return None
+
+    @objc.python_method
+    def _menu_pick(self, row):
+        actions = self._menu_actions or ()
+        action = actions[row] if 0 <= row < len(actions) else None
+        title = self._menu_title
+        self._close_menu()
+        if action and title:
+            self._defer_window_action(action, title)
+
+    @objc.python_method
+    def _close_menu(self):
+        if not self._menu_open and self._menu_panel is None:
+            return
+        self._menu_open = False
+        self._menu_title = None
+        self._menu_rects = {}
+        self._menu_via_hover = False
+        self._menu_away_since = 0.0
+        self._menu_anchor_rect = None
+        self._menu_panel_rect = None
+        # Suppress an immediate hover-reopen: keep the dwell anchored to this
+        # button but clear its clock, so the menu can reopen only after the
+        # cursor leaves the button and comes back.
+        self._hover_quit_since = 0.0
+        if self._menu_view is not None:
+            self._menu_view.set_highlight(-1)
+        if self._menu_panel is not None:
+            self._menu_panel.orderOut_(None)
 
     # -- panel management ------------------------------------------------------
 
     @objc.python_method
     def _sync_panels(self, targets):
+        trays = {}
         for index, (kind, tile) in enumerate(targets):
             panel = self._panel_at(index)
             button = self._buttons[index]
@@ -693,13 +989,21 @@ class MissionControlButtons(NSObject):
             x = tile["x"] + _BUTTON_INSET + tile.get("slot", 0) * (size + _BUTTON_GAP)
             y_top = tile["y"] + _BUTTON_INSET
             self._rects[index] = (x, y_top, size, size)
+            # Grow this tile's tray box to enclose the button. Buttons of one
+            # tile share its title and top-left, so they group under one tray.
+            key = (tile["title"], round(tile["x"]), round(tile["y"]))
+            box = trays.get(key)
+            if box is None:
+                trays[key] = [x, y_top, x + size, y_top + size]
+            else:
+                box[0], box[1] = min(box[0], x), min(box[1], y_top)
+                box[2], box[3] = max(box[2], x + size), max(box[3], y_top + size)
             y = self._screen_height - y_top - size  # flip to bottom-left origin
             panel.setFrame_display_(NSMakeRect(x, y, size, size), True)
             button.setLabel_(tile.get("label", "✕"))
             button.setHoverRGB_(tile.get("hover", ui.HOVER_RED))
             if abs(button.frame().size.width - size) > 0.5:
-                button.setFrame_(NSMakeRect(0, 0, size, size))
-                button.layer().setCornerRadius_(size / 2)
+                button.setDiameter_(size)
             if not panel.isVisible():
                 panel.orderFrontRegardless()
                 _debug("panel %d (%s %r) shown at (%.0f,%.0f) size=%.0f"
@@ -708,6 +1012,7 @@ class MissionControlButtons(NSObject):
             self._panels[index].orderOut_(None)
             self._targets.pop(index, None)
             self._rects.pop(index, None)
+        self._sync_trays(list(trays.values()))
 
     @objc.python_method
     def _panel_at(self, index):
@@ -738,7 +1043,7 @@ class MissionControlButtons(NSObject):
 
         button = ui.make_close_button(self, "closeClicked:")
         button.setTag_(index)
-        panel.contentView().addSubview_(button)
+        panel.contentView().addSubview_(button.outerView())
         self._buttons.append(button)
         return panel
 
@@ -793,10 +1098,62 @@ class MissionControlButtons(NSObject):
         panel.setContentView_(ui.make_mark_overlay(NSMakeRect(0, 0, 10, 10)))
         return panel
 
+    # -- Liquid Glass tray behind each tile's button row -----------------------
+
+    @objc.python_method
+    def _sync_trays(self, boxes):
+        """A Liquid Glass tray behind each tile's row of buttons, grouping them
+        against busy thumbnails. `boxes` are [x0, y0, x1, y1] button-row bounds
+        in top-left screen coords, grown by a small pad."""
+        pad = 3.0
+        for i, (x0, y0, x1, y1) in enumerate(boxes):
+            tx, ty = x0 - pad, y0 - pad
+            tw, th = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
+            panel = self._tray_panel_at(i)
+            y = self._screen_height - ty - th  # flip to bottom-left origin
+            panel.setFrame_display_(NSMakeRect(tx, y, tw, th), True)
+            if not panel.isVisible():
+                panel.orderFrontRegardless()
+        for i in range(len(boxes), len(self._tray_panels)):
+            self._tray_panels[i].orderOut_(None)
+
+    @objc.python_method
+    def _tray_panel_at(self, index):
+        while len(self._tray_panels) <= index:
+            self._tray_panels.append(self._make_tray_panel())
+        return self._tray_panels[index]
+
+    @objc.python_method
+    def _make_tray_panel(self):
+        size = ui.CLOSE_BUTTON_SIZE
+        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, size, size),
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+            NSBackingStoreBuffered, False)
+        panel.setReleasedWhenClosed_(False)
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(NSColor.clearColor())
+        panel.setHasShadow_(False)
+        panel.setHidesOnDeactivate_(False)
+        panel.setIgnoresMouseEvents_(True)  # decorative; clicks fall through
+        # One level below the buttons (so it never covers them) but above the
+        # Mission Control backdrop.
+        panel.setLevel_(NSPopUpMenuWindowLevel - 1)
+        panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorIgnoresCycle)
+        panel.setContentView_(ui.make_tray(NSMakeRect(0, 0, size, size), 9.0))
+        return panel
+
     def _hide_all(self):
+        self._close_menu()
         for panel in self._panels:
             panel.orderOut_(None)
         for panel in self._mark_panels:
+            panel.orderOut_(None)
+        for panel in self._tray_panels:
             panel.orderOut_(None)
         self._targets = {}
         self._rects = {}
@@ -812,6 +1169,10 @@ class MissionControlButtons(NSObject):
     def _close_index(self, index):
         kind, title, element = self._targets.get(index, (None, None, None))
         if not title:
+            return
+        if kind == "cancel":
+            # Take back a pending window action; its buttons return next frame.
+            self._cancel_deferred_action(title)
             return
         if kind == "fullscreen":
             self._close_fullscreen(index, title, element)
@@ -842,19 +1203,68 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _defer_window_action(self, action, title):
-        """Queue a window close/minimize/quit to run when Mission Control exits.
-        The buttons vanish now and the thumbnail gets a dim scrim (✕ close, −
-        minimize, ⏻ quit) for the rest of the session, so it's clear what will
-        act on exit and the buttons can never reappear on a lingering thumbnail."""
-        if not any(t == title for _, t in self._deferred_actions):
-            self._deferred_actions.append((action, title))
+        """Queue a window action to run when Mission Control exits: 'close',
+        'minimize', or one of the quit levels 'quit' (⌘Q), 'forcequit'
+        (forceTerminate) and 'kill' (SIGKILL). The buttons vanish now and the
+        thumbnail gets a dim scrim glyph for the rest of the session, so it's
+        clear what will act on exit and the buttons can never reappear on a
+        lingering thumbnail."""
+        # One pending action per thumbnail; a later menu pick (e.g. Force Quit
+        # after a plain quit) replaces the earlier one.
+        self._deferred_actions = [(a, t) for a, t in self._deferred_actions
+                                  if t != title]
+        self._deferred_actions.append((action, title))
         # Show a dim "marked" overlay on this thumbnail instead of its buttons.
-        self._marked[title] = {"minimize": "−", "quit": "⏻"}.get(action, "✕")
+        self._marked[title] = {"minimize": "−", "quit": "⏻",
+                               "forcequit": "☠️", "kill": "💀", "snapleft": "◧",
+                               "snapright": "◨", "snapmax": "■"}.get(action, "✕")
         for i, (k, t, e) in list(self._targets.items()):
             if t == title:
                 self._panels[i].orderOut_(None)
                 self._rects.pop(i, None)
         _geom_log("DEFER %s window=%r (applies on MC exit)" % (action, title))
+
+    @objc.python_method
+    def _cancel_deferred_action(self, title):
+        """Take back a pending action on a marked tile/thumbnail and restore its
+        buttons next frame, so the user can choose differently or leave it be.
+        Covers every reversible case: a deferred window action
+        (close/minimize/quit/…); the close queued for a full-screen app that has
+        dropped back to the desktop (that one already left full screen — cancel
+        just keeps it open as an ordinary window); and a held-reference
+        full-screen close still sitting fullscreen in the Spaces Bar."""
+        cancelled = False
+        # Window actions queued via _defer_window_action.
+        kept = []
+        for action, t in self._deferred_actions:
+            if t == title or ax.titles_related(title, t):
+                self._marked.pop(t, None)
+                cancelled = True
+            else:
+                kept.append((action, t))
+        self._deferred_actions = kept
+        # A full-screen app that un-fullscreened and is queued to close on exit.
+        app = self._unfs_pending.pop(title, None)
+        if app is not None:
+            if app in self._deferred_app_closes:
+                self._deferred_app_closes.remove(app)
+            if self._pending_unfs_app == app:  # stop scrimming its reappearance
+                self._pending_unfs_baseline = None
+                self._pending_unfs_app = None
+            cancelled = True
+        # A held-reference full-screen close still in the Spaces Bar.
+        if title in self._deferred_close:
+            self._deferred_close.pop(title, None)
+            cancelled = True
+        self._marked.pop(title, None)
+        # Drop the cancel button now; _sync restores the tile's own buttons on
+        # the next frame, once the mark is gone.
+        for i, (k, t, e) in list(self._targets.items()):
+            if k == "cancel" and t == title:
+                self._panels[i].orderOut_(None)
+                self._rects.pop(i, None)
+        if cancelled:
+            _geom_log("CANCEL pending action for %r" % title)
 
     def applyDeferredActions(self):
         if not self._deferred_actions:
@@ -875,6 +1285,18 @@ class MissionControlButtons(NSObject):
             elif action == "quit":
                 # Quit the whole app (⌘Q), by pid — no title/AX-button matching.
                 ok = self._quit_app_for(title, infos)
+            elif action == "forcequit":
+                ok = self._quit_app_for(title, infos, level="force")
+            elif action == "kill":
+                ok = self._quit_app_for(title, infos, level="kill")
+            elif action in ("snapleft", "snapright", "snapmax"):
+                # Snap to a region of the window's own screen: left/right half,
+                # or 'max' (fill the whole desktop, not macOS full screen).
+                # There's no traffic-light fallback for a resize, so AX-opaque
+                # windows (Steam etc.) just no-op.
+                region = {"snapleft": "left", "snapright": "right",
+                          "snapmax": "max"}[action]
+                ok = ax.snap_window_by_title(title, pids, region)
             else:
                 ok = (ax.close_window_by_title(title, pids)
                       or self._press_held_window(title, infos))
@@ -892,12 +1314,18 @@ class MissionControlButtons(NSObject):
                 "processTrafficLightQueue", None, 0.05)
 
     @objc.python_method
-    def _quit_app_for(self, title, infos):
-        """Quit the app owning the thumbnail titled `title` (⌘Q, graceful — it
-        may prompt to save). By pid, so it works regardless of AX buttons."""
+    def _quit_app_for(self, title, infos, level="graceful"):
+        """Quit the app owning the thumbnail titled `title`, by pid (so it works
+        regardless of AX buttons). `level` picks how hard: 'graceful' is ⌘Q
+        (terminate, may prompt to save), 'force' is Force Quit (forceTerminate,
+        no prompt), 'kill' is a raw SIGKILL to the process."""
         info = self._match_window_info(title, infos)
         if info is None:
             return False
+        if level == "force":
+            return ax.force_quit_pid(info.pid)
+        if level == "kill":
+            return ax.kill_pid(info.pid)
         return ax.quit_pid(info.pid)
 
     @objc.python_method
@@ -1181,6 +1609,7 @@ class MissionControlButtons(NSObject):
             # appears that isn't in this baseline (captured pre-transition).
             self._pending_unfs_baseline = set(self._prev_thumb_titles)
             self._pending_unfs_expires = time.time() + 4.0
+            self._pending_unfs_app = title  # so a ↺ on the reappearance can undo
             # Reliable close once MC exits: close the app's MAIN window BY NAME.
             # (Title matching is unreliable for a just-un-fullscreened window —
             # its AX title often differs from the full-screen-era title we held —

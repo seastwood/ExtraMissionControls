@@ -309,6 +309,33 @@ def quit_pid(pid):
     return False
 
 
+def force_quit_pid(pid):
+    """Force-quit the app with this pid — the Force Quit dialog's behaviour
+    (forceTerminate). The app is killed without a chance to prompt or save.
+    Returns True if the request was delivered; False if no NSRunningApplication
+    resolves for the pid (e.g. a helper process — use kill_pid for those)."""
+    from AppKit import NSRunningApplication
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app is not None:
+        return bool(app.forceTerminate())
+    return False
+
+
+def kill_pid(pid):
+    """Hardest stop: a raw SIGKILL straight to the process. Uncatchable and
+    immediate, and it targets the exact pid (so it works even for the helper
+    processes that own some apps' visible windows, e.g. Steam, where
+    forceTerminate finds no NSRunningApplication). Returns True if the signal
+    was sent."""
+    import os
+    import signal
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except OSError:
+        return False
+
+
 def running_app_names():
     """Localized names of all regular (Dock-visible) running apps."""
     from AppKit import NSApplicationActivationPolicyRegular, NSWorkspace
@@ -504,5 +531,86 @@ def _press_window_button_by_title(title, pids, button_attr):
     target = exact[0] if exact else (related[0] if len(related) == 1 else None)
     return target is not None and AX.AXUIElementPerformAction(
         target, AX.kAXPressAction) == AX.kAXErrorSuccess
+
+
+def _find_window_by_title(title, pids):
+    """The live window matching a thumbnail title among the given pids: exact
+    title, else a UNIQUE prefix match (the Dock shortens the title it shows).
+    Ambiguous prefixes return None so the wrong window is never touched — the
+    same rule the close/minimize matching uses."""
+    if not title:
+        return None
+    exact, related = [], []
+    for pid in pids:
+        for window in _ax_windows(pid):
+            window_title = _attribute(window, AX.kAXTitleAttribute) or ""
+            if window_title == title:
+                exact.append(window)
+            elif titles_related(title, window_title):
+                related.append(window)
+    if exact:
+        return exact[0]
+    return related[0] if len(related) == 1 else None
+
+
+def _snap_frame(region, win_frame):
+    """The AX (top-left origin) frame for a snap region of the screen the window
+    currently sits on, using that screen's *visible* area so the window clears
+    the menu bar and the Dock: the left half, the right half, or 'max' for the
+    whole visible area. `win_frame` is the window's current (x, y, w, h); its
+    centre picks the screen on a multi-display setup."""
+    from AppKit import NSScreen
+    screens = NSScreen.screens()
+    if not screens:
+        return None
+    primary_h = screens[0].frame().size.height  # AX origin = primary top-left
+    wx, wy, ww, wh = win_frame
+    cx, cy = wx + ww / 2.0, wy + wh / 2.0
+
+    def to_ax(rect):  # Cocoa (bottom-left) rect -> AX (top-left) rect
+        return (rect.origin.x,
+                primary_h - (rect.origin.y + rect.size.height),
+                rect.size.width, rect.size.height)
+
+    chosen = screens[0]
+    for screen in screens:
+        sx, sy, sw, sh = to_ax(screen.frame())
+        if sx <= cx <= sx + sw and sy <= cy <= sy + sh:
+            chosen = screen
+            break
+    vx, vy, vw, vh = to_ax(chosen.visibleFrame())
+    if region == "left":
+        return (vx, vy, vw / 2.0, vh)
+    if region == "right":
+        return (vx + vw / 2.0, vy, vw / 2.0, vh)
+    return (vx, vy, vw, vh)  # 'max' — whole visible area (not macOS full screen)
+
+
+def snap_window_by_title(title, pids, region):
+    """Move+resize the window matching a thumbnail title to a region of its
+    screen's visible area: the left half, the right half, or 'max' (fill the
+    whole visible area — maximize on the desktop, not macOS full screen). Window
+    matched like close/minimize (exact title, else unique prefix). Best-effort:
+    apps with a fixed or minimum window size clamp, and AX-opaque windows may
+    ignore it. Returns True if the AX frame updates were accepted."""
+    window = _find_window_by_title(title, pids)
+    if window is None:
+        return False
+    frame = window_frame(window)
+    if frame is None:
+        return False
+    target = _snap_frame(region, frame)
+    if target is None:
+        return False
+    x, y, w, h = target
+    pos = AX.AXValueCreate(_kAXValueCGPointType, Quartz.CGPointMake(x, y))
+    size = AX.AXValueCreate(_kAXValueCGSizeType, Quartz.CGSizeMake(w, h))
+    # Position, then size, then position again: setting one can be constrained
+    # by the other (some apps re-centre on resize), so a second position pass
+    # settles the window where we asked.
+    r1 = AX.AXUIElementSetAttributeValue(window, AX.kAXPositionAttribute, pos)
+    AX.AXUIElementSetAttributeValue(window, AX.kAXSizeAttribute, size)
+    r2 = AX.AXUIElementSetAttributeValue(window, AX.kAXPositionAttribute, pos)
+    return AX.kAXErrorSuccess in (r1, r2)
 
 
