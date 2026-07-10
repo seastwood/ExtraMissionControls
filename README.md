@@ -6,7 +6,7 @@
 
 <p align="center">
   Close buttons for macOS Mission Control <br></br>
-  close any window or fullscreen space right from the overview.
+  close, minimize, full-screen, arrange, or quit any window right from the overview.
 </p>
 
 <p align="center">
@@ -24,10 +24,10 @@
 Apple never shipped a close button in Mission Control. This menu-bar app adds
 a whole row of them: open Mission Control the way you always do (swipe up / ⌃↑
 / F3) and every window thumbnail gains **macOS-style controls in its top-left
-corner** — close, minimize, full screen, and quit — with hover highlighting.
-Fullscreen apps in the Spaces Bar get their own close and exit-full-screen
-buttons. Click one and it applies as you leave Mission Control, so the
-overview never breaks.
+corner** — close, minimize, full screen, arrange (snap to a half or maximize),
+and quit — with hover highlighting. Fullscreen apps in the Spaces Bar get their
+own close and exit-full-screen buttons. Click one and it applies as you leave
+Mission Control, so the overview never breaks.
 
 ## Features
 
@@ -60,9 +60,10 @@ overview never breaks.
 - Works even on apps with **broken accessibility** (e.g. Steam): close and
   minimize fall back to a synthetic click on the real traffic-light button,
   and full screen uses the window's own full-screen button
-- Buttons and menus render with **Liquid Glass** on macOS 26+ (a translucent
-  dark disc on older systems), and highlight in the matching traffic-light color
-  on hover
+- Buttons, their flyout menus, and the tray behind each row render with
+  **Liquid Glass** on macOS 26+ (a translucent dark disc on older systems); each
+  button rests as a glassy tint of its color and fills solid in that
+  traffic-light color on hover
 - Buttons track Mission Control's layout live (thumbnail re-flow, Spaces Bar
   expanding/shrinking) and scale down on small tiles
 - Just a menu-bar item — no Dock icon, no windows of its own
@@ -94,7 +95,8 @@ title/position/size). This app:
    still open leaves a dead "ghost" thumbnail the Dock keeps for the rest of
    the session (clicking it would reopen the app), so instead the thumbnail
    dims with the pending symbol and the real action — pressing the window's
-   close/minimize button, or asking its app to quit (⌘Q) — runs as you leave.
+   close/minimize button, resizing it for a left/right/maximize snap, or asking
+   its app to quit (⌘Q) — runs as you leave.
 
 Fullscreen apps take a different route. Closing one from the Spaces Bar first
 drops it back to the desktop in place (`AXRemoveDesktop` — you stay in Mission
@@ -257,7 +259,7 @@ Env hooks: `EMC_DEBUG=1` (log close paths), `EMC_NO_REGISTRY=1` /
 | `extra_mission_controls/mission_control.py` | ✕ buttons over Mission Control (AX polling + event tap + close chains) |
 | `extra_mission_controls/windows.py` | Window enumeration (CG window list) |
 | `extra_mission_controls/ax.py` | Dock AX tree reading; window close primitives |
-| `extra_mission_controls/ui.py` | Shared ✕ button styling |
+| `extra_mission_controls/ui.py` | Shared button, flyout-menu, and Liquid Glass styling |
 | `scripts/make_icon.py` | Generates the app/volume icon |
 | `scripts/setup_signing.sh` | Creates the stable self-signed signing identity |
 | `scripts/probe_dock_ax.py` | Dev tool: dump the Dock's AX tree with Mission Control open |

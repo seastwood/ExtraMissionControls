@@ -33,6 +33,7 @@ import traceback
 import objc
 import Quartz
 from AppKit import (
+    NSAnimationContext,
     NSBackingStoreBuffered,
     NSColor,
     NSEvent,
@@ -57,6 +58,7 @@ from . import ax, ui, windows
 _DETECT_INTERVAL = 0.25   # Mission Control open/close detection
 _SYNC_INTERVAL = 0.1      # button re-positioning while MC is active
 _HOVER_INTERVAL = 1 / 30.0  # mouse-position polling while MC is active
+_FADE = 0.15              # button/tray/scrim fade in/out duration (seconds)
 _QUIT_HOVER_DELAY = 0.4   # dwell on the quit button before its menu opens
 _QUIT_HOVER_CLOSE_DELAY = 0.35  # grace before a hover-opened menu self-closes
 _REGISTRY_MIN_GAP = 1.0   # coalesce event-driven registry scans
@@ -120,6 +122,7 @@ class MissionControlButtons(NSObject):
         if self is None:
             return None
         self._panels = []           # reusable pool, one per target slot
+        self._fade_target = {}      # id(panel) -> 1/0 intended alpha, for fades
         self._buttons = []          # the CloseButton inside each panel
         self._targets = {}          # index -> (kind, title, space element|None)
         self._rects = {}            # index -> button rect, top-left coords
@@ -1005,11 +1008,11 @@ class MissionControlButtons(NSObject):
             if abs(button.frame().size.width - size) > 0.5:
                 button.setDiameter_(size)
             if not panel.isVisible():
-                panel.orderFrontRegardless()
                 _debug("panel %d (%s %r) shown at (%.0f,%.0f) size=%.0f"
                        % (index, kind, tile["title"], x, y_top, size))
+            self._show_panel(panel)
         for index in range(len(targets), len(self._panels)):
-            self._panels[index].orderOut_(None)
+            self._hide_panel(self._panels[index])
             self._targets.pop(index, None)
             self._rects.pop(index, None)
         self._sync_trays(list(trays.values()))
@@ -1064,10 +1067,9 @@ class MissionControlButtons(NSObject):
                 view.setFrame_(NSMakeRect(0, 0, w, h))
                 view.setNeedsDisplay_(True)
             view.setGlyph_(glyph)
-            if not panel.isVisible():
-                panel.orderFrontRegardless()
+            self._show_panel(panel)
         for index in range(len(marks), len(self._mark_panels)):
-            self._mark_panels[index].orderOut_(None)
+            self._hide_panel(self._mark_panels[index])
 
     @objc.python_method
     def _mark_panel_at(self, index):
@@ -1112,10 +1114,9 @@ class MissionControlButtons(NSObject):
             panel = self._tray_panel_at(i)
             y = self._screen_height - ty - th  # flip to bottom-left origin
             panel.setFrame_display_(NSMakeRect(tx, y, tw, th), True)
-            if not panel.isVisible():
-                panel.orderFrontRegardless()
+            self._show_panel(panel)
         for i in range(len(boxes), len(self._tray_panels)):
-            self._tray_panels[i].orderOut_(None)
+            self._hide_panel(self._tray_panels[i])
 
     @objc.python_method
     def _tray_panel_at(self, index):
@@ -1147,14 +1148,53 @@ class MissionControlButtons(NSObject):
         panel.setContentView_(ui.make_tray(NSMakeRect(0, 0, size, size), 9.0))
         return panel
 
+    # -- fade panels in / out --------------------------------------------------
+
+    @objc.python_method
+    def _show_panel(self, panel):
+        """Fade a panel in. Idempotent once shown; also re-shows a panel that
+        was hidden out of band (raw orderOut) or is mid fade-out."""
+        if panel.isVisible() and self._fade_target.get(id(panel)) == 1:
+            return
+        self._fade_target[id(panel)] = 1
+        if not panel.isVisible():
+            panel.setAlphaValue_(0.0)
+            panel.orderFrontRegardless()
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.currentContext().setDuration_(_FADE)
+        panel.animator().setAlphaValue_(1.0)
+        NSAnimationContext.endGrouping()
+
+    @objc.python_method
+    def _hide_panel(self, panel):
+        """Fade a panel out, then order it out — unless a later _show_panel
+        cancels the pending fade (checked in _finish_hide)."""
+        if self._fade_target.get(id(panel), 0) == 0:
+            return  # already hidden or already fading out
+        self._fade_target[id(panel)] = 0
+        if not panel.isVisible():
+            panel.orderOut_(None)
+            return
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.currentContext().setDuration_(_FADE)
+        NSAnimationContext.currentContext().setCompletionHandler_(
+            lambda: self._finish_hide(panel))
+        panel.animator().setAlphaValue_(0.0)
+        NSAnimationContext.endGrouping()
+
+    @objc.python_method
+    def _finish_hide(self, panel):
+        if self._fade_target.get(id(panel), 0) == 0:
+            panel.orderOut_(None)
+
     def _hide_all(self):
         self._close_menu()
         for panel in self._panels:
-            panel.orderOut_(None)
+            self._hide_panel(panel)
         for panel in self._mark_panels:
-            panel.orderOut_(None)
+            self._hide_panel(panel)
         for panel in self._tray_panels:
-            panel.orderOut_(None)
+            self._hide_panel(panel)
         self._targets = {}
         self._rects = {}
 
