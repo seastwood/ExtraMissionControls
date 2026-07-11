@@ -140,11 +140,75 @@ def _render_centered_glyph(text, point, size):
     return image
 
 
+_GLASS_KEY = "EMCLiquidGlass"
+_liquid_glass = None  # cached setting; loaded from user defaults on first use
+
+
+def liquid_glass_enabled():
+    """Whether the overlays use Liquid Glass (NSGlassEffectView). Default OFF:
+    vibrancy is the most GPU-expensive thing the overlay draws, so the flat
+    style is the energy-efficient default; the menu-bar dropdown toggles it
+    (persisted in user defaults)."""
+    global _liquid_glass
+    if _liquid_glass is None:
+        from Foundation import NSUserDefaults
+        _liquid_glass = bool(
+            NSUserDefaults.standardUserDefaults().boolForKey_(_GLASS_KEY))
+    return _liquid_glass
+
+
+def set_liquid_glass(enabled):
+    """Persist the Liquid Glass preference. Callers must rebuild any pooled
+    views afterwards — the setting is read at view creation time."""
+    global _liquid_glass
+    _liquid_glass = bool(enabled)
+    from Foundation import NSUserDefaults
+    NSUserDefaults.standardUserDefaults().setBool_forKey_(
+        _liquid_glass, _GLASS_KEY)
+
+
+_COLORS_KEY = "EMCButtonColors"
+_button_colors = None  # cached setting; loaded from user defaults on first use
+
+
+def colors_enabled():
+    """Whether the round buttons carry their traffic-light hues (close red,
+    minimize yellow, zoom green, …). Default ON — the colours echo the macOS
+    traffic lights and make each button's job obvious; the menu-bar dropdown
+    can switch to a neutral dark disc. Applies to both the Liquid Glass and
+    the flat styles (applyStyle reads this each time it runs). Unset in user
+    defaults counts as ON, so boolForKey_ (which is False when unset) is only
+    trusted once the key actually exists."""
+    global _button_colors
+    if _button_colors is None:
+        from Foundation import NSUserDefaults
+        defaults = NSUserDefaults.standardUserDefaults()
+        if defaults.objectForKey_(_COLORS_KEY) is None:
+            _button_colors = True
+        else:
+            _button_colors = bool(defaults.boolForKey_(_COLORS_KEY))
+    return _button_colors
+
+
+def set_colors(enabled):
+    """Persist the button-colour preference. Callers rebuild the pooled buttons
+    afterwards so the new style is applied."""
+    global _button_colors
+    _button_colors = bool(enabled)
+    from Foundation import NSUserDefaults
+    NSUserDefaults.standardUserDefaults().setBool_forKey_(
+        _button_colors, _COLORS_KEY)
+
+
 def _make_glass(frame, corner_radius):
     """An NSGlassEffectView (Liquid Glass, macOS 26+) sized to `frame` with the
-    given corner radius, or None where the class is unavailable (older macOS) —
+    given corner radius, or None when disabled (the energy-saving default,
+    toggleable from the menu bar) or where the class is unavailable (older
+    macOS) —
     callers then fall back to a flat translucent layer, so the app looks the
     same as before there."""
+    if not liquid_glass_enabled():
+        return None
     cls = getattr(AppKit, "NSGlassEffectView", None)
     if cls is None:
         return None
@@ -239,41 +303,41 @@ class CloseButton(NSButton):
             self.layer().setCornerRadius_(size / 2.0)
 
     def applyStyle(self):
-        # Liquid Glass: tint the disc — the hover colour when hovered, a dark
-        # glass otherwise (so the white glyph stays legible over any backdrop) —
-        # and set the rim's brightness (brighter on hover) so the edge reads
-        # even over a flat background the glass can't refract.
-        if self._glass is not None:
-            # NSGlassEffectView.tintColor ignores its alpha (it applies a hue,
-            # not opacity), so colour the disc with a fill on the glyph layer,
-            # which sits on top of the glass. Idle shows the button's own hover
-            # colour as a translucent, glassy tint; hover fills it near-solid.
-            # Either way the glass still frosts through it and around the rim.
-            layer = self.layer()
-            if layer is not None:
-                r, g, b = self._hover_rgb or HOVER_RED
-                alpha, rim = (0.85, 0.5) if self._hovered else (0.5, 0.5)
-                layer.setBackgroundColor_(
-                    NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                        r, g, b, alpha).CGColor())
-                layer.setBorderColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(rim).CGColor())
-            return
+        # Fill + rim for the disc, computed for the current render style (Liquid
+        # Glass vs flat), colour setting, and hover state. Colour, when on, is
+        # the button's traffic-light hue — a translucent tint at idle, near
+        # solid on hover. Colour off is a neutral dark disc in both styles; the
+        # glyphs are white, so neutral fills stay dark (never a light fill that
+        # would swallow the glyph) and a bright rim carries the hover cue. For
+        # Liquid Glass the fill goes on the glyph layer ON TOP of the glass
+        # (NSGlassEffectView.tintColor ignores alpha), so the disc still frosts.
+        glass = self._glass is not None
+        hovered = self._hovered
+        r, g, b = self._hover_rgb or HOVER_RED
+        if colors_enabled():
+            if glass:
+                fill, rim = (r, g, b, 0.85 if hovered else 0.5), 0.5
+            elif hovered:
+                fill, rim = (r, g, b, 0.95), 0.9
+            else:
+                fill, rim = (r, g, b, 0.55), 0.45
+        else:
+            if glass:
+                fill = (0.35, 0.35, 0.35, 0.6) if hovered else (0.0, 0.0, 0.0, 0.42)
+                rim = 0.7 if hovered else 0.45
+            elif hovered:
+                fill, rim = (0.30, 0.30, 0.30, 0.92), 0.95
+            else:
+                fill, rim = (0.0, 0.0, 0.0, 0.7), 0.4
         layer = self.layer()
         if layer is None:
             return
-        if self._hovered:
-            r, g, b = self._hover_rgb or HOVER_RED
-            layer.setBackgroundColor_(
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    r, g, b, 0.95).CGColor())
-            layer.setBorderColor_(
-                NSColor.whiteColor().colorWithAlphaComponent_(0.9).CGColor())
-        else:
-            layer.setBackgroundColor_(
-                NSColor.blackColor().colorWithAlphaComponent_(0.7).CGColor())
-            layer.setBorderColor_(
-                NSColor.whiteColor().colorWithAlphaComponent_(0.4).CGColor())
+        fr, fg, fb, fa = fill
+        layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                fr, fg, fb, fa).CGColor())
+        layer.setBorderColor_(
+            NSColor.whiteColor().colorWithAlphaComponent_(rim).CGColor())
 
 
 class MarkView(NSView):

@@ -73,21 +73,88 @@ def _dock_pid():
     return None
 
 
-def mission_control_probably_active():
-    """Cheap idle-poll prefilter: ONE WindowServer query, no AX IPC and no
-    app wake-ups. While Mission Control is up the Dock owns fullscreen
-    windows at layer 18-20; quiescent it only owns wallpaper/backdrop layers
-    (negative) and the dock bar itself. Callers confirm a positive with
-    mission_control_group() — this only exists to make the idle poll free."""
+def _mc_backdrop_windows():
+    """The Dock's layer 18-20 windows: (layers, min_alpha). One resident
+    full-screen layer-20 window exists PERMANENTLY while any fullscreen space
+    does (observed live: name='Dock', 1470x956, alpha 1.0, with Mission
+    Control closed), so mere presence in 18-20 is NOT 'MC is up'. Mission
+    Control itself adds more: a layer-18 window plus another at 20 (observed:
+    {20} idle vs {18, 20, 20} during MC)."""
     raw = Quartz.CGWindowListCopyWindowInfo(
         Quartz.kCGWindowListOptionOnScreenOnly
         | Quartz.kCGWindowListExcludeDesktopElements,
         Quartz.kCGNullWindowID) or []
+    layers = []
+    min_alpha = 1.0
     for entry in raw:
         if entry.get(Quartz.kCGWindowOwnerName) == "Dock" \
                 and 18 <= entry.get(Quartz.kCGWindowLayer, 0) <= 20:
-            return True
-    return False
+            layers.append(entry.get(Quartz.kCGWindowLayer, 0))
+            alpha = float(entry.get(Quartz.kCGWindowAlpha, 1.0))
+            if alpha < min_alpha:
+                min_alpha = alpha
+    return layers, min_alpha
+
+
+def mission_control_probably_active():
+    """Cheap idle-poll prefilter: ONE WindowServer query, no AX IPC and no
+    app wake-ups. True when the Dock's Mission Control backdrop is up — a
+    layer-18 window, or several windows in 18-20 (a LONE layer-20 window is
+    the resident fullscreen-space backdrop that exists even with MC closed).
+    Callers confirm a positive with mission_control_group() — this only
+    exists to make the idle poll free."""
+    layers, _ = _mc_backdrop_windows()
+    return 18 in layers or len(layers) >= 2
+
+
+def mission_control_pulse(exclude_pid):
+    """(present, real_window_sig) from ONE WindowServer query — the sync
+    tick's per-frame heartbeat. `present` is the mission_control_probably_active
+    rule. `real_window_sig` is a rounded-bounds signature of the layer-0 app
+    windows (excluding ours): macOS 26 moves the REAL windows through Mission
+    Control's animations, and at a gesture COMMIT the AX tree snaps to the
+    final layout while these windows visibly ease after it — so 'AX still but
+    real windows moving' identifies the commit, cursor position be damned
+    (the Spaces Bar only expands, and so only signals, when the cursor is in
+    the top region). One list pass; no extra queries over the old check."""
+    raw = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly
+        | Quartz.kCGWindowListExcludeDesktopElements,
+        Quartz.kCGNullWindowID) or []
+    layers = []
+    sig = []
+    for entry in raw:
+        layer = entry.get(Quartz.kCGWindowLayer, 0)
+        if layer == 0:
+            if entry.get(Quartz.kCGWindowOwnerPID) == exclude_pid:
+                continue
+            bounds = entry.get(Quartz.kCGWindowBounds) or {}
+            sig.append((entry.get(Quartz.kCGWindowNumber, 0),
+                        round(bounds.get("X", 0)), round(bounds.get("Y", 0)),
+                        round(bounds.get("Width", 0)),
+                        round(bounds.get("Height", 0))))
+        elif entry.get(Quartz.kCGWindowOwnerName) == "Dock" \
+                and 18 <= layer <= 20:
+            layers.append(layer)
+    present = 18 in layers or len(layers) >= 2
+    return present, tuple(sig)
+
+
+def mission_control_backdrop_state():
+    """(present, settled) for Mission Control's backdrop, from the same single
+    WindowServer query mission_control_probably_active uses.
+
+    `present`: MC's own backdrop windows exist (same rule as
+    mission_control_probably_active — a lone layer-20 window is the resident
+    fullscreen-space backdrop, not MC). `settled`: every backdrop window sits
+    at FULL alpha. The blur tracks a three-finger gesture's progress, so a
+    partial entry/exit shows alpha < 1 — the one 'fully settled' signal for
+    desktop transitions, where neither the AX tree (frozen at the settled
+    layout throughout) nor the scene probe (desktop zooms don't transform
+    overlay windows) sees anything move."""
+    layers, min_alpha = _mc_backdrop_windows()
+    present = 18 in layers or len(layers) >= 2
+    return present, min_alpha >= 0.999
 
 
 def mission_control_group():
@@ -100,6 +167,86 @@ def mission_control_group():
         if _attribute(child, "AXIdentifier") == "mc":
             return child
     return None
+
+
+def _multi_attributes(element, names):
+    """Read several attributes of one element with a SINGLE AX round-trip
+    (AXUIElementCopyMultipleAttributeValues) instead of one Mach IPC per
+    attribute. Returns {name: value}; missing attributes come back as
+    error-typed AXValues, which the callers' unpack helpers turn into None."""
+    try:
+        err, values = AX.AXUIElementCopyMultipleAttributeValues(
+            element, names, 0, None)
+    except Exception:
+        err, values = -1, None
+    if err != AX.kAXErrorSuccess or values is None or len(values) != len(names):
+        return {name: _attribute(element, name) for name in names}
+    return dict(zip(names, values))
+
+
+_THUMB_ATTRS = ["AXTitle", "AXPosition", "AXSize"]
+_SPACE_ATTRS = ["AXTitle", "AXDescription", "AXPosition", "AXSize"]
+
+
+def mission_control_snapshot(group):
+    """One walk of the Mission Control subtree returning
+    (thumbnails, spaces, window_count) — everything a sync frame needs.
+
+    This replaces three separate walks (thumbnails, spaces, window count)
+    that each re-read the same structural nodes, and fetches each leaf's
+    attributes with one batched call instead of three or four — together
+    roughly a 4x cut in AX IPC per frame, which dominates CPU while Mission
+    Control is open (the readers run at 10 Hz)."""
+    thumbs, spaces, window_count = [], [], 0
+    if group is None:
+        return thumbs, spaces, window_count
+    for display in _attribute(group, AX.kAXChildrenAttribute) or []:
+        if _attribute(display, "AXIdentifier") != "mc.display":
+            continue
+        for section in _attribute(display, AX.kAXChildrenAttribute) or []:
+            ident = _attribute(section, "AXIdentifier")
+            if ident == "mc.windows":
+                children = _attribute(section, AX.kAXChildrenAttribute) or []
+                window_count = len(children)
+                for button in children:
+                    vals = _multi_attributes(button, _THUMB_ATTRS)
+                    position = _unpack_point(vals["AXPosition"])
+                    size = _unpack_size(vals["AXSize"])
+                    if position is None or size is None:
+                        continue
+                    title = vals["AXTitle"]
+                    thumbs.append({
+                        "title": title if isinstance(title, str) else "",
+                        "x": position[0],
+                        "y": position[1],
+                        "width": size[0],
+                        "height": size[1],
+                        # AXPress focuses the window (and exits Mission Control).
+                        "element": button,
+                    })
+            elif ident == "mc.spaces":
+                for child in _attribute(section, AX.kAXChildrenAttribute) or []:
+                    if _attribute(child, "AXIdentifier") != "mc.spaces.list":
+                        continue
+                    for button in _attribute(child, AX.kAXChildrenAttribute) or []:
+                        vals = _multi_attributes(button, _SPACE_ATTRS)
+                        position = _unpack_point(vals["AXPosition"])
+                        size = _unpack_size(vals["AXSize"])
+                        if position is None or size is None:
+                            continue
+                        title = vals["AXTitle"]
+                        desc = vals["AXDescription"]
+                        spaces.append({
+                            "title": title if isinstance(title, str) else "",
+                            "desc": desc if isinstance(desc, str) else "",
+                            "x": position[0],
+                            "y": position[1],
+                            "width": size[0],
+                            "height": size[1],
+                            # AXPress on this element switches to the space.
+                            "element": button,
+                        })
+    return thumbs, spaces, window_count
 
 
 def mission_control_thumbnails(group=None):
@@ -612,5 +759,103 @@ def snap_window_by_title(title, pids, region):
     AX.AXUIElementSetAttributeValue(window, AX.kAXSizeAttribute, size)
     r2 = AX.AXUIElementSetAttributeValue(window, AX.kAXPositionAttribute, pos)
     return AX.kAXErrorSuccess in (r1, r2)
+
+
+# Native macOS window tiling (macOS 15+) lives in the app's menu bar under
+# Window ▸ Move & Resize ▸ {Left | Right | Fill}. Pressing the leaf item makes
+# the window a REAL macOS tile — it joins the tile group and gets the shared
+# resize divider between adjacent halves — unlike snap_window_by_title, which
+# only sets a frame the window system doesn't recognise as a pair. Matched by
+# English menu titles (other locales fall through to the raw snap), and only
+# standard AppKit apps expose these items (Electron/Java/game windows don't), so
+# tile_window_native returns False whenever it can't drive the menu.
+_TILE_WINDOW_MENU = ("Window",)
+_TILE_SUBMENU = ("Move & Resize",)
+_TILE_LEAF = {"left": ("Left",), "right": ("Right",), "max": ("Fill", "Maximize")}
+
+
+def _submenu_items(element):
+    """The AXMenuItem children of a menu bar item or menu item: its submenu is
+    the single AXMenu child, whose children are the items. Empty if the element
+    has no (populated) submenu."""
+    for child in _attribute(element, AX.kAXChildrenAttribute) or []:
+        if _attribute(child, AX.kAXRoleAttribute) == "AXMenu":
+            return list(_attribute(child, AX.kAXChildrenAttribute) or [])
+    return []
+
+
+def _menu_item_titled(items, titles):
+    """The first menu item whose AX title is in `titles`, or None."""
+    for item in items:
+        if (_attribute(item, AX.kAXTitleAttribute) or "") in titles:
+            return item
+    return None
+
+
+def focus_window_by_title(title, pids):
+    """Make the window matching a thumbnail title the app's main window, raise
+    it, and bring the app frontmost — so a subsequent native-tile menu press
+    lands on it. Returns the owning pid, or None if the window wasn't found.
+
+    Split from the menu press (tile_focused_app) on purpose: activation is
+    asynchronous, so the caller waits a beat between focusing and pressing, and
+    stages multiple windows apart so their tile animations don't collide."""
+    window = _find_window_by_title(title, pids)
+    if window is None:
+        return None
+    err, pid = AX.AXUIElementGetPid(window, None)
+    if err != AX.kAXErrorSuccess or not pid:
+        return None
+    AX.AXUIElementSetAttributeValue(window, AX.kAXMainAttribute, True)
+    AX.AXUIElementPerformAction(window, AX.kAXRaiseAction)
+    activate_pid(pid)
+    return pid
+
+
+def tile_focused_app(pid, region):
+    """Press the native tiling menu leaf for the app's focused window: Window ▸
+    Move & Resize ▸ Left/Right, or the top-level Fill for 'max'. Returns True
+    only if the item was found and the press succeeded; False otherwise (no such
+    menu, wrong locale, disabled item), so the caller can fall back to a raw
+    snap. Pair with focus_window_by_title, which makes the target window main."""
+    leaf_titles = _TILE_LEAF.get(region)
+    if not leaf_titles or not pid:
+        return False
+    app = AX.AXUIElementCreateApplication(pid)
+    AX.AXUIElementSetMessagingTimeout(app, 0.5)
+    menu_bar = _attribute(app, "AXMenuBar")
+    if menu_bar is None:
+        return False
+    window_menu = _menu_item_titled(
+        _attribute(menu_bar, AX.kAXChildrenAttribute) or [], _TILE_WINDOW_MENU)
+    if window_menu is None:
+        return False
+    items = _submenu_items(window_menu)
+    # Sequoia/Tahoe nest the tile items under a "Move & Resize" submenu; look
+    # there first, then fall back to any that sit directly in the Window menu.
+    candidates = []
+    submenu = _menu_item_titled(items, _TILE_SUBMENU)
+    if submenu is not None:
+        candidates.extend(_submenu_items(submenu))
+    candidates.extend(items)
+    leaf = _menu_item_titled(candidates, leaf_titles)
+    if leaf is None:
+        return False
+    # Don't pre-check AXEnabled: right after activation the app may not have come
+    # forward yet, so a genuinely tileable item can still read disabled. Just
+    # press — AXPress returns non-success on a truly disabled item (e.g. an
+    # Electron window that can't tile), and the caller then snaps.
+    return press_element(leaf)
+
+
+def tile_window_native(title, pids, region):
+    """Single-shot native tile: focus the matching window, then press its tiling
+    menu leaf. Returns True on success. The staged Arrange path uses
+    focus_window_by_title + tile_focused_app directly so it can wait between the
+    two steps; this convenience wrapper is for a one-off with no such need."""
+    pid = focus_window_by_title(title, pids)
+    if pid is None:
+        return False
+    return tile_focused_app(pid, region)
 
 
