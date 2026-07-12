@@ -471,34 +471,35 @@ class MenuView(NSView):
 
 
 def make_menu(frame):
-    """Build the flyout's views. Returns (root, menu_view): `root` is placed in
-    the panel — a Liquid Glass wrapper on macOS 26+, else the MenuView itself
-    with a dark rounded layer — and `menu_view` is the MenuView the controller
-    drives with set_items / set_highlight."""
+    """Build the flyout's views. Returns (root, menu_view): `root` is placed
+    in the panel — a Liquid Glass wrapper when enabled (macOS 26+), else a
+    dark HUD BLUR (NSVisualEffectView), same treatment as the trays — and
+    `menu_view` is the MenuView the controller drives with set_items /
+    set_highlight. Either way the rows draw on a transparent MenuView riding
+    the material, with the rim on the MenuView's layer so the menu's edge
+    reads against flat backgrounds."""
     view = MenuView.alloc().initWithFrame_(frame)
     view.setWantsLayer_(True)
     view.set_items(())
     view.set_highlight(-1)
+    layer = view.layer()
+    layer.setCornerRadius_(10.0)
+    layer.setBorderWidth_(1.0)
+    layer.setBorderColor_(
+        NSColor.whiteColor().colorWithAlphaComponent_(0.28).CGColor())
     glass = _make_glass(frame, 10.0)
     if glass is not None:
         glass.setContentView_(view)   # menu rows draw on top of the glass
-        # Rim on the rows layer (on top of the glass) so the menu's edge reads
-        # against a flat background, same idea as the buttons.
-        layer = view.layer()
-        layer.setCornerRadius_(10.0)
-        layer.setBorderWidth_(1.0)
-        layer.setBorderColor_(
-            NSColor.whiteColor().colorWithAlphaComponent_(0.28).CGColor())
         return glass, view
-    layer = view.layer()
-    layer.setCornerRadius_(10.0)
-    layer.setMasksToBounds_(True)
-    layer.setBackgroundColor_(
-        NSColor.blackColor().colorWithAlphaComponent_(0.9).CGColor())
-    layer.setBorderWidth_(1.0)
-    layer.setBorderColor_(
-        NSColor.whiteColor().colorWithAlphaComponent_(0.25).CGColor())
-    return view, view
+    blur = AppKit.NSVisualEffectView.alloc().initWithFrame_(frame)
+    blur.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+    blur.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
+    blur.setState_(AppKit.NSVisualEffectStateActive)  # panels are never key
+    blur.setMaskImage_(_rounded_mask_image(10.0))
+    view.setAutoresizingMask_(
+        AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+    blur.addSubview_(view)            # rows + rim ride the frosted backdrop
+    return blur, view
 
 
 def make_close_button(target, action, size=CLOSE_BUTTON_SIZE):
@@ -528,11 +529,28 @@ def make_close_button(target, action, size=CLOSE_BUTTON_SIZE):
     return button
 
 
+def _rounded_mask_image(radius):
+    """A stretchable white rounded-rect (cap insets = radius) — the supported
+    way to round an NSVisualEffectView's corners (a plain layer cornerRadius
+    does not reliably clip the blur backdrop)."""
+    size = radius * 2 + 2.0
+    image = NSImage.alloc().initWithSize_(NSMakeSize(size, size))
+    image.lockFocus()
+    NSColor.whiteColor().set()
+    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(0, 0, size, size), radius, radius).fill()
+    image.unlockFocus()
+    image.setCapInsets_(AppKit.NSEdgeInsetsMake(radius, radius, radius, radius))
+    image.setResizingMode_(AppKit.NSImageResizingModeStretch)
+    return image
+
+
 def make_tray(frame, corner_radius):
-    """A Liquid Glass tray to sit behind a tile's row of buttons (macOS 26+),
-    with a faint rim so its edge reads against a flat background; or a subtle
-    translucent rounded view where glass is unavailable. Returned view is used
-    as the tray panel's content view."""
+    """The tray behind a tile's row of buttons. Liquid Glass when enabled
+    (macOS 26+); otherwise a dark HUD BLUR (NSVisualEffectView) — the classic
+    frosted material, softer than the old flat black fill and much cheaper
+    than Liquid Glass. Both carry a faint rim so the edge reads over busy
+    thumbnails. Returned view is used as the tray panel's content view."""
     glass = _make_glass(frame, corner_radius)
     if glass is not None:
         glass.setWantsLayer_(True)
@@ -543,10 +561,22 @@ def make_tray(frame, corner_radius):
             layer.setBorderColor_(
                 NSColor.whiteColor().colorWithAlphaComponent_(0.22).CGColor())
         return glass
-    view = NSView.alloc().initWithFrame_(frame)
-    view.setWantsLayer_(True)
-    layer = view.layer()
+    blur = AppKit.NSVisualEffectView.alloc().initWithFrame_(frame)
+    blur.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+    blur.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
+    blur.setState_(AppKit.NSVisualEffectStateActive)  # never dims: no key window
+    blur.setMaskImage_(_rounded_mask_image(corner_radius))
+    # The rim rides a transparent subview (a border set on the blur's own
+    # layer would ignore the mask's rounded shape).
+    rim = NSView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, frame.size.width, frame.size.height))
+    rim.setAutoresizingMask_(
+        AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+    rim.setWantsLayer_(True)
+    layer = rim.layer()
     layer.setCornerRadius_(corner_radius)
-    layer.setBackgroundColor_(
-        NSColor.blackColor().colorWithAlphaComponent_(0.4).CGColor())
-    return view
+    layer.setBorderWidth_(1.0)
+    layer.setBorderColor_(
+        NSColor.whiteColor().colorWithAlphaComponent_(0.2).CGColor())
+    blur.addSubview_(rim)
+    return blur

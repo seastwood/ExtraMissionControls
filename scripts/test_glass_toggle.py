@@ -42,10 +42,15 @@ def main():
         check("button has no glass wrapper (draws its own disc)",
               button.outerView() is button)
         tray = ui.make_tray(NSMakeRect(0, 0, 100, 30), 9.0)
-        check("tray falls back to a flat view",
-              type(tray).__name__ != "NSGlassEffectView")
+        check("tray falls back to a HUD blur (NSVisualEffectView)",
+              isinstance(tray, __import__("AppKit").NSVisualEffectView)
+              and type(tray).__name__ != "NSGlassEffectView")
+        check("blur tray has its rounded mask", tray.maskImage() is not None)
         root, view = ui.make_menu(NSMakeRect(0, 0, 158, 90))
-        check("menu root is the flat MenuView itself", root is view)
+        check("menu root is a HUD blur with the rows riding it",
+              isinstance(root, __import__("AppKit").NSVisualEffectView)
+              and root is not view and view.superview() is root
+              and root.maskImage() is not None)
 
         # Toggle ON: persisted, and glass comes back (macOS 26 has the class).
         ui.set_liquid_glass(True)
