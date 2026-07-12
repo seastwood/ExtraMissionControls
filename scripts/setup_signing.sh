@@ -35,8 +35,10 @@ ensure_keychain_ready() {
     if [[ ! -f "$KEYCHAIN" ]]; then
         security create-keychain -p "$KC_PASS" "$KEYCHAIN"
     fi
-    security set-keychain-settings "$KEYCHAIN"          # no auto-lock timeout
+    # Unlock FIRST: set-keychain-settings on a locked keychain falls back to
+    # a GUI password prompt; unlock-keychain -p is non-interactive.
     security unlock-keychain -p "$KC_PASS" "$KEYCHAIN"
+    security set-keychain-settings "$KEYCHAIN"          # no auto-lock timeout
     # Add to the user search list (once) so codesign can find the identity.
     if ! security list-keychains -d user | grep -qF "$KEYCHAIN"; then
         local existing
