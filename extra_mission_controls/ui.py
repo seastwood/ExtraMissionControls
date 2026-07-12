@@ -303,32 +303,45 @@ class CloseButton(NSButton):
             self.layer().setCornerRadius_(size / 2.0)
 
     def applyStyle(self):
-        # Fill + rim for the disc, computed for the current render style (Liquid
-        # Glass vs flat), colour setting, and hover state. Colour, when on, is
-        # the button's traffic-light hue — a translucent tint at idle, near
-        # solid on hover. Colour off is a neutral dark disc in both styles; the
-        # glyphs are white, so neutral fills stay dark (never a light fill that
-        # would swallow the glyph) and a bright rim carries the hover cue. For
-        # Liquid Glass the fill goes on the glyph layer ON TOP of the glass
-        # (NSGlassEffectView.tintColor ignores alpha), so the disc still frosts.
+        # Fill + rim for the disc, computed for the current render style
+        # (Liquid Glass vs flat), colour setting, and hover state.
+        #
+        # LIQUID GLASS aims to look like GLASS, not paint: the hue (when
+        # Colors is on) is applied with NSGlassEffectView's own tintColor,
+        # which infuses the material without covering it, and the paint layer
+        # on top drops to a whisper — just enough dark/hue backing to keep
+        # the white glyph legible over bright thumbnails. Hover brightens the
+        # backing and the rim rather than flooding the disc. (tintColor
+        # ignores its alpha — it sets a hue, not an opacity — which is
+        # exactly what makes it the right vehicle for a glassy colour.)
+        #
+        # FLAT keeps the original solid discs: colour = hue tint at idle and
+        # near-solid on hover; neutral = dark disc, bright rim on hover.
         glass = self._glass is not None
         hovered = self._hovered
         r, g, b = self._hover_rgb or HOVER_RED
+        tint = None
         if colors_enabled():
             if glass:
-                fill, rim = (r, g, b, 0.85 if hovered else 0.5), 0.5
+                tint = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                    r, g, b, 1.0)
+                fill = (r, g, b, 0.62 if hovered else 0.26)
+                rim = 0.65 if hovered else 0.38
             elif hovered:
                 fill, rim = (r, g, b, 0.95), 0.9
             else:
                 fill, rim = (r, g, b, 0.55), 0.45
         else:
             if glass:
-                fill = (0.35, 0.35, 0.35, 0.6) if hovered else (0.0, 0.0, 0.0, 0.42)
-                rim = 0.7 if hovered else 0.45
+                fill = ((0.42, 0.42, 0.42, 0.45) if hovered
+                        else (0.0, 0.0, 0.0, 0.22))
+                rim = 0.75 if hovered else 0.35
             elif hovered:
                 fill, rim = (0.30, 0.30, 0.30, 0.92), 0.95
             else:
                 fill, rim = (0.0, 0.0, 0.0, 0.7), 0.4
+        if glass:
+            self._glass.setTintColor_(tint)  # None clears to plain glass
         layer = self.layer()
         if layer is None:
             return

@@ -14,7 +14,7 @@ from AppKit import (
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
-from . import ax, ui
+from . import __version__, ax, ui
 from .mission_control import MissionControlButtons
 
 
@@ -49,7 +49,7 @@ class AppDelegate(NSObject):
 
         menu = NSMenu.alloc().init()
         info = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "✕ buttons active in Mission Control", None, "")
+            "Extra Mission Controls %s" % __version__, None, "")
         info.setEnabled_(False)
         menu.addItem_(info)
         menu.addItem_(NSMenuItem.separatorItem())

@@ -61,8 +61,18 @@ _DETECT_INTERVAL = 0.15   # Mission Control open/close detection (was 0.25;
                           # sooner after MC opens — the check is one ~0.1ms
                           # CGWindowList query, so even ~7Hz is negligible)
 _SYNC_INTERVAL = 0.1      # button re-positioning while MC is active
+# Until a session's FIRST settle the sync loop runs faster: every stage of
+# entry detection (baseline, stillness, the commit-ease overlap) quantizes to
+# this tick, so 20 Hz halves the wait between gesture commit and buttons.
+# The moment a layout is accepted the loop drops back to _SYNC_INTERVAL —
+# the fast rate only ever spans the entry transition (typically <1s).
+_SYNC_INTERVAL_FAST = 0.05
 _HOVER_INTERVAL = 1 / 30.0  # mouse-position polling while MC is active
-_FADE = 0.15              # button/tray/scrim fade in/out duration (seconds)
+_FADE_IN = 0.15           # gentle button/tray/scrim appear (user preference)
+_FADE_OUT = 0.08          # quick clear — keeps exits crisp (nothing lingers
+                          # over a closing overview); reads matched to the
+                          # slower fade-in, since vanishing content is
+                          # perceived as softer than appearing content
 _QUIT_HOVER_DELAY = 0.4   # dwell on the quit button before its menu opens
 _QUIT_HOVER_CLOSE_DELAY = 0.35  # grace before a hover-opened menu self-closes
 _REGISTRY_MIN_GAP = 1.0   # coalesce event-driven registry scans
@@ -84,6 +94,31 @@ _EXIT_LATCH_MAX = 0.8
 # a hypothetical machine whose bar rests collapsed: a longer hold still opens.
 _SETTLE_CONFIRM = 0.4
 _SETTLE_CONFIRM_NOBAR = 1.5
+# Raw trackpad touch frames (NSEventTypeGesture) stream at ~125Hz while any
+# finger touches the pad — verified by a listen-only tap during real gestures.
+# No frame for _TOUCH_IDLE seconds ⇒ fingers are off ⇒ no gesture can be
+# mid-flight, so a still layout is trusted IMMEDIATELY (a fast flick's ease
+# settles with the bar still collapsed and no AX snap — geometry alone gave
+# no commit signal there, and the old fallback was the 1.5s wait). Mouse and
+# keyboard users never produce touch frames, so they get instant acceptance.
+_TOUCH_EVENT_TYPE = 29
+_TOUCH_IDLE = 0.12
+# Quiescent-state economics: with Mission Control settled and untouched there
+# is nothing to compute, so the sync work pauses entirely unless the cursor is
+# within reach of the Spaces Bar (whose hover-expansion is the only change the
+# real-window signature cannot reveal). A slow heartbeat resync guarantees any
+# unforeseen drift heals within a second.
+_BAR_REGION_HEIGHT = 160.0
+_BAR_BURST = 0.8   # fast full frames after crossing the bar region boundary
+_QUIET_RESYNC = 1.0
+_QUIET_RESYNC_BAR = 0.25   # cursor near the bar: faster heartbeat, still not 10Hz
+# Mission Control's hover effect LIFTS the real window under the cursor by a
+# few percent (10-25px on a typical thumbnail) — cosmetic, absent from the AX
+# layout. Real transitions move windows 50-300px per frame. Bounds deltas at
+# or under this tolerance are not "motion": they fall through to the full
+# pipeline, where the AX-based settle machine decides (which correctly
+# ignores hover lifts); only bigger deltas take the cheap hide-fast paths.
+_MOTION_TOLERANCE = 30.0
 
 # The scene gate opens after this many consecutive at-rest probe reads
 # (30 Hz): the WindowServer transforms our windows during MC's enter/exit
@@ -141,6 +176,25 @@ def _debug(message):
             pass
 
 
+def _sig_moved(prev, cur, tol=_MOTION_TOLERANCE):
+    """Whether two window-bounds signatures differ MEANINGFULLY: any window
+    appearing or vanishing counts, but bounds drift within `tol` px (Mission
+    Control's cosmetic hover lift) does not."""
+    if prev is None or cur is None:
+        return False
+    if len(prev) != len(cur):
+        return True
+    old = {entry[0]: entry[1:] for entry in prev}
+    for entry in cur:
+        bounds = old.get(entry[0])
+        if bounds is None:
+            return True
+        for a, b in zip(bounds, entry[1:]):
+            if abs(a - b) > tol:
+                return True
+    return False
+
+
 def _geom_log(message):
     """Diagnostic trace (close chains, layouts) — debug builds only."""
     if not _DEBUG:
@@ -169,6 +223,7 @@ class MissionControlButtons(NSObject):
         self._screen_width = None
         self._active = False
         self._mc_group = None   # cached Dock 'mc' element while MC is up
+        self._sync_interval = 0.0   # current sync cadence (fast until settled)
         self._timer = None
         self._sync_timer = None
         self._hover_timer = None
@@ -266,6 +321,7 @@ class MissionControlButtons(NSObject):
         self._scene_streak = _SCENE_STREAK_MIN
         self._scene_dead_ticks = 0    # unreadable-probe ticks (signal broke)
         self._scene_closed_ticks = 0  # any closed-gate ticks (insurance)
+        self._probe_decim = 0         # settled probe polling decimation
         # Settled-layout state machine (desktop gestures): the thumbs layout
         # currently trusted for rendering, the candidate layout waiting to be
         # trusted, when it started holding still, and the bar's last settled
@@ -277,6 +333,29 @@ class MissionControlButtons(NSObject):
         self._commit_until = 0.0  # brief fast-accept window after a gesture commits
         self._cg_sig = None       # real-window bounds signature (syncTick pulse)
         self._prev_cg_sig = None
+        # Timestamp of the last raw trackpad touch frame seen by the tap.
+        # Deliberately NOT reset per session: 0.0 (or a stale time) reads as
+        # "fingers up", which is correct for keyboard/mouse opens; an active
+        # gesture refreshes it within ~10ms of the tap enabling.
+        self._last_touch = 0.0
+        # Quiescent-skip bookkeeping: the by-id watchdog (window ids worth
+        # watching + their last signature), when the last full sync ran, the
+        # cursor's last top-left y (fed by the hover tick), and the hovered
+        # button. Any button action sets _watch_sig = None (bust).
+        self._watch_ids = ()
+        self._watch_sig = None
+        self._pulse_prev = None  # last frame's pulse sig (motion short-circuit)
+        self._pulse_prev_t = 0.0  # when it was sampled (stale = not "motion")
+        self._near_bar_prev = None   # cursor side of the bar boundary
+        self._bar_burst_until = 0.0  # full-rate window around bar transitions
+        self._last_full_sync = 0.0
+        self._quiet_skips = 0   # EMC_DEBUG telemetry: skip/full frame ratio
+        self._quiet_fulls = 0
+        self._last_mouse_y = None
+        self._hover_index = None
+        # Last (label, hover rgb, size) applied per button index, so identical
+        # frames send no ObjC at all in _sync_panels.
+        self._button_applied = {}
         # {title: glyph} thumbnails marked for a deferred action — shown with a
         # dim overlay so it is clear which windows will close on exit.
         self._marked = {}
@@ -388,6 +467,9 @@ class MissionControlButtons(NSObject):
     def _activate(self, group):
         self._active = True
         self._activated_at = time.time()
+        # The idle detect poll has nothing to do while MC is up (syncTick owns
+        # liveness); parking it saves ~7 no-op Python wakeups a second.
+        self._stop_detect_timer()
         self._mc_group = group  # cached; syncTick revalidates with one AX call
         # AX coordinates are relative to the primary screen's top-left.
         self._screen_height = NSScreen.screens()[0].frame().size.height
@@ -405,17 +487,42 @@ class MissionControlButtons(NSObject):
         self._commit_until = 0.0
         self._cg_sig = None
         self._prev_cg_sig = None
+        self._watch_ids = ()
+        self._watch_sig = None
+        self._pulse_prev = None
+        self._pulse_prev_t = 0.0
+        self._near_bar_prev = None
+        self._bar_burst_until = 0.0
+        self._last_full_sync = 0.0
         self._show_scene_probe()
         self._set_tap_enabled(True)
         self._start_hover_polling()
-        self._sync_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            _SYNC_INTERVAL, self, "syncTick:", None, True)
+        # Entry runs at the fast cadence; _set_sync_interval drops it back to
+        # _SYNC_INTERVAL the moment the first layout is accepted.
+        self._sync_interval = 0.0
+        self._set_sync_interval(_SYNC_INTERVAL_FAST)
         self._sync(group)
+
+    @objc.python_method
+    def _set_sync_interval(self, interval):
+        """(Re)schedule the sync timer at `interval`, if it isn't already
+        there. Headless callers (unit tests) have no run loop — the value is
+        recorded either way so the transition is observable."""
+        if self._sync_interval == interval:
+            return
+        self._sync_interval = interval
+        if self._sync_timer is not None:
+            self._sync_timer.invalidate()
+            self._sync_timer = None
+        if self._active:
+            self._sync_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                interval, self, "syncTick:", None, True)
 
     @objc.python_method
     def _deactivate(self):
         _geom_log("DEACTIVATE %.3f (mc group gone)" % (time.time() % 1000))
         self._active = False
+        self._start_detect_timer()
         self._mc_group = None
         self._scene_streak = 0
         if self._scene_probe is not None:
@@ -459,10 +566,45 @@ class MissionControlButtons(NSObject):
         try:
             if not self._active:
                 return
-            # Cheapest check first: one WindowServer query, no Dock IPC. It
-            # also yields the real-window bounds signature the settle machine
-            # uses to spot a gesture commit (AX still + real windows easing).
-            present, self._cg_sig = ax.mission_control_pulse(os.getpid())
+            # Quiescent settled state, decided BEFORE any full query: watch
+            # only the windows that matter — the real windows macOS moves
+            # through every Mission Control re-layout, plus the backdrop
+            # windows whose death is an exit — via a ~0.1ms by-id description
+            # (vs ~1ms for a full list pass). Unchanged signature ⇒ the
+            # overview cannot differ ⇒ this frame costs nothing else. The
+            # cursor being near the Spaces Bar only SHORTENS the heartbeat
+            # (bar hover-expansion is invisible to window bounds); any button
+            # action busts _watch_sig so scrims/cancels show next frame. This
+            # is what makes "sitting in Mission Control" cost ~nothing.
+            now = time.time()
+            mouse_y = (self._last_mouse_y if self._last_mouse_y is not None
+                       else 0.0)  # unknown counts as "near the bar"
+            beat = (_QUIET_RESYNC_BAR if mouse_y <= _BAR_REGION_HEIGHT
+                    else _QUIET_RESYNC)
+            if (self._settled_thumbs_sig is not None
+                    and self._watch_sig is not None
+                    and now >= self._bar_burst_until
+                    and now - self._last_full_sync < beat
+                    and not _sig_moved(self._watch_sig,
+                                       ax.windows_alive_signature(
+                                           self._watch_ids))):
+                self._quiet_skips += 1
+                return
+            if (now >= self._bar_burst_until
+                    and self._settled_thumbs_sig is not None
+                    and self._sync_interval == _SYNC_INTERVAL_FAST):
+                # A bar burst just ended: back to the efficient cadence.
+                self._set_sync_interval(_SYNC_INTERVAL)
+            self._quiet_fulls += 1
+            if _DEBUG and self._quiet_skips + self._quiet_fulls >= 100:
+                _geom_log("QUIET %d skipped / %d full frames"
+                          % (self._quiet_skips, self._quiet_fulls))
+                self._quiet_skips = self._quiet_fulls = 0
+            # Full frame: one WindowServer list pass, no Dock IPC. It also
+            # yields the real-window bounds signature the settle machine uses
+            # to spot a gesture commit (AX still + real windows easing).
+            present, self._cg_sig, watch_ids = \
+                ax.mission_control_pulse(os.getpid())
             if not present:
                 self._mc_group = None
                 if ax.mission_control_group() is None:
@@ -478,9 +620,55 @@ class MissionControlButtons(NSObject):
             if self._scene_streak < _SCENE_STREAK_MIN:
                 # Mid-transition (the scene probe reads transformed): nothing
                 # is clickable, nothing is rendered, and there is nothing to
-                # read — this frame costs the one backdrop query above. The
-                # probe itself is polled at 30 Hz by the hover tick, and
+                # read — this frame costs the one list pass above. The probe
+                # itself is polled at 30 Hz by the hover tick, and
                 # deactivation is covered by the backdrop check.
+                return
+            # Real windows in motion: the AX tree just mirrors them (verified
+            # frame-by-frame in the gesture logs) and the settle machine's
+            # answer would be "moving — render nothing", so walking the Dock's
+            # AX tree now is pure waste — and worst-priced, since the Dock is
+            # busiest exactly during its animations (this was the 16% CPU
+            # spike on open/close). Stop at the pulse until motion ends,
+            # except when a post-action glide needs live coords to move the
+            # buttons with their thumbnails.
+            # Pre-settle there are no buttons and no hover lifts — any real
+            # drift is a gesture/animation, so tolerance applies only once
+            # settled (where it exists to ignore MC's cosmetic hover lift).
+            tol = (_MOTION_TOLERANCE if self._settled_thumbs_sig is not None
+                   else 0.0)
+            # "Moving" requires TWO FRESH consecutive samples that differ. A
+            # single divergence against a stale baseline (the previous full
+            # frame may be a whole quiet heartbeat old) is NOT motion — it is
+            # usually a hover lift that outgrew the tolerance, and hiding on
+            # it flashed the buttons once per session. Such frames fall
+            # through to the full sync, where the AX machine decides (and it
+            # correctly ignores hover lifts). Real animations produce fresh
+            # consecutive divergences within a frame or two either way.
+            fresh = now - self._pulse_prev_t < 0.25
+            cg_moving = (fresh
+                         and _sig_moved(self._pulse_prev, self._cg_sig, tol))
+            self._pulse_prev = self._cg_sig
+            self._pulse_prev_t = now
+            if cg_moving:
+                fingers_up = now - self._last_touch >= _TOUCH_IDLE
+                gliding = (self._settled_thumbs_sig is not None
+                           and fingers_up and bool(self._recently_closed))
+                if not gliding:
+                    if self._rects:
+                        # Buttons up while things move and it's not a glide:
+                        # an exit or gesture is starting — drop them now.
+                        _geom_log("MOTION-HIDE (cg moving, no glide)")
+                        self._hide_all(immediate=True)
+                    self._watch_sig = None  # quiet skip stays off until still
+                    return
+            elif (self._settled_thumbs_sig is None
+                    and self._candidate_sig is not None
+                    and now - self._last_full_sync < 0.15):
+                # Frozen mid-gesture hold: nothing moves, the candidate layout
+                # is already known, and acceptance is timer/fingers-driven —
+                # re-walking the AX tree at the full entry cadence would just
+                # re-read identical frames. ~7 Hz is plenty to notice release.
                 return
             # Reuse the cached 'mc' group element: verifying it is alive is a
             # single AX call, where re-discovering it walks the Dock's whole
@@ -492,7 +680,11 @@ class MissionControlButtons(NSObject):
             if group is None:
                 self._deactivate()
                 return
+            self._last_full_sync = now
             self._sync(group)
+            # Re-arm the watchdog against the state just rendered.
+            self._watch_ids = watch_ids
+            self._watch_sig = ax.windows_alive_signature(watch_ids)
         except Exception:
             traceback.print_exc()
 
@@ -688,24 +880,43 @@ class MissionControlButtons(NSObject):
         if cg_moving and thumbs_still and self._settled_thumbs_sig is None:
             _geom_log("COMMIT-EASE detected (AX still, windows easing)")
             self._commit_until = now + 0.5
+        # Fingers off the trackpad ⇒ no gesture can be holding a layout
+        # mid-flight. Used twice: to accept a still layout immediately (the
+        # flick/keyboard fast path) and to keep buttons GLUED to thumbnails
+        # through a system re-flow instead of blinking them out and back.
+        fingers_up = now - self._last_touch >= _TOUCH_IDLE
         if thumbs_still and thumbs_sig != self._settled_thumbs_sig:
             if self._candidate_sig != thumbs_sig:
                 self._candidate_sig = thumbs_sig
                 self._candidate_since = now
             confirm = _SETTLE_CONFIRM if bar_ok else _SETTLE_CONFIRM_NOBAR
-            if now < self._commit_until \
+            if fingers_up or now < self._commit_until \
                     or now - self._candidate_since >= confirm:
                 self._settled_thumbs_sig = thumbs_sig
                 self._candidate_sig = None
                 self._commit_until = 0.0
+                # Entry is over: drop the sync loop back to its efficient rate.
+                self._set_sync_interval(_SYNC_INTERVAL)
         elif not thumbs_still:
             self._candidate_sig = None
         mc_settled = thumbs_still and thumbs_sig == self._settled_thumbs_sig
-        if not mc_settled:
+        # Post-action re-flow glide: when a layout WE were settled in starts
+        # moving with no fingers on the pad, right after one of our own
+        # actions (a tile close / un-fullscreen re-flows Mission Control),
+        # it is a system ease, not a gesture — keep emitting at the live AX
+        # coords so the pooled panels MOVE with their thumbnails rather than
+        # hiding and re-confirming. Gesture motion always has fingers down,
+        # and transition zooms are already cut off by the scene gate above.
+        gliding = (not mc_settled and not thumbs_still
+                   and self._settled_thumbs_sig is not None
+                   and fingers_up and bool(self._recently_closed))
+        if not mc_settled and not gliding:
             self._trace_gate("await-settle bar_ok=%d still=%d"
                              % (bar_ok, thumbs_still),
                              window_count, spaces, thumbs)
             return [], []
+        if gliding:
+            self._trace_gate("gliding re-flow", window_count, spaces, thumbs)
 
         # A window grown to nearly fill the screen means Mission Control is
         # zooming into or out of a full-screen space (opening from it, or closing
@@ -738,7 +949,7 @@ class MissionControlButtons(NSObject):
         # A window already marked (deferred close/minimize) shows a dim overlay
         # instead of buttons — a clear "this will close when you leave".
         targets, marks = [], []
-        if thumbs_still:
+        if thumbs_still or gliding:
             for thumb in on_screen:
                 if self._untitled(thumb):
                     # A titleless thumbnail is a tooltip/popup Mission Control
@@ -1019,15 +1230,29 @@ class MissionControlButtons(NSObject):
         if self._tap is None:
             if not enabled:
                 return
-            mask = (Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
-                    | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
-                    | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDown)
-                    | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseUp))
+            mouse_mask = (Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
+                          | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
+                          | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDown)
+                          | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseUp))
+            # Also listen (never consume) for raw trackpad touch frames
+            # (NSEventTypeGesture, 29): they stream at ~125Hz while fingers
+            # touch the pad, so "no touch frames lately" = fingers lifted =
+            # a gesture can no longer be mid-flight. The settle machine uses
+            # that to accept a still layout immediately (see _TOUCH_IDLE).
             self._tap = Quartz.CGEventTapCreate(
                 Quartz.kCGSessionEventTap,
                 Quartz.kCGHeadInsertEventTap,
                 Quartz.kCGEventTapOptionDefault,
-                mask, self._tap_callback, None)
+                mouse_mask | Quartz.CGEventMaskBit(_TOUCH_EVENT_TYPE),
+                self._tap_callback, None)
+            if self._tap is None:
+                # Some configuration refused the gesture type: fall back to
+                # the mouse-only tap so the buttons always stay clickable.
+                self._tap = Quartz.CGEventTapCreate(
+                    Quartz.kCGSessionEventTap,
+                    Quartz.kCGHeadInsertEventTap,
+                    Quartz.kCGEventTapOptionDefault,
+                    mouse_mask, self._tap_callback, None)
             if self._tap is None:
                 print("ExtraMissionControls: could not create event tap — "
                       "✕ buttons in Mission Control will not receive clicks "
@@ -1046,6 +1271,11 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _tap_callback(self, proxy, event_type, event, refcon):
+        if event_type == _TOUCH_EVENT_TYPE:
+            # Raw touch frame: fingers are on the trackpad right now. Cheap
+            # stamp only — the event always passes through untouched.
+            self._last_touch = time.time()
+            return event
         if event_type in (Quartz.kCGEventTapDisabledByTimeout,
                           Quartz.kCGEventTapDisabledByUserInput):
             if self._active:
@@ -1129,6 +1359,7 @@ class MissionControlButtons(NSObject):
             self._hover_timer = None
         for button in self._buttons:
             button.setHovered_(False)
+        self._hover_index = None
         self._hover_quit_index = None
         self._hover_quit_since = 0.0
 
@@ -1137,18 +1368,42 @@ class MissionControlButtons(NSObject):
         location = NSEvent.mouseLocation()  # global, bottom-left origin
         x = location.x
         y_top = self._screen_height - location.y
+        self._last_mouse_y = y_top  # feeds the sync loop's quiescent skip
+        near_bar = y_top <= _BAR_REGION_HEIGHT
+        if self._near_bar_prev is None:
+            self._near_bar_prev = near_bar
+        elif near_bar != self._near_bar_prev:
+            # Crossing the Spaces Bar region: the bar is about to expand or
+            # collapse, which no window-bounds signal can see — burst to full
+            # fast frames so its buttons appear (or clear) right behind the
+            # bar's own animation instead of at the quiet heartbeat.
+            self._near_bar_prev = near_bar
+            if self._active and self._settled_thumbs_sig is not None:
+                self._bar_burst_until = time.time() + _BAR_BURST
+                self._watch_sig = None
+                self._set_sync_interval(_SYNC_INTERVAL_FAST)
         if self._menu_open:
             # Highlight the quit menu's hovered row; keep the buttons quiet.
             row = self._menu_row_at(x, y_top)
             if self._menu_view is not None:
                 self._menu_view.set_highlight(row if row is not None else -1)
-            for button in self._buttons:
-                button.setHovered_(False)
+            if self._hover_index is not None \
+                    and self._hover_index < len(self._buttons):
+                self._buttons[self._hover_index].setHovered_(False)
+            self._hover_index = None
             self._maybe_autoclose_menu(x, y_top)
             return
         hit = self._button_index_at(x, y_top)
-        for index, button in enumerate(self._buttons):
-            button.setHovered_(index == hit)
+        # Only message buttons on hover TRANSITIONS — poking all ~26 of them
+        # 30 times a second (mostly to say "still not hovered") was a steady
+        # stream of pointless ObjC sends while just sitting in Mission Control.
+        if hit != self._hover_index:
+            if self._hover_index is not None \
+                    and self._hover_index < len(self._buttons):
+                self._buttons[self._hover_index].setHovered_(False)
+            if hit is not None and hit < len(self._buttons):
+                self._buttons[hit].setHovered_(True)
+            self._hover_index = hit
         self._update_quit_hover(hit)
 
     @objc.python_method
@@ -1344,8 +1599,8 @@ class MissionControlButtons(NSObject):
             # In a settled overview the layout is identical frame to frame:
             # skip the window move (setFrame with display forces a redraw —
             # at 10 Hz across ~30 panels that alone was a steady CPU drain).
-            # The glyph/hover setters below no-op internally on same values.
-            moved = self._rects.get(index) != rect or not panel.isVisible()
+            moved = self._rects.get(index) != rect \
+                or self._fade_target.get(id(panel)) != 1
             self._rects[index] = rect
             self._targets[index] = (kind, tile["title"], tile.get("element"))
             # Grow this tile's tray box to enclose the button. Buttons of one
@@ -1360,11 +1615,18 @@ class MissionControlButtons(NSObject):
             if moved:
                 y = self._screen_height - y_top - size  # flip to bottom-left
                 panel.setFrame_display_(NSMakeRect(x, y, size, size), True)
-            button.setLabel_(tile.get("label", "✕"))
-            button.setHoverRGB_(tile.get("hover", ui.HOVER_RED))
-            if abs(button.frame().size.width - size) > 0.5:
-                button.setDiameter_(size)
-            if not panel.isVisible():
+            # Style sends only when something about THIS button changed; an
+            # identical frame costs zero ObjC traffic per button.
+            label = tile.get("label", "✕")
+            hover = tile.get("hover", ui.HOVER_RED)
+            applied = self._button_applied.get(index)
+            if applied != (label, hover, size):
+                button.setLabel_(label)
+                button.setHoverRGB_(hover)
+                if applied is None or abs(applied[2] - size) > 0.5:
+                    button.setDiameter_(size)
+                self._button_applied[index] = (label, hover, size)
+            if moved:
                 _debug("panel %d (%s %r) shown at (%.0f,%.0f) size=%.0f"
                        % (index, kind, tile["title"], x, y_top, size))
             self._show_panel(panel)
@@ -1534,16 +1796,17 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _show_panel(self, panel):
-        """Fade a panel in. Idempotent once shown; also re-shows a panel that
-        was hidden out of band (raw orderOut) or is mid fade-out."""
-        if panel.isVisible() and self._fade_target.get(id(panel)) == 1:
+        """Fade a panel in. Idempotent once shown (every code path that orders
+        a pooled panel out resets its fade target to 0, so the target alone is
+        trustworthy — no per-call isVisible round-trip on the hot path)."""
+        if self._fade_target.get(id(panel)) == 1:
             return
         self._fade_target[id(panel)] = 1
         if not panel.isVisible():
             panel.setAlphaValue_(0.0)
             panel.orderFrontRegardless()
         NSAnimationContext.beginGrouping()
-        NSAnimationContext.currentContext().setDuration_(_FADE)
+        NSAnimationContext.currentContext().setDuration_(_FADE_IN)
         panel.animator().setAlphaValue_(1.0)
         NSAnimationContext.endGrouping()
 
@@ -1558,7 +1821,7 @@ class MissionControlButtons(NSObject):
             panel.orderOut_(None)
             return
         NSAnimationContext.beginGrouping()
-        NSAnimationContext.currentContext().setDuration_(_FADE)
+        NSAnimationContext.currentContext().setDuration_(_FADE_OUT)
         NSAnimationContext.currentContext().setCompletionHandler_(
             lambda: self._finish_hide(panel))
         panel.animator().setAlphaValue_(0.0)
@@ -1637,6 +1900,12 @@ class MissionControlButtons(NSObject):
         if not self._active or self._scene_probe is None \
                 or self._scene_probe_rect is None:
             return
+        # Settled state: the probe only matters for spotting a NEW transform
+        # under visible buttons, and other exit signals overlap it — 10Hz is
+        # plenty then; keep the full 30Hz during entries/transitions.
+        self._probe_decim = (self._probe_decim + 1) % 3
+        if self._settled_thumbs_sig is not None and self._probe_decim:
+            return
         x, y_top, w, h = self._scene_probe_rect
         match = self._bounds_match(self._scene_probe.windowNumber(),
                                    x, y_top, w, h)
@@ -1695,6 +1964,8 @@ class MissionControlButtons(NSObject):
         self._mark_panels = []
         self._tray_panels = []
         self._fade_target = {}
+        self._button_applied = {}  # new buttons must be styled from scratch
+        self._hover_index = None
         if self._menu_panel is not None:
             self._menu_panel.close()
             self._menu_panel = None
@@ -1729,6 +2000,10 @@ class MissionControlButtons(NSObject):
         kind, title, element = self._targets.get(index, (None, None, None))
         if not title:
             return
+        # A button was acted on: whatever follows (scrims, re-flows, cancel
+        # buttons) must show on the very next frame — bust the quiescent skip,
+        # which would otherwise sit out its heartbeat since no window moved.
+        self._watch_sig = None
         if kind == "cancel":
             # Take back a pending window action; its buttons return next frame.
             self._cancel_deferred_action(title)
@@ -1772,6 +2047,7 @@ class MissionControlButtons(NSObject):
             # No action can resolve an untitled window; queueing one could only
             # ever mis-target (title matching is how actions find windows).
             return
+        self._watch_sig = None  # show the scrim on the very next frame
         # One pending action per thumbnail; a later menu pick (e.g. Force Quit
         # after a plain quit) replaces the earlier one.
         self._deferred_actions = [(a, t) for a, t in self._deferred_actions
@@ -1783,6 +2059,7 @@ class MissionControlButtons(NSObject):
                                "snapright": "◨", "snapmax": "■"}.get(action, "✕")
         for i, (k, t, e) in list(self._targets.items()):
             if t == title:
+                self._fade_target[id(self._panels[i])] = 0
                 self._panels[i].orderOut_(None)
                 self._rects.pop(i, None)
         _geom_log("DEFER %s window=%r (applies on MC exit)" % (action, title))
@@ -1824,6 +2101,7 @@ class MissionControlButtons(NSObject):
         # the next frame, once the mark is gone.
         for i, (k, t, e) in list(self._targets.items()):
             if k == "cancel" and t == title:
+                self._fade_target[id(self._panels[i])] = 0
                 self._panels[i].orderOut_(None)
                 self._rects.pop(i, None)
         if cancelled:

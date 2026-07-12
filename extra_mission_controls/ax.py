@@ -123,21 +123,52 @@ def mission_control_pulse(exclude_pid):
         Quartz.kCGNullWindowID) or []
     layers = []
     sig = []
+    watch_ids = []
     for entry in raw:
         layer = entry.get(Quartz.kCGWindowLayer, 0)
         if layer == 0:
             if entry.get(Quartz.kCGWindowOwnerPID) == exclude_pid:
                 continue
+            number = entry.get(Quartz.kCGWindowNumber, 0)
             bounds = entry.get(Quartz.kCGWindowBounds) or {}
-            sig.append((entry.get(Quartz.kCGWindowNumber, 0),
+            sig.append((number,
                         round(bounds.get("X", 0)), round(bounds.get("Y", 0)),
                         round(bounds.get("Width", 0)),
                         round(bounds.get("Height", 0))))
+            watch_ids.append(number)
         elif entry.get(Quartz.kCGWindowOwnerName) == "Dock" \
                 and 18 <= layer <= 20:
             layers.append(layer)
+            watch_ids.append(entry.get(Quartz.kCGWindowNumber, 0))
     present = 18 in layers or len(layers) >= 2
-    return present, tuple(sig)
+    return present, tuple(sig), tuple(watch_ids)
+
+
+def windows_alive_signature(ids):
+    """Rounded-bounds signature of SPECIFIC windows by id — the settled-state
+    watchdog. CGWindowListCreateDescriptionFromArray costs ~0.11ms for a
+    handful of ids versus ~0.8ms+ for a full on-screen list pass with
+    per-entry bridging, so the quiet sync tick can ask 'did anything I care
+    about move or vanish?' nearly for free. A window that closed (e.g. the
+    Mission Control backdrop at exit) simply drops out of the description,
+    changing the signature."""
+    if not ids:
+        return ()
+    raw = Quartz.CGWindowListCreateDescriptionFromArray(ids) or []
+    sig = []
+    for entry in raw:
+        bounds = entry.get(Quartz.kCGWindowBounds)
+        if bounds is None:
+            continue
+        # One bridged call for the whole rect instead of four dict reads —
+        # PyObjC bridging, not the WindowServer, dominates this function.
+        ok, rect = Quartz.CGRectMakeWithDictionaryRepresentation(bounds, None)
+        if not ok:
+            continue
+        sig.append((entry.get(Quartz.kCGWindowNumber, 0),
+                    round(rect.origin.x), round(rect.origin.y),
+                    round(rect.size.width), round(rect.size.height)))
+    return tuple(sig)
 
 
 def mission_control_backdrop_state():
