@@ -7,6 +7,8 @@ import ApplicationServices as AX
 import Quartz
 
 _kAXValueCGPointType = getattr(AX, "kAXValueCGPointType", 1)
+# Debug-only extras (EMC_DEBUG=1): extra AX reads used purely for logging.
+_DEBUG = bool(__import__("os").environ.get("EMC_DEBUG"))
 _kAXValueCGSizeType = getattr(AX, "kAXValueCGSizeType", 2)
 
 
@@ -409,7 +411,6 @@ def _dock_mc_group():
 
 
 def _window_manager_root():
-    global _wm_root
     pid = _bundle_pid(_WINDOW_MANAGER)
     if pid is None:
         return None
@@ -623,16 +624,10 @@ def _drop_other_space_thumbs(thumbs, spaces):
     return [t for t in thumbs if t.get("space") not in fs_spaces]
 
 
-# {window title: bundle id} of the full-screen-space thumbnails macOS 27
-# lists (and we hide) — lets a Spaces Bar tile title be traced to its app.
+# {window title: bundle id} for every Mission Control thumbnail seen (macOS
+# 27), recorded before any space filter — lets a tile or thumbnail title be
+# traced to its app without CG window titles.
 fullscreen_bundles = {}
-
-
-def _remember_fullscreen(all_thumbs, kept):
-    kept_ids = {id(t) for t in kept}
-    for t in all_thumbs:
-        if id(t) not in kept_ids and t.get("bundle") and t.get("title"):
-            fullscreen_bundles[t["title"]] = t["bundle"]
 
 
 def _note_bundles(buttons):
@@ -686,53 +681,6 @@ def pid_for_bundle(bundle_id):
     apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(
         bundle_id) or []
     return apps[0].processIdentifier() if apps else None
-
-
-def window_states(pid):
-    """[(window number, layer, alpha, on_screen, (x, y, w, h))] for every
-    CG window of a pid, on screen or not — the 'is it actually visible?'
-    check after a full-screen window drops back to the desktop."""
-    onscreen = {e.get(Quartz.kCGWindowNumber) for e in
-                Quartz.CGWindowListCopyWindowInfo(
-                    Quartz.kCGWindowListOptionOnScreenOnly,
-                    Quartz.kCGNullWindowID) or []}
-    out = []
-    for e in Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID) or []:
-        if e.get(Quartz.kCGWindowOwnerPID) != pid:
-            continue
-        b = e.get(Quartz.kCGWindowBounds) or {}
-        number = e.get(Quartz.kCGWindowNumber)
-        out.append((number, e.get(Quartz.kCGWindowLayer, 0),
-                    float(e.get(Quartz.kCGWindowAlpha, 1.0)),
-                    number in onscreen,
-                    (b.get("X", 0), b.get("Y", 0),
-                     b.get("Width", 0), b.get("Height", 0))))
-    return out
-
-
-def revive_windows(pid, hard=False):
-    """Nudge a pid's AX windows back into view: raise them (and, when
-    `hard`, minimize+restore, which makes the WindowServer re-show the
-    window from scratch). Returns how many windows were touched."""
-    touched = 0
-    for window in _ax_windows(pid):
-        if _attribute(window, "AXFullScreen"):
-            # The drop removed the window's full-screen space but the app
-            # still thinks the window is full screen, so it sits off screen
-            # with nowhere to draw. Let the app leave full screen properly.
-            set_fullscreen(window, False)
-            touched += 1
-            continue
-        if _attribute(window, AX.kAXCloseButtonAttribute) is None:
-            continue
-        if hard:
-            AX.AXUIElementSetAttributeValue(window, "AXMinimized", True)
-            AX.AXUIElementSetAttributeValue(window, "AXMinimized", False)
-        AX.AXUIElementPerformAction(window, AX.kAXRaiseAction)
-        touched += 1
-    activate_pid(pid)
-    return touched
 
 
 def _app_name_for_bundle(bundle_id):
@@ -808,9 +756,7 @@ def mission_control_snapshot(group):
             })
     if group is _wm_root:
         before = len(thumbs)
-        all_thumbs = thumbs
         thumbs = _drop_other_space_thumbs(thumbs, spaces)
-        _remember_fullscreen(all_thumbs, thumbs)
         window_count -= before - len(thumbs)
     return thumbs, spaces, window_count
 
@@ -1080,6 +1026,8 @@ def _note_caps(pid, title, window):
     except Exception:
         resizable = True
     window_caps[(pid, title)] = (can_fs, resizable and can_fs)
+    if not _DEBUG:
+        return
     caps_debug[(pid, title)] = (
         fs_button is not None,
         _attribute(fs_button, "AXEnabled") if fs_button is not None else None,

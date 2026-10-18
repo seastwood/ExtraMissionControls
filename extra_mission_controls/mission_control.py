@@ -208,9 +208,9 @@ _ACTION_PREFIXES = ("UNFULLSCREEN", "CLOSE-FULLSCREEN", "APPLY-DEFERRED",
 
 
 def _action_log(message):
-    """Always-on, append-only record of full-screen actions (gitignored,
-    next to the package when run from source) so macOS 27 behaviour can be
-    diagnosed from an ordinary repro. Silently skipped when unwritable."""
+    """Append-only record of user actions for debug runs (EMC_DEBUG=1;
+    gitignored, next to the package when run from source). Silently skipped
+    when unwritable."""
     try:
         if os.path.exists(_ACTION_LOG) and os.path.getsize(_ACTION_LOG) > 200000:
             os.replace(_ACTION_LOG, _ACTION_LOG + ".old")
@@ -221,12 +221,13 @@ def _action_log(message):
 
 
 def _geom_log(message):
-    """Diagnostic trace (close chains, layouts) — debug builds only, except
-    full-screen actions, which also go to the always-on action log."""
-    if message.startswith(_ACTION_PREFIXES):
-        _action_log(message)
+    """Diagnostic trace (close chains, layouts) — debug runs only
+    (EMC_DEBUG=1); actions also go to emc_actions.log then. In normal use this
+    returns immediately: no string building, no disk writes."""
     if not _DEBUG:
         return
+    if message.startswith(_ACTION_PREFIXES):
+        _action_log(message)
     try:
         with open(_GEOMETRY_LOG, "a") as fh:
             fh.write(message + "\n")
@@ -234,10 +235,10 @@ def _geom_log(message):
         pass
 
 
-# macOS 27 diagnostics: Mission Control's AX layout moved into WindowManager
-# and is undocumented, so the first few distinct layouts of each launch are
-# dumped (tree + thumbnails + on-screen windows) to emc_diag.txt in the
-# project folder when running from source. Cheap: at most _DIAG_MAX writes.
+# macOS 27 diagnostics (EMC_DEBUG=1 only): Mission Control's AX layout moved
+# into WindowManager and is undocumented, so the first few distinct layouts
+# of each launch are dumped (tree + thumbnails + on-screen windows) to
+# emc_diag.txt in the project folder. At most _DIAG_MAX writes.
 _DIAG_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "emc_diag.txt")
 _DIAG_MAX = 4
@@ -245,7 +246,7 @@ _diag_state = {"count": 0, "sigs": set(), "fresh": True}
 
 
 def _write_diag(group, thumbs, spaces):
-    if group is None or group is not ax._wm_root \
+    if not _DEBUG or group is None or group is not ax._wm_root \
             or _diag_state["count"] >= _DIAG_MAX:
         return
     sig = tuple((t["title"], round(t["x"]), round(t["y"])) for t in thumbs)
@@ -303,9 +304,6 @@ _CORNER_PROBE_SIZE = 4.0
 # window joining/leaving the desktop and re-lays out the whole overview on
 # each click. All-spaces panels are ignored by its layout.
 _PANEL_SPACES = NSWindowCollectionBehaviorCanJoinAllSpaces
-# macOS 27: un-fullscreen on Mission Control exit, not via AXRemoveDesktop.
-_DEFER_UNFULLSCREEN = False  # superseded by drop + revive
-_REVIVE_AFTER_DROP = False  # superseded by _DROP_VIA_SPACE
 # macOS 27: full-screen tile buttons switch to the space and un-fullscreen
 # there (AXRemoveDesktop strands the window invisibly).
 _DROP_VIA_SPACE = ax._macos_major() >= 27
@@ -379,9 +377,6 @@ class MissionControlButtons(NSObject):
         # App names whose (just un-fullscreened) main window is closed on MC
         # exit, by name with retries while the window un-parks.
         self._deferred_app_closes = []
-        # macOS 27: full-screen tiles to un-fullscreen once MC closes.
-        self._deferred_unfs = []
-        self._revive_pids = []        # macOS 27: windows to check after a drop
         self._last_thumbs = []
         self._fs_busy_until = 0.0      # one full-screen transition at a time
         self._no_max_titles = set()    # thumbnails whose window can't maximize
@@ -394,9 +389,6 @@ class MissionControlButtons(NSObject):
         self._menu_dock = None         # the Dock item the open menu acts on
         self._dock_actions = []        # [(action, pid, name)] run on MC exit
         self._dock_marked = {}         # window title -> Dock app name it marks
-        self._revive_windows = []     # (title, held AX window) to un-fullscreen
-        self._drop_watch_baseline = None
-        self._drop_watch_until = 0.0
         self._app_close_attempts = 0
         # To scrim the desktop thumbnail a closed full-screen app reappears as
         # (its title is unpredictable): the thumbnail titles present when the ✕
@@ -596,12 +588,6 @@ class MissionControlButtons(NSObject):
     def _activate(self, group):
         self._active = True
         self._activated_at = time.time()
-        pending_mark = getattr(self, "_mark_on_activate", None)
-        if pending_mark:
-            # A ✕ on a full-screen tile (macOS 27 via-space drop): the window
-            # is now on the desktop — show it marked for close, undoable.
-            self._mark_on_activate = None
-            self._defer_window_action("close", pending_mark)
         # The idle detect poll has nothing to do while MC is up (syncTick owns
         # liveness); parking it saves ~7 no-op Python wakeups a second.
         self._stop_detect_timer()
@@ -703,14 +689,6 @@ class MissionControlButtons(NSObject):
             self.performSelector_withObject_afterDelay_(
                 "applyDockActions", None, 0.35)
         self._dock_items_at = 0.0
-        if self._revive_pids or self._revive_windows:
-            self._revive_round = 0
-            self.performSelector_withObject_afterDelay_(
-                "reviveDroppedWindows", None, 0.6)
-        if self._deferred_unfs:
-            self._unfs_attempts = 0
-            self.performSelector_withObject_afterDelay_(
-                "applyDeferredUnfullscreen", None, 0.5)
         if self._deferred_app_closes:
             # Un-fullscreened apps: close their main window by name once MC is
             # gone and the window has un-parked (applyDeferredAppCloses retries).
@@ -900,8 +878,6 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _scan_registry(self):
-        if os.environ.get("EMC_NO_REGISTRY"):
-            return  # test hook: force the no-held-reference fallback paths
         now = time.time()
         if self._last_registry_scan and \
                 now - self._last_registry_scan < _REGISTRY_MIN_GAP:
@@ -920,6 +896,8 @@ class MissionControlButtons(NSObject):
         self._fullscreen_registry = merged
         self._window_registry = by_pid
         self._running_names = running
+        if not _DEBUG:
+            return
         _debug("registry: fullscreen=%s windows=%d apps"
                % (sorted(str(k) for k in merged), len(by_pid)))
         caps_view = sorted((str(ax.app_name_for_pid(p) or p), str(t), v)
@@ -956,21 +934,6 @@ class MissionControlButtons(NSObject):
         thumbs, spaces, window_count = ax.mission_control_snapshot(group)
         self._log_geometry(group, thumbs, spaces)
         self._last_thumbs = thumbs
-        if self._drop_watch_baseline is not None:
-            if time.time() > self._drop_watch_until:
-                self._drop_watch_baseline = None
-            else:
-                for t in thumbs:
-                    key = (t.get("bundle"), t["title"])
-                    if key in self._drop_watch_baseline or not t.get("bundle"):
-                        continue
-                    pid = ax.pid_for_bundle(t["bundle"])
-                    self._drop_watch_baseline.add(key)
-                    if pid is not None and pid not in self._revive_pids:
-                        self._revive_pids.append(pid)
-                    _geom_log("UNFULLSCREEN dropped window appeared %r %s pid=%s"
-                              " states=%s" % (t["title"], t["bundle"], pid,
-                                              ax.window_states(pid) if pid else None))
         _write_diag(group, thumbs, spaces)
 
         # A full-screen app closed from the Spaces Bar un-fullscreens in place
@@ -1229,8 +1192,7 @@ class MissionControlButtons(NSObject):
                 # A held-reference full-screen close still sits in the Spaces
                 # Bar (it never left full screen), so it is fully reversible —
                 # give it the same cancel (↺) button.
-                if (space["title"] in self._deferred_close
-                        or space["title"] in self._deferred_unfs):
+                if space["title"] in self._deferred_close:
                     targets.append(("cancel",
                                     self._slot(space, 0, "↺", ui.HOVER_BLUE)))
                 continue
@@ -1988,7 +1950,7 @@ class MissionControlButtons(NSObject):
             self._hide_panel(self._panels[index])
             self._targets.pop(index, None)
             self._rects.pop(index, None)
-        if keys != getattr(self, "_logged_panel_keys", None) and keys:
+        if _DEBUG and keys and keys != getattr(self, "_logged_panel_keys", None):
             self._logged_panel_keys = keys
             sample = []
             for index, key in list(zip(assigned, keys))[:6]:
@@ -2596,10 +2558,6 @@ class MissionControlButtons(NSObject):
                     self._marked.pop(window_title, None)
             _geom_log("DOCK cancel %r" % app)
             return
-        if title in self._deferred_unfs:
-            self._deferred_unfs.remove(title)
-            self._marked.pop(title, None)
-            cancelled = True
         # Window actions queued via _defer_window_action.
         kept = []
         for action, t in self._deferred_actions:
@@ -3370,149 +3328,11 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _drop_to_desktop(self, title, element):
-        """Take a full-screen app out of full screen RIGHT NOW so its window
-        drops into the desktop overview. Through macOS 26: the Spaces Bar's
-        own AXRemoveDesktop. macOS 27: that leaves the window permanently
-        invisible, so ask the window itself (AXFullScreen=False on the held
-        reference) instead."""
-        pid = ax.pid_for_title(title) if _REVIVE_AFTER_DROP else None
-        if pid is None and _REVIVE_AFTER_DROP:
-            window = self._held_fullscreen_window(title)
-            if window is not None:
-                err, held_pid = ax.AX.AXUIElementGetPid(window, None)
-                pid = held_pid if err == 0 else None
-        held = self._held_fullscreen_window(title) if _REVIVE_AFTER_DROP else None
-        ok = element is not None and ax.remove_space(element)
-        if ok and held is not None:
-            # After the drop the app stops listing this window over AX, so
-            # keep the reference we already hold to un-fullscreen it later.
-            self._revive_windows.append((title, held))
-        if ok and _REVIVE_AFTER_DROP:
-            # macOS 27 can leave the dropped window invisible; check (and fix)
-            # it once Mission Control has closed.
-            if pid is not None and pid not in self._revive_pids:
-                self._revive_pids.append(pid)
-            # The dropped window reappears as a NEW desktop thumbnail carrying
-            # its bundle id — the reliable way to find its app; watch for it.
-            self._drop_watch_baseline = {(t.get("bundle"), t["title"])
-                                         for t in self._last_thumbs}
-            self._drop_watch_until = time.time() + 4.0
-            _geom_log("UNFULLSCREEN drop %r pid=%s held=%s registry=%s"
-                      % (title, pid, held is not None,
-                         [(k, v[2]) for k, v in self._fullscreen_registry.items()]))
-        return ok
-
-    @objc.python_method
-    def _held_fullscreen_window(self, title):
-        """The full-screen window behind a Spaces Bar tile, from the registry
-        scanned while Mission Control was closed (apps hide their AX windows
-        while it is open): keyed by app name, else by the window's title."""
-        entry = self._fullscreen_registry.get(title)
-        if entry is None:
-            for name, candidate in self._fullscreen_registry.items():
-                if candidate[2] and (candidate[2] == title
-                                     or ax.titles_related(title, candidate[2])):
-                    entry = candidate
-                    break
-        if entry is None or not ax.element_alive(entry[0]):
-            return None
-        return entry[0]
-
-    def verifyInstantUnfullscreen(self):
-        data, self._unfs_check = getattr(self, "_unfs_check", None), None
-        if not data:
-            return
-        title, window = data
-        still = ax._attribute(window, "AXFullScreen")
-        _geom_log("UNFULLSCREEN verify %r fullscreen_now=%r alive=%s"
-                  % (title, still, ax.element_alive(window)))
-        if still:
-            # The app ignored it while Mission Control was up: finish on exit.
-            if title not in self._deferred_unfs:
-                self._deferred_unfs.append(title)
-            if self._active:
-                self._marked[title] = "❏"
-
-    def reviveDroppedWindows(self):
-        """After Mission Control closes: make sure every window that dropped
-        out of full screen is really visible (macOS 27 can leave it at alpha
-        0 / off screen). Round 0 only raises; later rounds minimize+restore."""
-        if not (self._revive_pids or self._revive_windows):
-            return
-        if ax.mission_control_group() is not None:
-            self.performSelector_withObject_afterDelay_(
-                "reviveDroppedWindows", None, 0.4)
-            return
-        # The held references first: the stranded window still believes it
-        # is full screen, so asking it to leave full screen redraws it.
-        still_held = []
-        for title, window in self._revive_windows:
-            state = ax._attribute(window, "AXFullScreen")
-            ok = bool(state) and ax.set_fullscreen(window, False)
-            _geom_log("UNFULLSCREEN revive held %r fullscreen=%r alive=%s set=%s"
-                      % (title, state, ax.element_alive(window), ok))
-            if state and not ok:
-                still_held.append((title, window))
-        self._revive_windows = still_held
-        pending = []
-        for pid in self._revive_pids:
-            states = [st for st in ax.window_states(pid)
-                      if st[1] == 0 and st[4][2] >= 80 and st[4][3] >= 80]
-            main = max(states, key=lambda st: st[4][2] * st[4][3], default=None)
-            hidden = [main] if main and (main[2] < 0.99 or not main[3]) else []
-            _geom_log("UNFULLSCREEN revive round=%d pid=%s windows=%s"
-                      % (self._revive_round, pid, states))
-            if hidden or not states:
-                touched = ax.revive_windows(pid, hard=False)
-                _geom_log("UNFULLSCREEN revive pid=%s hard=%s touched=%d"
-                          % (pid, False, touched))
-                pending.append(pid)
-        self._revive_round += 1
-        # The app may not report the stranded window over AX for a while
-        # after Mission Control closes, so keep trying for ~10s.
-        if (pending or self._revive_windows) and self._revive_round < 12:
-            self._revive_pids = pending
-            self.performSelector_withObject_afterDelay_(
-                "reviveDroppedWindows", None, 0.8)
-            return
-        self._revive_pids = []
-        self._revive_windows = []
-
-    def applyDeferredUnfullscreen(self):
-        """Take each marked full-screen app out of full screen now that
-        Mission Control is gone, via the window's own AXFullScreen (the
-        app's normal exit animation). Retries briefly while the app's AX
-        windows reappear after Mission Control."""
-        if not self._deferred_unfs:
-            return
-        if ax.mission_control_group() is not None:
-            self.performSelector_withObject_afterDelay_(
-                "applyDeferredUnfullscreen", None, 0.4)
-            return
-        pending = []
-        for title in self._deferred_unfs:
-            window = ax.find_fullscreen_target(title)
-            if window is None:
-                entry = self._fullscreen_registry.get(title)
-                if entry is not None and ax.element_alive(entry[0]):
-                    window = entry[0]
-            _geom_log("UNFULLSCREEN deferred %r found=%s"
-                      % (title, window is not None))
-            if window is not None and ax.set_fullscreen(window, False):
-                _geom_log("UNFULLSCREEN %r applied" % title)
-                self._fullscreen_registry.pop(title, None)
-            else:
-                pending.append(title)
-        self._unfs_attempts = getattr(self, "_unfs_attempts", 0) + 1
-        if pending and self._unfs_attempts < 8:
-            self._deferred_unfs = pending
-            self.performSelector_withObject_afterDelay_(
-                "applyDeferredUnfullscreen", None, 0.3)
-            return
-        for title in pending:
-            print("ExtraMissionControls: could not exit full screen for %r"
-                  % title)
-        self._deferred_unfs = []
+        """Through macOS 26: the Spaces Bar's own AXRemoveDesktop, which turns
+        a full-screen space back into an ordinary desktop window while Mission
+        Control stays open. (macOS 27 uses _drop_via_space instead — there
+        AXRemoveDesktop strands the window invisibly.)"""
+        return element is not None and ax.remove_space(element)
 
     def processDeferredCloses(self):
         # One title at a time so the verify/escalate steps below can use single

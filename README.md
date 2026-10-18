@@ -251,8 +251,9 @@ EMC_VICTIM=textedit .venv/bin/python scripts/test_mc_e2e.py # held-ref path
 .venv/bin/python scripts/test_mc_fullscreen_e2e.py          # Spaces Bar tile
 ```
 
-Env hooks: `EMC_DEBUG=1` (log close paths), `EMC_NO_REGISTRY=1` /
-`EMC_FORCE_UNFS=1` (force the fallback paths under test).
+Debugging: run with `EMC_DEBUG=1` to log actions and button layouts to
+`emc_actions.log` and dump the first few Mission Control layouts to
+`emc_diag.txt` (both gitignored). Normal runs write nothing.
 
 ## Project layout
 
