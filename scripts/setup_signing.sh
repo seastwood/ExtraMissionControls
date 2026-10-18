@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Create (once) a STABLE self-signed code-signing identity for
-# ExtraMissionControls, so macOS keeps granted permissions across app updates.
+# Extra Mission Controls, so macOS keeps granted permissions across app updates.
 #
 # macOS TCC keys permissions to an app's code-signing "designated requirement".
 # An unsigned / ad-hoc app's requirement is the binary's cdhash, which changes

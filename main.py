@@ -1,4 +1,4 @@
-"""Entry point — run this file in PyCharm to start ExtraMissionControls."""
+"""Entry point — run this file in PyCharm to start Extra Mission Controls."""
 
 from extra_mission_controls.app import main
 

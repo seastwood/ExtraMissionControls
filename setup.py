@@ -11,8 +11,8 @@ OPTIONS = {
     "iconfile": "assets/icon.icns",
     "resources": ["assets/tray_icon.png"],  # the menu-bar icon
     "plist": {
-        "CFBundleName": "ExtraMissionControls",
-        "CFBundleDisplayName": "ExtraMissionControls",
+        "CFBundleName": "Extra Mission Controls",
+        "CFBundleDisplayName": "Extra Mission Controls",
         "CFBundleIdentifier": "com.seth.extramissioncontrols",
         "CFBundleShortVersionString": __version__,
         "CFBundleVersion": __version__,
@@ -23,7 +23,7 @@ OPTIONS = {
 }
 
 setup(
-    name="ExtraMissionControls",
+    name="Extra Mission Controls",
     version=__version__,
     app=APP,
     options={"py2app": OPTIONS},

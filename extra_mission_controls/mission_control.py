@@ -523,7 +523,7 @@ class MissionControlButtons(NSObject):
         if _DEBUG:
             try:
                 with open(_GEOMETRY_LOG, "w") as fh:
-                    fh.write("ExtraMissionControls geometry log\n")
+                    fh.write("Extra Mission Controls geometry log\n")
             except OSError:
                 pass
         self._start_detect_timer()
@@ -1493,7 +1493,7 @@ class MissionControlButtons(NSObject):
                     Quartz.kCGEventTapOptionDefault,
                     mouse_mask, self._tap_callback, None)
             if self._tap is None:
-                print("ExtraMissionControls: could not create event tap — "
+                print("Extra Mission Controls: could not create event tap — "
                       "✕ buttons in Mission Control will not receive clicks "
                       "(is Accessibility permission granted?)")
                 return
@@ -1525,7 +1525,7 @@ class MissionControlButtons(NSObject):
                 self._key_tap_callback, None)
             if self._key_tap is None:
                 self._key_tap_failed = True
-                print("ExtraMissionControls: keyboard shortcuts (W/M/Q) are "
+                print("Extra Mission Controls: keyboard shortcuts (W/M/Q) are "
                       "unavailable — macOS refused the keyboard event tap "
                       "(Input Monitoring permission).")
                 return
@@ -3178,7 +3178,7 @@ class MissionControlButtons(NSObject):
             _geom_log("UNFULLSCREEN tile=%r" % title)
             self._recently_closed[("acted", title)] = time.time() + 2.5
         else:
-            print("ExtraMissionControls: could not exit full screen for %r"
+            print("Extra Mission Controls: could not exit full screen for %r"
                   % title)
 
     @objc.python_method
@@ -3188,7 +3188,7 @@ class MissionControlButtons(NSObject):
         into a solo fullscreen space we are already viewing, so the second app
         is closed right after, then Mission Control reopens."""
         if element is None:
-            print("ExtraMissionControls: cannot reach split %r" % title)
+            print("Extra Mission Controls: cannot reach split %r" % title)
             return
         self._panels[index].orderOut_(None)
         self._rects.pop(index, None)
@@ -3273,7 +3273,7 @@ class MissionControlButtons(NSObject):
     @objc.python_method
     def _fallback_close_fullscreen(self, title, element):
         if element is None:
-            print("ExtraMissionControls: no closable fullscreen named %r" % title)
+            print("Extra Mission Controls: no closable fullscreen named %r" % title)
             return
         # Universal fallback: switch to its space — Mission Control closes,
         # the app becomes AX-visible — then close it there (verified, with
@@ -3311,7 +3311,7 @@ class MissionControlButtons(NSObject):
                     "finishPendingClose", None, 0.35)
             else:
                 self._pending_close_title = None
-                print("ExtraMissionControls: gave up closing fullscreen %r"
+                print("Extra Mission Controls: gave up closing fullscreen %r"
                       % title)
                 self._pending_chain_failed(title)
             return
@@ -3414,7 +3414,7 @@ class MissionControlButtons(NSObject):
             self.performSelector_withObject_afterDelay_(
                 "finishExitedClose", None, 1.9)
         else:
-            print("ExtraMissionControls: could not close fullscreen %r" % title)
+            print("Extra Mission Controls: could not close fullscreen %r" % title)
             self._pending_chain_failed(title)
 
     @objc.python_method
@@ -3571,7 +3571,7 @@ class MissionControlButtons(NSObject):
             self.performSelector_withObject_afterDelay_(
                 "finishDeferredExitClose", None, 1.9)
         else:
-            print("ExtraMissionControls: could not finish closing %r" % title)
+            print("Extra Mission Controls: could not finish closing %r" % title)
             self._next_deferred_close()
 
     def finishDeferredExitClose(self):
@@ -3583,7 +3583,7 @@ class MissionControlButtons(NSObject):
             _debug("deferred close of %r completed after un-fullscreen" % title)
             self._fullscreen_registry.pop(title, None)
         else:
-            print("ExtraMissionControls: un-fullscreened %r but could not "
+            print("Extra Mission Controls: un-fullscreened %r but could not "
                   "close it" % title)
         self._next_deferred_close()
 
@@ -3604,6 +3604,6 @@ class MissionControlButtons(NSObject):
             self._pending_chain_done()
         else:
             _geom_log("  finishExitedClose: could NOT close %r's window" % title)
-            print("ExtraMissionControls: un-fullscreened %r but could not "
+            print("Extra Mission Controls: un-fullscreened %r but could not "
                   "close its window" % title)
             self._pending_chain_failed(title)

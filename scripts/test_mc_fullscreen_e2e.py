@@ -71,7 +71,7 @@ def main():
                     'tell application "TextEdit" to quit'], check=False)
     time.sleep(1.5)
     doc = "/tmp/emc_fullscreen_victim.txt"
-    open(doc, "w").write("ExtraMissionControls fullscreen test victim\n")
+    open(doc, "w").write("Extra Mission Controls fullscreen test victim\n")
     subprocess.run(["open", "-e", doc], check=False)
     time.sleep(2.0)
 

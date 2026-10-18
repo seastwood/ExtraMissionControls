@@ -36,7 +36,7 @@ from .mission_control import MissionControlButtons
 
 UPDATE_CHECK_INTERVAL = 6 * 3600.0  # re-check GitHub every 6 hours
 
-def _tray_image(label="ExtraMissionControls"):
+def _tray_image(label="Extra Mission Controls"):
     """EMC's branded menu-bar icon (assets/tray_icon.png) as a template image,
     so macOS tints it for light and dark menu bars. None if it can't load."""
     base = os.environ.get("RESOURCEPATH") or os.path.join(
@@ -93,7 +93,7 @@ class AppDelegate(NSObject):
                 UPDATE_CHECK_INTERVAL, self, "checkForUpdates:", None, True))
 
         if not ax.ensure_permissions():
-            print("ExtraMissionControls: Accessibility permission missing — "
+            print("Extra Mission Controls: Accessibility permission missing — "
                   "nothing will work until it is granted "
                   "(System Settings → Privacy & Security → Accessibility).")
 
@@ -286,7 +286,8 @@ def _replace_running_instance():
                                  capture_output=True, text=True).stdout
         except OSError:
             cmd = ""
-        if "main.py" in cmd or "ExtraMissionControls" in cmd:
+        if ("main.py" in cmd or "ExtraMissionControls" in cmd
+                or "Extra Mission Controls" in cmd):
             for sig in (signal.SIGCONT, signal.SIGTERM):
                 try:
                     os.kill(old, sig)
