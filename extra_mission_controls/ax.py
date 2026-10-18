@@ -19,13 +19,11 @@ def is_trusted(prompt=False):
 
 
 def ensure_permissions():
-    """Prompt for Accessibility and Screen Recording access if missing.
-    Returns (ax_ok, capture_ok)."""
-    ax_ok = is_trusted(prompt=True)
-    capture_ok = bool(Quartz.CGPreflightScreenCaptureAccess())
-    if not capture_ok:
-        Quartz.CGRequestScreenCaptureAccess()
-    return ax_ok, capture_ok
+    """Prompt for Accessibility access if missing; returns whether it's
+    granted. EMC deliberately does NOT ask for Screen Recording: it only ever
+    unlocked other apps' window titles, and thumbnails are now matched to
+    windows by bundle id and AX instead."""
+    return is_trusted(prompt=True)
 
 
 def _attribute(element, name):
@@ -1032,11 +1030,17 @@ def scan_closable_windows():
         if ax_windows:
             visible.add(name)
         entries = []
+        if ax_windows:
+            # Re-read this app's windows from scratch (drop closed ones).
+            for key in [k for k in window_caps if k[0] == pid]:
+                window_caps.pop(key, None)
+                caps_debug.pop(key, None)
         for window in ax_windows:
             close_button = _attribute(window, AX.kAXCloseButtonAttribute)
             if close_button is None:
                 continue
             title = _attribute(window, AX.kAXTitleAttribute) or ""
+            _note_caps(pid, title, window)
             minimize_button = _attribute(window, AX.kAXMinimizeButtonAttribute)
             entries.append((title, close_button, minimize_button))
             if name not in fullscreen and _attribute(window, "AXFullScreen"):
@@ -1044,6 +1048,63 @@ def scan_closable_windows():
         if entries:
             by_pid[pid] = entries
     return fullscreen, visible, by_pid
+
+
+# {(pid, window title): (can_fullscreen, can_maximize)} — read while Mission
+# Control is closed (apps hide their AX windows while it is open), so
+# thumbnails can drop buttons a window can't honour (System Settings has a
+# disabled full-screen button and a fixed width).
+window_caps = {}
+caps_debug = {}
+
+
+def _note_caps(pid, title, window):
+    fs_button = _attribute(window, "AXFullScreenButton")
+    can_fs = True
+    if fs_button is not None:
+        if _attribute(fs_button, "AXEnabled") is False:
+            can_fs = False
+    else:
+        # No full-screen button at all (System Settings on macOS 27): it can
+        # only go full screen if its AXFullScreen attribute is settable.
+        try:
+            err, settable = AX.AXUIElementIsAttributeSettable(
+                window, "AXFullScreen", None)
+            can_fs = bool(settable) if err == AX.kAXErrorSuccess else False
+        except Exception:
+            can_fs = False
+    try:
+        err, settable = AX.AXUIElementIsAttributeSettable(
+            window, AX.kAXSizeAttribute, None)
+        resizable = bool(settable) if err == AX.kAXErrorSuccess else True
+    except Exception:
+        resizable = True
+    window_caps[(pid, title)] = (can_fs, resizable and can_fs)
+    caps_debug[(pid, title)] = (
+        fs_button is not None,
+        _attribute(fs_button, "AXEnabled") if fs_button is not None else None,
+        _attribute(fs_button, "AXSubrole") if fs_button is not None else None,
+        resizable,
+        _attribute(_attribute(window, "AXZoomButton"), "AXEnabled")
+        if _attribute(window, "AXZoomButton") is not None else None)
+
+
+def caps_for(pid, title):
+    """(can_fullscreen, can_maximize) for a thumbnail, or (True, True) when
+    unknown — never hide a button on a guess."""
+    if pid is None:
+        return True, True
+    caps = window_caps.get((pid, title))
+    if caps is not None:
+        return caps
+    related = [c for (p, t), c in window_caps.items()
+               if p == pid and titles_related(title, t)]
+    if len(related) == 1:
+        return related[0]
+    # Apps whose AX window title is blank (System Settings) can't be matched
+    # by title; if the app has just one known window, it's that one.
+    mine = [c for (p, _), c in window_caps.items() if p == pid]
+    return mine[0] if len(mine) == 1 else (True, True)
 
 
 def press_element(element):

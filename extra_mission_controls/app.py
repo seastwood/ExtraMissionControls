@@ -100,16 +100,10 @@ class AppDelegate(NSObject):
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 UPDATE_CHECK_INTERVAL, self, "checkForUpdates:", None, True))
 
-        ax_ok, capture_ok = ax.ensure_permissions()
-        if not ax_ok:
+        if not ax.ensure_permissions():
             print("ExtraMissionControls: Accessibility permission missing — "
                   "nothing will work until it is granted "
                   "(System Settings → Privacy & Security → Accessibility).")
-        if not capture_ok:
-            print("ExtraMissionControls: Screen Recording permission missing — "
-                  "window-title matching is degraded, so closing apps with "
-                  "broken accessibility (e.g. Steam) may fail "
-                  "(System Settings → Privacy & Security → Screen Recording).")
 
     def _setup_status_item(self):
         self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(

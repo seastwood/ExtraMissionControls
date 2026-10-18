@@ -200,7 +200,8 @@ _ACTION_LOG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "emc_actions.log")
 _ACTION_PREFIXES = ("UNFULLSCREEN", "CLOSE-FULLSCREEN", "APPLY-DEFERRED",
-                    "MAKE-FULLSCREEN", "PANELS", "registry")
+                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK",
+                    "registry")
 
 
 def _action_log(message):
@@ -305,6 +306,8 @@ _REVIVE_AFTER_DROP = False  # superseded by _DROP_VIA_SPACE
 # macOS 27: full-screen tile buttons switch to the space and un-fullscreen
 # there (AXRemoveDesktop strands the window invisibly).
 _DROP_VIA_SPACE = ax._macos_major() >= 27
+# Minimum spacing between full-screen actions (switch + animate + reopen).
+_FS_ACTION_GAP = 3.0
 _PANEL_SHARING = (NSWindowSharingReadOnly if ax._macos_major() >= 27
                   else NSWindowSharingNone)
 
@@ -377,6 +380,8 @@ class MissionControlButtons(NSObject):
         self._deferred_unfs = []
         self._revive_pids = []        # macOS 27: windows to check after a drop
         self._last_thumbs = []
+        self._fs_busy_until = 0.0      # one full-screen transition at a time
+        self._no_max_titles = set()    # thumbnails whose window can't maximize
         self._revive_windows = []     # (title, held AX window) to un-fullscreen
         self._drop_watch_baseline = None
         self._drop_watch_until = 0.0
@@ -900,6 +905,12 @@ class MissionControlButtons(NSObject):
         self._running_names = running
         _debug("registry: fullscreen=%s windows=%d apps"
                % (sorted(merged), len(by_pid)))
+        caps_view = sorted((ax.app_name_for_pid(p) or p, t, v)
+                           for (p, t), v in ax.caps_debug.items())
+        if caps_view != getattr(self, "_logged_caps", None):
+            self._logged_caps = caps_view
+            _geom_log("registry caps (fsbtn, enabled, subrole, resizable, "
+                      "zoom_enabled)=%s" % caps_view)
         if sorted(merged) != getattr(self, "_logged_fs", None):
             self._logged_fs = sorted(merged)
             _geom_log("registry fullscreen=%s"
@@ -1104,6 +1115,7 @@ class MissionControlButtons(NSObject):
         # A window already marked (deferred close/minimize) shows a dim overlay
         # instead of buttons — a clear "this will close when you leave".
         targets, marks = [], []
+        self._no_max_titles = set()
         if thumbs_still or gliding:
             for thumb in on_screen:
                 if self._untitled(thumb):
@@ -1128,15 +1140,26 @@ class MissionControlButtons(NSObject):
                         targets.append(("cancel",
                                         self._slot(thumb, 0, "↺", ui.HOVER_BLUE)))
                     continue
-                targets.append(("window", self._slot(thumb, 0)))
+                pid = (ax.pid_for_bundle(thumb["bundle"])
+                       if thumb.get("bundle") else None)
+                can_fs, can_max = ax.caps_for(pid, thumb["title"])
+                if not can_max:
+                    self._no_max_titles.add(thumb["title"])
+                slot = 0
+                targets.append(("window", self._slot(thumb, slot)))
+                slot += 1
                 targets.append(("minimize",
-                                self._slot(thumb, 1, "−", ui.HOVER_YELLOW)))
-                targets.append(("makefullscreen",
-                                self._slot(thumb, 2, "⤢", ui.HOVER_GREEN)))
+                                self._slot(thumb, slot, "−", ui.HOVER_YELLOW)))
+                slot += 1
+                if can_fs:  # hidden for windows that can't go full screen
+                    targets.append(("makefullscreen",
+                                    self._slot(thumb, slot, "⤢", ui.HOVER_GREEN)))
+                    slot += 1
                 targets.append(("arrange",
-                                self._slot(thumb, 3, "◫", ui.HOVER_TEAL)))
+                                self._slot(thumb, slot, "◫", ui.HOVER_TEAL)))
+                slot += 1
                 targets.append(("quit",
-                                self._slot(thumb, 4, "⏻", ui.HOVER_PURPLE)))
+                                self._slot(thumb, slot, "⏻", ui.HOVER_PURPLE)))
 
         # Bar-tile buttons only exist while the bar is still AND expanded at the
         # top of the screen; collapsed tiles sit above the screen edge (negative
@@ -1632,8 +1655,14 @@ class MissionControlButtons(NSObject):
             self._open_menu(index, "quit", ui.QUIT_MENU_ITEMS,
                             _QUIT_MENU_ACTIONS, via_hover)
         elif kind == "arrange":
-            self._open_menu(index, "arrange", ui.ARRANGE_MENU_ITEMS,
-                            _ARRANGE_MENU_ACTIONS, via_hover)
+            title = self._targets.get(index, (None, None))[1]
+            if title in self._no_max_titles:
+                # Fixed-size window: Maximize can't do anything, so leave it out.
+                self._open_menu(index, "arrange", ui.ARRANGE_MENU_ITEMS[:2],
+                                _ARRANGE_MENU_ACTIONS[:2], via_hover)
+            else:
+                self._open_menu(index, "arrange", ui.ARRANGE_MENU_ITEMS,
+                                _ARRANGE_MENU_ACTIONS, via_hover)
 
     @objc.python_method
     def _open_menu(self, index, kind, items, actions, via_hover=False):
@@ -1886,7 +1915,34 @@ class MissionControlButtons(NSObject):
     def _sync_marks(self, marks):
         """Draw a dim scrim + glyph over each thumbnail queued for a deferred
         action; hide any leftover overlay panels from a previous frame."""
-        for index, (tile, glyph) in enumerate(marks):
+        # Stable overlay-per-thumbnail (same reason as the buttons): assigning
+        # by list position slid an existing overlay onto a newly marked
+        # window. Exact (title, x, y) first, else a lone same-title overlay
+        # (its thumbnail re-flowed).
+        keys = [(t["title"], round(t["x"]), round(t["y"])) for t, _ in marks]
+        previous = getattr(self, "_mark_keys", {})
+        assigned, used = [None] * len(marks), set()
+        for i, key in enumerate(keys):
+            index = previous.get(key)
+            if index is not None and index not in used:
+                assigned[i] = index
+                used.add(index)
+        for i, key in enumerate(keys):
+            if assigned[i] is None:
+                same = [index for k, index in previous.items()
+                        if k[0] == key[0] and index not in used]
+                if len(same) == 1:
+                    assigned[i] = same[0]
+                    used.add(same[0])
+        free = 0
+        for i in range(len(marks)):
+            if assigned[i] is None:
+                while free in used:
+                    free += 1
+                assigned[i] = free
+                used.add(free)
+        self._mark_keys = {key: assigned[i] for i, key in enumerate(keys)}
+        for index, (tile, glyph) in zip(assigned, marks):
             panel = self._mark_panel_at(index)
             w, h = tile["width"], tile["height"]
             state = (round(tile["x"], 1), round(tile["y"], 1),
@@ -1904,7 +1960,9 @@ class MissionControlButtons(NSObject):
                     view.setNeedsDisplay_(True)
                 view.setGlyph_(glyph)
             self._show_panel(panel)
-        for index in range(len(marks), len(self._mark_panels)):
+        for index in range(len(self._mark_panels)):
+            if index in used:
+                continue
             self._hide_panel(self._mark_panels[index])
             self._mark_applied.pop(index, None)
 
@@ -2267,6 +2325,7 @@ class MissionControlButtons(NSObject):
         self._buttons = []
         self._panel_keys = {}
         self._tray_keys = {}
+        self._mark_keys = {}
         self._mark_panels = []
         self._tray_panels = []
         self._fade_target = {}
@@ -2314,6 +2373,16 @@ class MissionControlButtons(NSObject):
             # Take back a pending window action; its buttons return next frame.
             self._cancel_deferred_action(title)
             return
+        _geom_log("CLICK %s on %r" % (kind, title))
+        if kind in ("fullscreen", "unfullscreen", "makefullscreen", "splitall"):
+            # Each of these switches spaces / runs a full-screen animation and
+            # then (often) reopens Mission Control. Overlapping them wedged
+            # macOS 27's WindowManager (Mission Control stopped opening), so
+            # only one runs at a time; extra clicks meanwhile are ignored.
+            if time.time() < self._fs_busy_until:
+                _geom_log("UNFULLSCREEN busy: ignored %s on %r" % (kind, title))
+                return
+            self._fs_busy_until = time.time() + _FS_ACTION_GAP
         if kind == "fullscreen":
             self._close_fullscreen(index, title, element)
             return
@@ -2508,14 +2577,22 @@ class MissionControlButtons(NSObject):
         regardless of AX buttons). `level` picks how hard: 'graceful' is ⌘Q
         (terminate, may prompt to save), 'force' is Force Quit (forceTerminate,
         no prompt), 'kill' is a raw SIGKILL to the process."""
-        info = self._match_window_info(title, infos)
-        if info is None:
+        # The thumbnail's own bundle id names the app exactly (macOS 27); CG
+        # window titles are blank without Screen Recording, so title matching
+        # missed windows whose title isn't the app name (System Settings'
+        # 'Trackpad').
+        pid = ax.pid_for_title(title)
+        if pid is None:
+            info = self._match_window_info(title, infos)
+            pid = info.pid if info is not None else None
+        _geom_log("APPLY-DEFERRED quit(%s) %r pid=%s" % (level, title, pid))
+        if pid is None:
             return False
         if level == "force":
-            return ax.force_quit_pid(info.pid)
+            return ax.force_quit_pid(pid)
         if level == "kill":
-            return ax.kill_pid(info.pid)
-        return ax.quit_pid(info.pid)
+            return ax.kill_pid(pid)
+        return ax.quit_pid(pid)
 
     @objc.python_method
     def _match_window_info(self, title, infos):
@@ -2664,9 +2741,28 @@ class MissionControlButtons(NSObject):
 
     def makeFullscreenStep(self):
         title = self._fs_make_title
-        self._fs_make_title = None
         if not title:
             return
+        # macOS 27: starting a full-screen animation while Mission Control's
+        # exit animation is still running wedged WindowManager (Spaces Bar
+        # stuck on screen). Wait until Mission Control and its backdrop are
+        # fully gone, then a further beat, before touching the window.
+        if _DROP_VIA_SPACE:
+            waited = getattr(self, "_fs_make_waits", 0)
+            gone = ax.mission_control_group() is None
+            if not gone and waited < 20:
+                self._fs_make_waits = waited + 1
+                self.performSelector_withObject_afterDelay_(
+                    "makeFullscreenStep", None, 0.15)
+                return
+            if waited >= 0 and not getattr(self, "_fs_make_settled", False):
+                self._fs_make_settled = True
+                self.performSelector_withObject_afterDelay_(
+                    "makeFullscreenStep", None, 0.7)
+                return
+            self._fs_make_waits = 0
+            self._fs_make_settled = False
+        self._fs_make_title = None
         # macOS 27: the thumbnail's own bundle id names the app exactly, and
         # its focused window is the one AXPress just brought forward — no
         # dependence on CG window titles (blank without Screen Recording).
@@ -2687,7 +2783,7 @@ class MissionControlButtons(NSObject):
                 else:
                     ax.set_fullscreen(window, True)
                 self.performSelector_withObject_afterDelay_(
-                    "verifyMakeFullscreenWindow", None, 1.0)
+                    "verifyMakeFullscreenWindow", None, 2.0)
                 return
         # Mission Control has exited and the window is un-parked. Find it and
         # raise its app frontmost.
@@ -2714,11 +2810,28 @@ class MissionControlButtons(NSObject):
         if window is None:
             return
         state = ax._attribute(window, "AXFullScreen")
-        _geom_log("MAKE-FULLSCREEN verify fullscreen=%r" % (state,))
+        frame = ax.window_frame(window)
+        _geom_log("MAKE-FULLSCREEN verify fullscreen=%r frame=%s" % (state, frame))
         if state:
             self._fs_make_rect = None
             return
-        if self._fs_make_rect is not None:
+        # macOS 27: no blind green-button click. Traffic lights sit in
+        # app-specific spots (inset toolbars), so the click hit other controls
+        # and toggled windows twice. One AX retry instead.
+        if _DROP_VIA_SPACE:
+            self._fs_make_rect = None
+            if ax.element_alive(window):
+                ok = ax.set_fullscreen(window, True)
+                _geom_log("MAKE-FULLSCREEN retry via AXFullScreen ok=%s" % ok)
+            return
+        # A screen-sized frame means a full-screen transition is still in
+        # flight; a synthetic green-button click then lands on whatever is at
+        # the top-left of the screen. Never click blind in that state.
+        if frame and self._screen_width and frame[2] >= 0.95 * self._screen_width:
+            self._fs_make_rect = None
+            return
+        if self._fs_make_rect is not None and frame:
+            self._fs_make_rect = (self._fs_make_rect[0], frame[0], frame[1])
             self.clickFullscreenButton()
 
     def verifyMakeFullscreen(self):
@@ -3016,10 +3129,8 @@ class MissionControlButtons(NSObject):
         strands the window on a deleted space (invisible until the app
         relaunches), and apps hide full-screen windows from AX while Mission
         Control is open. So: switch to the app's space (Mission Control
-        closes), take the window out of full screen there with its own
-        AXFullScreen, then reopen Mission Control — the window is back in the
-        desktop overview, and for ✕ it comes back marked for close (↺ undoes
-        it; it closes when Mission Control exits)."""
+        closes) and act there — ❏ takes the window out of full screen with its
+        own AXFullScreen, ✕ closes it — leaving the user on the desktop."""
         pid = ax.pid_for_title(title)
         _geom_log("UNFULLSCREEN via-space %r pid=%s close=%s" % (title, pid, close))
         self._recently_closed[("acted", title)] = time.time() + 3.0
@@ -3033,6 +3144,20 @@ class MissionControlButtons(NSObject):
         job = getattr(self, "_space_drop", None)
         if not job:
             return
+        # Don't start the exit-full-screen animation until Mission Control's
+        # own exit has fully finished (overlapping them wedged WindowManager),
+        # plus a short settle.
+        gone = ax.mission_control_group() is None
+        if not gone and job.get("waits", 0) < 20:
+            job["waits"] = job.get("waits", 0) + 1
+            self.performSelector_withObject_afterDelay_(
+                "finishSpaceDrop", None, 0.15)
+            return
+        if not job.get("settled"):
+            job["settled"] = True
+            self.performSelector_withObject_afterDelay_(
+                "finishSpaceDrop", None, 0.7)
+            return
         window = ax.find_fullscreen_target(job["title"])
         if window is None and job["pid"] is not None:
             window = ax.fullscreen_window_of_pid(job["pid"])
@@ -3044,7 +3169,18 @@ class MissionControlButtons(NSObject):
                 return
             _geom_log("UNFULLSCREEN via-space %r: window not found" % job["title"])
             self._space_drop = None
-            self._reopen_mission_control(0.2)
+            return
+        if job["close"]:
+            # ✕: just close it here, on its own space, and stay on the
+            # desktop it drops back to — no trip back into Mission Control.
+            button = ax.close_button_of(window)
+            pressed = button is not None and ax.press_element(button)
+            _geom_log("CLOSE-FULLSCREEN via-space %r pressed=%s"
+                      % (job["title"], pressed))
+            self._space_drop = None
+            self._close_check = (job["title"], job["pid"], window)
+            self.performSelector_withObject_afterDelay_(
+                "verifySpaceClose", None, 0.9)
             return
         ok = ax.set_fullscreen(window, False)
         after = (ax._attribute(window, ax.AX.kAXTitleAttribute) or "").strip()
@@ -3052,11 +3188,38 @@ class MissionControlButtons(NSObject):
             after = ax.app_name_for_pid(job["pid"]) or ""
         _geom_log("UNFULLSCREEN via-space %r set=%s window_title=%r"
                   % (job["title"], ok, after))
-        if job["close"] and ok and after:
-            self._mark_on_activate = after
+        # ❏: stay on the desktop with the window; no Mission Control reopen.
         self._space_drop = None
-        # Let the exit-full-screen animation land before reopening.
-        self._reopen_mission_control(1.1)
+
+    def verifySpaceClose(self):
+        """Some apps ignore the close button while a window is full screen:
+        if it survived, take it out of full screen, then close it."""
+        data, self._close_check = getattr(self, "_close_check", None), None
+        if not data:
+            return
+        title, pid, window = data
+        if not ax.element_alive(window):
+            _geom_log("CLOSE-FULLSCREEN via-space %r closed" % title)
+            return
+        if ax._attribute(window, "AXFullScreen") and ax.set_fullscreen(window, False):
+            _geom_log("CLOSE-FULLSCREEN via-space %r ignored close; exiting "
+                      "full screen first" % title)
+            self._close_check_late = (title, window)
+            self.performSelector_withObject_afterDelay_(
+                "finishSpaceCloseLate", None, 1.9)
+            return
+        button = ax.close_button_of(window)
+        ok = button is not None and ax.press_element(button)
+        _geom_log("CLOSE-FULLSCREEN via-space %r retry close=%s" % (title, ok))
+
+    def finishSpaceCloseLate(self):
+        data, self._close_check_late = getattr(self, "_close_check_late", None), None
+        if not data:
+            return
+        title, window = data
+        button = ax.close_button_of(window) if ax.element_alive(window) else None
+        ok = button is not None and ax.press_element(button)
+        _geom_log("CLOSE-FULLSCREEN via-space %r late close=%s" % (title, ok))
 
     @objc.python_method
     def _drop_to_desktop(self, title, element):
