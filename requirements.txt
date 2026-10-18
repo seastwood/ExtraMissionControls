@@ -6,3 +6,4 @@ pyobjc-framework-ApplicationServices>=10.0
 # Packaging (.app + DMG)
 py2app>=0.28
 setuptools<81  # py2app still imports pkg_resources, removed in setuptools 81
+Pillow>=10.0  # scripts/make_icon.py (app icon)

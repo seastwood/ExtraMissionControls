@@ -1,224 +1,157 @@
-"""Generate assets/icon.icns — the app icon.
+"""Generate the app icon and the menu-bar icon.
 
-The five control buttons — ✕ close (red), − minimize (yellow), ⤢ full screen
-(green), ◫ arrange (teal), ⏻ quit (purple) — drawn as colored glass discs laid
-out in the interlocking 3-over-2 Olympic-rings formation, sitting in a Liquid
-Glass tray. Vector-redrawn at every icon size, then packed with iconutil.
+App icon (assets/icon.icns, assets/icon_256.png): a graphite square holding
+a 2x2 grid — three grey window tiles and, in the top-left, a
+pink-to-violet ring: Mission Control's windows plus the control EMC adds.
 
+Menu-bar icon (assets/tray_icon.png): the same grid and ring with no
+background, drawn as a macOS *template* image (black + alpha) — macOS shows
+it white on a dark menu bar and dark on a light one.
+
+    .venv/bin/pip install Pillow
     .venv/bin/python scripts/make_icon.py
 """
 
 import os
-import shutil
-import subprocess
 
-from AppKit import (
-    NSBezierPath,
-    NSBitmapImageFileTypePNG,
-    NSBitmapImageRep,
-    NSColor,
-    NSDeviceRGBColorSpace,
-    NSGradient,
-    NSGraphicsContext,
-)
-from Foundation import NSMakeRect, NSMakePoint
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 ASSETS = os.path.join(os.path.dirname(__file__), "..", "assets")
 
-# All geometry is designed on a 1024pt canvas, bottom-left origin.
-_BODY = (100, 100, 824, 824)   # the icon "squircle" (macOS leaves a margin)
-_BODY_RADIUS = 185
-
-# Control colors (match the app's traffic-light palette).
-_RED = (0.99, 0.37, 0.34)
-_YELLOW = (1.00, 0.74, 0.18)
-_GREEN = (0.22, 0.74, 0.32)
-_TEAL = (0.16, 0.72, 0.70)
-_PURPLE = (0.66, 0.42, 0.94)
-# macOS dark-mode window background (NSColor.windowBackgroundColor, #1E1E1E).
-_DARK_BG = (0.118, 0.118, 0.118)
-
-# Olympic layout: three discs on top, two nestled below in the gaps.
-_DISC_R = 92
-_CX = 512
-_TOP_DX = 206          # top-row centre spacing
-_TOP_Y = 566
-_BOT_Y = 458
-_DISCS = [             # (cx, cy, rgb, glyph) — drawn back-to-front, so the two
-                       # bottom-row discs sit behind the three top-row ones.
-    (_CX - _TOP_DX / 2, _BOT_Y, _PURPLE, "power"),     # quit, bottom-left
-    (_CX + _TOP_DX / 2, _BOT_Y, _TEAL, "arrange"),     # arrange, bottom-right
-    (_CX - _TOP_DX, _TOP_Y, _RED, "close"),            # close, top-left
-    (_CX,           _TOP_Y, _GREEN, "expand"),         # full screen, top-centre
-    (_CX + _TOP_DX, _TOP_Y, _YELLOW, "minimize"),      # minimize, top-right
-]
-
-# Glass tray hugging the disc cluster.
-_TRAY_PAD = 52
-_xs = [d[0] for d in _DISCS]
-_ys = [d[1] for d in _DISCS]
-_TRAY = (min(_xs) - _DISC_R - _TRAY_PAD,
-         min(_ys) - _DISC_R - _TRAY_PAD,
-         (max(_xs) - min(_xs)) + 2 * (_DISC_R + _TRAY_PAD),
-         (max(_ys) - min(_ys)) + 2 * (_DISC_R + _TRAY_PAD))
-_TRAY_RADIUS = 96
+S = 4                     # supersampling factor
+N = 1024 * S              # app-icon canvas (designed on a 1024 grid)
+BODY = (100, 100, 924, 924)
+BODY_RADIUS = 64
+TILE, GAP = 300, 56
+X0 = 512 - (2 * TILE + GAP) / 2
 
 
-def _lighten(rgb, amount):
-    return tuple(c + (1.0 - c) * amount for c in rgb)
+def _box(b, scale=S):
+    return [v * scale for v in b]
 
 
-def _rgba(rgb, alpha=1.0):
-    return NSColor.colorWithCalibratedRed_green_blue_alpha_(
-        rgb[0], rgb[1], rgb[2], alpha)
+def _cell(r, c):
+    x, y = X0 + c * (TILE + GAP), X0 + r * (TILE + GAP)
+    return x, y, x + TILE, y + TILE
 
 
-def _rounded(rect, radius):
-    return NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-        NSMakeRect(*rect), radius, radius)
+def _lerp(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(len(a)))
 
 
-def _oval(cx, cy, r):
-    return NSBezierPath.bezierPathWithOvalInRect_(
-        NSMakeRect(cx - r, cy - r, 2 * r, 2 * r))
+def _diag(c1, c2):
+    """Diagonal gradient, top-left -> bottom-right."""
+    small = Image.new("RGBA", (256, 256))
+    px = small.load()
+    for y in range(256):
+        for x in range(256):
+            px[x, y] = _lerp(c1, c2, (x + y) / 510) + (255,)
+    return small.resize((N, N), Image.BICUBIC)
 
 
-def _stroke(pts, width):
-    path = NSBezierPath.bezierPath()
-    path.setLineWidth_(width)
-    path.setLineCapStyle_(1)   # round
-    path.setLineJoinStyle_(1)  # round
-    path.moveToPoint_(NSMakePoint(*pts[0]))
-    for pt in pts[1:]:
-        path.lineToPoint_(NSMakePoint(*pt))
-    path.stroke()
+def _grad(c1, c2, horizontal=False):
+    g = Image.new("RGBA", (256, 1) if horizontal else (1, 256))
+    for i in range(256):
+        g.putpixel((i, 0) if horizontal else (0, i), _lerp(c1, c2, i / 255) + (255,))
+    return g.resize((N, N), Image.BICUBIC)
 
 
-def _glyph(kind, cx, cy, g, w):
-    """Draw a white control glyph centred at (cx, cy); g = half-extent."""
-    NSColor.whiteColor().setStroke()
-    if kind == "close":
-        _stroke([(cx - g, cy - g), (cx + g, cy + g)], w)
-        _stroke([(cx - g, cy + g), (cx + g, cy - g)], w)
-    elif kind == "minimize":
-        _stroke([(cx - g, cy), (cx + g, cy)], w)
-    elif kind == "expand":
-        # Diagonal double-arrow (bottom-left ↙ / top-right ↗).
-        _stroke([(cx - g, cy - g), (cx + g, cy + g)], w)
-        a = g * 1.05
-        _stroke([(cx + g - a, cy + g), (cx + g, cy + g), (cx + g, cy + g - a)], w)
-        _stroke([(cx - g + a, cy - g), (cx - g, cy - g), (cx - g, cy - g + a)], w)
-    elif kind == "arrange":
-        # Square split by a vertical line (the ◫ tiling glyph).
-        box = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            NSMakeRect(cx - g, cy - g, 2 * g, 2 * g), g * 0.28, g * 0.28)
-        box.setLineWidth_(w)
-        box.setLineJoinStyle_(1)
-        box.stroke()
-        _stroke([(cx, cy - g), (cx, cy + g)], w)
-    elif kind == "power":
-        # IEC power symbol: ring with a gap at the top + a vertical bar.
-        ring = NSBezierPath.bezierPath()
-        ring.setLineWidth_(w)
-        ring.setLineCapStyle_(1)
-        ring.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_(
-            NSMakePoint(cx, cy - g * 0.12), g, 118.0, 62.0)
-        ring.stroke()
-        _stroke([(cx, cy - g * 0.12), (cx, cy + g * 1.05)], w)
+def _mask(draw_fn):
+    m = Image.new("L", (N, N), 0)
+    draw_fn(ImageDraw.Draw(m))
+    return m
 
 
-def _draw_disc(cx, cy, r, rgb, kind):
-    # Soft contact shadow so the disc reads as sitting on the glass.
-    NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.18).setFill()
-    _oval(cx, cy - r * 0.06, r * 1.02).fill()
-    # Colored body with a top-lit glassy gradient.
-    NSGradient.alloc().initWithStartingColor_endingColor_(
-        _rgba(_lighten(rgb, 0.28)), _rgba(rgb)).drawInBezierPath_angle_(
-            _oval(cx, cy, r), -90.0)
-    # Full rim + a brighter specular arc across the top edge.
-    ring = _oval(cx, cy, r - r * 0.02)
-    ring.setLineWidth_(r * 0.05)
-    NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.35).setStroke()
-    ring.stroke()
-    sheen = NSBezierPath.bezierPath()
-    sheen.setLineWidth_(r * 0.06)
-    sheen.setLineCapStyle_(1)
-    sheen.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_(
-        NSMakePoint(cx, cy), r * 0.9, 52.0, 128.0)
-    NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.55).setStroke()
-    sheen.stroke()
-    _glyph(kind, cx, cy, r * 0.46, r * 0.17)
+def _shadow(img, mask, dy=12, blur=16, alpha=110):
+    sh = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+    sh.putalpha(mask.point(lambda v: v * alpha // 255))
+    sh = sh.transform((N, N), Image.AFFINE, (1, 0, 0, 0, 1, -dy * S))
+    img.alpha_composite(sh.filter(ImageFilter.GaussianBlur(blur * S)))
 
 
-def _draw_tray(rect, radius):
-    x, y, w, h = rect
-    # Drop shadow.
-    NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.22).setFill()
-    _rounded((x, y - h * 0.03, w, h), radius).fill()
-    tray = _rounded(rect, radius)
-    # Frosted fill: translucent white, brighter at the top.
-    NSGradient.alloc().initWithStartingColor_endingColor_(
-        NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.30),
-        NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.10),
-    ).drawInBezierPath_angle_(tray, -90.0)
-    # Rim.
-    tray.setLineWidth_(max(2.0, h * 0.012))
-    NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.45).setStroke()
-    tray.stroke()
+def app_icon():
+    img = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+    body = _mask(lambda d: d.rounded_rectangle(_box(BODY), radius=BODY_RADIUS * S,
+                                               fill=255))
+    img.paste(_diag((62, 63, 70), (16, 16, 20)), (0, 0), body)
+
+    # Window tiles: solid greys, lit from the top, with soft shadows.
+    for (r, c), (top, bottom) in (((0, 1), ((128, 128, 136), (100, 100, 108))),
+                                  ((1, 0), ((92, 92, 100), (68, 68, 75))),
+                                  ((1, 1), ((176, 176, 184), (146, 146, 154)))):
+        box = _cell(r, c)
+        m = _mask(lambda d, b=box: d.rounded_rectangle(_box(b), radius=44 * S,
+                                                       fill=255))
+        _shadow(img, m, dy=12, blur=16, alpha=100)
+        tile = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+        tile.paste(_grad(top, bottom), (0, 0), m)
+        img.alpha_composite(tile)
+        x1, y1, x2, y2 = box
+        edge = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+        ImageDraw.Draw(edge).rounded_rectangle(
+            _box((x1 + 2, y1 + 2, x2 - 2, y2 - 2)), radius=42 * S,
+            outline=(255, 255, 255, 60), width=3 * S)
+        fade = _mask(lambda d, y=y1, a=x1, b=x2: d.rectangle(
+            _box((a, y, b, y + 70)), fill=255)).filter(ImageFilter.GaussianBlur(24 * S))
+        edge.putalpha(ImageChops.multiply(edge.getchannel("A"), fade))
+        img.alpha_composite(edge)
+
+    # The ring: pink -> violet gradient with a soft drop shadow.
+    x1, y1, x2, y2 = _cell(0, 0)
+    ring = _mask(lambda d: d.ellipse(_box((x1 + 18, y1 + 18, x2 - 18, y2 - 18)),
+                                     outline=255, width=48 * S))
+    _shadow(img, ring, dy=10, blur=12, alpha=120)
+    fill = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+    fill.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True), (0, 0), ring)
+    img.alpha_composite(fill)
+    sheen = Image.new("RGBA", (N, N), (255, 255, 255, 0))
+    top_half = _mask(lambda d: d.rectangle(_box((x1, y1, x2, (y1 + y2) / 2)),
+                                           fill=70)).filter(ImageFilter.GaussianBlur(30 * S))
+    sheen.putalpha(ImageChops.multiply(ring, top_half))
+    img.alpha_composite(sheen)
+
+    # A hairline highlight around the body edge.
+    rim = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+    ImageDraw.Draw(rim).rounded_rectangle(_box((101, 101, 923, 923)),
+                                          radius=(BODY_RADIUS - 1) * S,
+                                          outline=(255, 255, 255, 34), width=3 * S)
+    img.alpha_composite(rim)
+    return img.resize((1024, 1024), Image.LANCZOS)
 
 
-def draw(size):
-    s = size / 1024.0
+def tray_icon(px=36):
+    """Template image: 18pt menu-bar icon at @2x (36px)."""
+    k = 16  # supersample
+    n = px * k
+    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    margin, gap = 2.0, 2.5
+    tile = (px - 2 * margin - gap) / 2
+    ink = (0, 0, 0, 255)
 
-    def sc(rect):
-        return tuple(v * s for v in rect)
+    def cell(r, c):
+        x = margin + c * (tile + gap)
+        y = margin + r * (tile + gap)
+        return [x * k, y * k, (x + tile) * k, (y + tile) * k]
 
-    # Background: the flat macOS dark-mode window color.
-    body = _rounded(sc(_BODY), _BODY_RADIUS * s)
-    _rgba(_DARK_BG).setFill()
-    body.fill()
-
-    _draw_tray(sc(_TRAY), _TRAY_RADIUS * s)
-
-    for cx, cy, rgb, kind in _DISCS:
-        _draw_disc(cx * s, cy * s, _DISC_R * s, rgb, kind)
-
-
-def render_png(size, path):
-    rep = NSBitmapImageRep.alloc(). \
-        initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
-            None, size, size, 8, 4, True, False, NSDeviceRGBColorSpace, 0, 0)
-    context = NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.setCurrentContext_(context)
-    try:
-        draw(size)
-    finally:
-        NSGraphicsContext.restoreGraphicsState()
-    rep.representationUsingType_properties_(
-        NSBitmapImageFileTypePNG, {}).writeToFile_atomically_(path, True)
+    for r, c in ((0, 1), (1, 0), (1, 1)):
+        d.rounded_rectangle(cell(r, c), radius=3.2 * k, fill=ink)
+    x1, y1, x2, y2 = cell(0, 0)
+    inset = 0.6 * k
+    d.ellipse([x1 + inset, y1 + inset, x2 - inset, y2 - inset],
+              outline=ink, width=int(2.6 * k))
+    return img.resize((px, px), Image.LANCZOS)
 
 
 def main():
-    os.makedirs(ASSETS, exist_ok=True)
-    iconset = os.path.join(ASSETS, "icon.iconset")
-    shutil.rmtree(iconset, ignore_errors=True)
-    os.makedirs(iconset)
-
-    for points in (16, 32, 128, 256, 512):
-        render_png(points, os.path.join(iconset, "icon_%dx%d.png" % (points, points)))
-        render_png(points * 2, os.path.join(
-            iconset, "icon_%dx%d@2x.png" % (points, points)))
-
-    icns = os.path.join(ASSETS, "icon.icns")
-    subprocess.run(["iconutil", "-c", "icns", iconset, "-o", icns], check=True)
-    shutil.rmtree(iconset)
-    print("wrote", os.path.abspath(icns))
-
-    # Standalone PNG for the README header.
-    readme_png = os.path.join(ASSETS, "icon_256.png")
-    render_png(256, os.path.abspath(readme_png))
-    print("wrote", os.path.abspath(readme_png))
+    icon = app_icon()
+    icon.save(os.path.join(ASSETS, "icon.icns"),
+              sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256),
+                     (512, 512), (1024, 1024)])
+    icon.resize((256, 256), Image.LANCZOS).save(
+        os.path.join(ASSETS, "icon_256.png"))
+    tray_icon().save(os.path.join(ASSETS, "tray_icon.png"))
+    print("wrote assets/icon.icns, assets/icon_256.png, assets/tray_icon.png")
 
 
 if __name__ == "__main__":
