@@ -68,7 +68,7 @@ def describe(element):
     return "  ".join(parts)
 
 
-def walk(element, depth=0, max_depth=8):
+def walk(element, depth=0, max_depth=10):
     print("%s%s" % ("  " * depth, describe(element)))
     if depth >= max_depth:
         return
@@ -94,14 +94,15 @@ def dump_dock(label):
 
 def dock_windows(label):
     print("-" * 70)
-    print("DOCK / WINDOWMANAGER CG WINDOWS — %s" % label)
+    print("ALL ON-SCREEN CG WINDOWS — %s" % label)
     raw = Quartz.CGWindowListCopyWindowInfo(
         Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []
     for entry in raw:
         owner = entry.get(Quartz.kCGWindowOwnerName, "")
-        if owner in ("Dock", "WindowManager"):
-            print("  owner=%s layer=%s name=%r bounds=%s" % (
-                owner,
+        if True:
+            print("  owner=%s pid=%s layer=%s alpha=%s name=%r bounds=%s" % (
+                owner, entry.get(Quartz.kCGWindowOwnerPID),
+                entry.get(Quartz.kCGWindowAlpha),
                 entry.get(Quartz.kCGWindowLayer),
                 entry.get(Quartz.kCGWindowName, ""),
                 dict(entry.get(Quartz.kCGWindowBounds) or {})))
@@ -123,7 +124,7 @@ def main():
 
     print("\n>>> Triggering Mission Control...\n")
     subprocess.run(["open", "-b", "com.apple.exposelauncher"], check=False)
-    time.sleep(1.5)
+    time.sleep(2.5)
 
     try:
         dump_dock("MISSION CONTROL ACTIVE")

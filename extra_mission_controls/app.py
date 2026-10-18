@@ -301,10 +301,59 @@ class AppDelegate(NSObject):
 _delegate = None  # NSApplication.delegate is weak; keep a strong reference
 
 
+_PID_FILE = os.path.join(os.environ.get("TMPDIR", "/tmp"),
+                         "extramissioncontrols.pid")
+
+
+def _replace_running_instance():
+    """Only one EMC may run: two draw duplicate buttons and tray icons. A
+    copy left behind (a suspended Ctrl+Z, a Terminal that kept it alive) is
+    stopped here so a fresh launch always wins with the current code."""
+    import signal
+    import time
+    try:
+        with open(_PID_FILE) as fh:
+            old = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        old = 0
+    if old and old != os.getpid():
+        try:
+            # Only stop it if it really is EMC (the pid may have been reused).
+            cmd = subprocess.run(["ps", "-p", str(old), "-o", "command="],
+                                 capture_output=True, text=True).stdout
+        except OSError:
+            cmd = ""
+        if "main.py" in cmd or "ExtraMissionControls" in cmd:
+            for sig in (signal.SIGCONT, signal.SIGTERM):
+                try:
+                    os.kill(old, sig)
+                except OSError:
+                    break
+            for _ in range(20):  # up to 1s for a clean exit, then force it
+                try:
+                    os.kill(old, 0)
+                except OSError:
+                    break
+                time.sleep(0.05)
+            else:
+                try:
+                    os.kill(old, signal.SIGKILL)
+                except OSError:
+                    pass
+    try:
+        with open(_PID_FILE, "w") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
 def main():
     global _delegate
+    _replace_running_instance()
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     _delegate = AppDelegate.alloc().init()
     app.setDelegate_(_delegate)
-    AppHelper.runEventLoop()
+    # installInterrupt: Ctrl+C in the launching Terminal quits cleanly
+    # (the Cocoa run loop otherwise swallows SIGINT).
+    AppHelper.runEventLoop(installInterrupt=True)

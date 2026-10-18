@@ -42,8 +42,10 @@ from AppKit import (
     NSScreen,
     NSTimer,
     NSWindowSharingNone,
+    NSWindowSharingReadOnly,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorMoveToActiveSpace,
     NSWindowCollectionBehaviorIgnoresCycle,
     NSWindowCollectionBehaviorStationary,
     NSWindowStyleMaskBorderless,
@@ -206,6 +208,79 @@ def _geom_log(message):
         pass
 
 
+# macOS 27 diagnostics: Mission Control's AX layout moved into WindowManager
+# and is undocumented, so the first few distinct layouts of each launch are
+# dumped (tree + thumbnails + on-screen windows) to emc_diag.txt in the
+# project folder when running from source. Cheap: at most _DIAG_MAX writes.
+_DIAG_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "emc_diag.txt")
+_DIAG_MAX = 4
+_diag_state = {"count": 0, "sigs": set(), "fresh": True}
+
+
+def _write_diag(group, thumbs, spaces):
+    if group is None or group is not ax._wm_root \
+            or _diag_state["count"] >= _DIAG_MAX:
+        return
+    sig = tuple((t["title"], round(t["x"]), round(t["y"])) for t in thumbs)
+    if sig in _diag_state["sigs"]:
+        return
+    _diag_state["sigs"].add(sig)
+    _diag_state["count"] += 1
+    try:
+        lines = ["==== layout %d @ %s ====" % (_diag_state["count"],
+                                              time.strftime("%H:%M:%S"))]
+        lines.append("[thumbs]")
+        for t in thumbs:
+            lines.append("  %r @(%.0f,%.0f %.0fx%.0f)"
+                         % (t["title"], t["x"], t["y"], t["width"], t["height"]))
+        lines.append("[spaces]")
+        for sp in spaces:
+            lines.append("  %r desc=%r @(%.0f,%.0f %.0fx%.0f)"
+                         % (sp["title"], sp["desc"], sp["x"], sp["y"],
+                            sp["width"], sp["height"]))
+        lines.append("[tree]")
+        lines.extend(ax.describe_mc_tree(group, max_depth=7))
+        lines.append("[on-screen windows]")
+        raw = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []
+        for entry in raw:
+            b = entry.get(Quartz.kCGWindowBounds) or {}
+            lines.append("  %s pid=%s layer=%s alpha=%s name=%r (%s,%s %sx%s)" % (
+                entry.get(Quartz.kCGWindowOwnerName),
+                entry.get(Quartz.kCGWindowOwnerPID),
+                entry.get(Quartz.kCGWindowLayer),
+                entry.get(Quartz.kCGWindowAlpha),
+                entry.get(Quartz.kCGWindowName, ""),
+                b.get("X"), b.get("Y"), b.get("Width"), b.get("Height")))
+        mode = "w" if _diag_state["fresh"] else "a"
+        _diag_state["fresh"] = False
+        with open(_DIAG_FILE, mode) as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+
+
+# Our overlay panels opt out of window capture so Mission Control's space
+# previews skip them (macOS 26). macOS 27's WindowManager instead draws an
+# uncapturable window as SOLID BLACK in every space preview it appears in —
+# and these panels join all spaces, so each full-screen space's Spaces Bar
+# preview went black (the screen-sized scene probe) with button-shaped holes.
+# There, leave them capturable: the probe is alpha 0, so previews look right.
+# macOS 27: two tiny corner probes replace the screen-sized scene probe,
+# which WindowManager painted black into every Spaces Bar preview.
+_SPLIT_SCENE_PROBE = ax._macos_major() >= 27
+_CORNER_PROBE_SIZE = 4.0
+# Which spaces our panels live on. Joining ALL spaces put a copy of every
+# button into each full-screen space's Spaces Bar preview on macOS 27 (26 hid
+# them via the sharing type above); there, keep them on the active space only.
+_PANEL_SPACES = (NSWindowCollectionBehaviorMoveToActiveSpace
+                 if ax._macos_major() >= 27
+                 else NSWindowCollectionBehaviorCanJoinAllSpaces)
+_PANEL_SHARING = (NSWindowSharingReadOnly if ax._macos_major() >= 27
+                  else NSWindowSharingNone)
+
+
 class MissionControlButtons(NSObject):
     """Polls the Dock for Mission Control and manages the ✕ button panels."""
 
@@ -318,6 +393,8 @@ class MissionControlButtons(NSObject):
         # activate) exercise the downstream logic; _activate arms it closed.
         self._scene_probe = None
         self._scene_probe_rect = None
+        self._corner_probes = []      # macOS 27 split probe (see below)
+        self._corner_rects = []
         self._scene_streak = _SCENE_STREAK_MIN
         self._scene_dead_ticks = 0    # unreadable-probe ticks (signal broke)
         self._scene_closed_ticks = 0  # any closed-gate ticks (insurance)
@@ -533,6 +610,8 @@ class MissionControlButtons(NSObject):
         self._scene_streak = 0
         if self._scene_probe is not None:
             self._scene_probe.orderOut_(None)
+        for panel in self._corner_probes:
+            panel.orderOut_(None)
         if self._sync_timer is not None:
             self._sync_timer.invalidate()
             self._sync_timer = None
@@ -793,6 +872,7 @@ class MissionControlButtons(NSObject):
         # tiles, and the mc.windows child count — instead of three.
         thumbs, spaces, window_count = ax.mission_control_snapshot(group)
         self._log_geometry(group, thumbs, spaces)
+        _write_diag(group, thumbs, spaces)
 
         # A full-screen app closed from the Spaces Bar un-fullscreens in place
         # and reappears as a desktop thumbnail with an unpredictable title. Mark
@@ -1533,7 +1613,7 @@ class MissionControlButtons(NSObject):
                 NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
                 NSBackingStoreBuffered, False)
             panel.setReleasedWhenClosed_(False)
-            panel.setSharingType_(NSWindowSharingNone)  # not in MC snapshots
+            panel.setSharingType_(_PANEL_SHARING)  # not in MC snapshots
             panel.setOpaque_(False)
             panel.setBackgroundColor_(NSColor.clearColor())
             panel.setHasShadow_(True)  # a menu casts a shadow, unlike the buttons
@@ -1541,7 +1621,7 @@ class MissionControlButtons(NSObject):
             # One level above the button panels so it overlays them like a menu.
             panel.setLevel_(NSPopUpMenuWindowLevel + 1)
             panel.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces
+                _PANEL_SPACES
                 | NSWindowCollectionBehaviorStationary
                 | NSWindowCollectionBehaviorFullScreenAuxiliary
                 | NSWindowCollectionBehaviorIgnoresCycle)
@@ -1660,7 +1740,7 @@ class MissionControlButtons(NSObject):
         # Excluded from Mission Control's space-thumbnail captures: a stationary
         # all-spaces panel is otherwise composited into a full-screen space's
         # snapshot, so the buttons look baked into that tile in the Spaces Bar.
-        panel.setSharingType_(NSWindowSharingNone)
+        panel.setSharingType_(_PANEL_SHARING)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(False)
@@ -1669,7 +1749,7 @@ class MissionControlButtons(NSObject):
         # present on every space, and pinned in place while MC animates.
         panel.setLevel_(NSPopUpMenuWindowLevel)
         panel.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
+            _PANEL_SPACES
             | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorIgnoresCycle)
@@ -1724,7 +1804,7 @@ class MissionControlButtons(NSObject):
         # Excluded from Mission Control's space-thumbnail captures: a stationary
         # all-spaces panel is otherwise composited into a full-screen space's
         # snapshot, so the buttons look baked into that tile in the Spaces Bar.
-        panel.setSharingType_(NSWindowSharingNone)
+        panel.setSharingType_(_PANEL_SHARING)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(False)
@@ -1734,7 +1814,7 @@ class MissionControlButtons(NSObject):
         # scrim, but above the Mission Control backdrop.
         panel.setLevel_(NSPopUpMenuWindowLevel - 1)
         panel.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
+            _PANEL_SPACES
             | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorIgnoresCycle)
@@ -1782,7 +1862,7 @@ class MissionControlButtons(NSObject):
         # Excluded from Mission Control's space-thumbnail captures: a stationary
         # all-spaces panel is otherwise composited into a full-screen space's
         # snapshot, so the buttons look baked into that tile in the Spaces Bar.
-        panel.setSharingType_(NSWindowSharingNone)
+        panel.setSharingType_(_PANEL_SHARING)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(False)
@@ -1792,7 +1872,7 @@ class MissionControlButtons(NSObject):
         # Mission Control backdrop.
         panel.setLevel_(NSPopUpMenuWindowLevel - 1)
         panel.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
+            _PANEL_SPACES
             | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorIgnoresCycle)
@@ -1871,13 +1951,16 @@ class MissionControlButtons(NSObject):
         yet still CG-listed with live bounds (verified)."""
         w = float(self._screen_width or 1000)
         h = float(self._screen_height or 800)
+        if _SPLIT_SCENE_PROBE:
+            self._show_corner_probes(w, h)
+            return
         if self._scene_probe is None:
             panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
                 NSMakeRect(0, 0, w, h),
                 NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
                 NSBackingStoreBuffered, False)
             panel.setReleasedWhenClosed_(False)
-            panel.setSharingType_(NSWindowSharingNone)
+            panel.setSharingType_(_PANEL_SHARING)
             panel.setOpaque_(False)
             panel.setBackgroundColor_(NSColor.clearColor())
             panel.setHasShadow_(False)
@@ -1886,7 +1969,7 @@ class MissionControlButtons(NSObject):
             panel.setAlphaValue_(0.0)
             panel.setLevel_(NSPopUpMenuWindowLevel)
             panel.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces
+                _PANEL_SPACES
                 | NSWindowCollectionBehaviorStationary
                 | NSWindowCollectionBehaviorFullScreenAuxiliary
                 | NSWindowCollectionBehaviorIgnoresCycle)
@@ -1894,6 +1977,68 @@ class MissionControlButtons(NSObject):
         self._scene_probe_rect = (0.0, 0.0, w, h)
         self._scene_probe.setFrame_display_(NSMakeRect(0, 0, w, h), False)
         self._scene_probe.orderFrontRegardless()
+
+    @objc.python_method
+    def _new_probe_panel(self, rect):
+        panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect,
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
+            NSBackingStoreBuffered, False)
+        panel.setReleasedWhenClosed_(False)
+        panel.setSharingType_(_PANEL_SHARING)
+        panel.setOpaque_(False)
+        panel.setBackgroundColor_(NSColor.clearColor())
+        panel.setHasShadow_(False)
+        panel.setHidesOnDeactivate_(False)
+        panel.setIgnoresMouseEvents_(True)
+        panel.setAlphaValue_(0.0)
+        panel.setLevel_(NSPopUpMenuWindowLevel)
+        panel.setCollectionBehavior_(
+            _PANEL_SPACES
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+            | NSWindowCollectionBehaviorIgnoresCycle)
+        return panel
+
+    @objc.python_method
+    def _show_corner_probes(self, w, h):
+        """macOS 27 variant of the scene probe. WindowManager draws every
+        window into the Spaces Bar previews IGNORING its alpha, so the
+        screen-sized probe painted each preview solid black. Two tiny probes
+        at opposite screen corners see the same zoom instead: under a scale
+        about ANY anchor, at least one of two opposite corners moves by half
+        the diagonal times the scale change (~9px at 1%% on a 1470x956
+        screen), past _bounds_match's 5px threshold — while in a preview they
+        shrink to under a pixel."""
+        size = _CORNER_PROBE_SIZE
+        # Cocoa (bottom-left origin) rects; CG/top-left expectations beside.
+        specs = [(NSMakeRect(0, h - size, size, size), (0.0, 0.0, size, size)),
+                 (NSMakeRect(w - size, 0, size, size),
+                  (w - size, h - size, size, size))]
+        if not self._corner_probes:
+            self._corner_probes = [self._new_probe_panel(rect)
+                                   for rect, _ in specs]
+            self._scene_probe = self._corner_probes[0]
+        self._corner_rects = []
+        for panel, (rect, expect) in zip(self._corner_probes, specs):
+            panel.setFrame_display_(rect, False)
+            panel.orderFrontRegardless()
+            self._corner_rects.append((panel, expect))
+        self._scene_probe_rect = self._corner_rects[0][1]
+
+    @objc.python_method
+    def _probe_match(self):
+        """True (at rest) / False (transformed) / None (unreadable) across the
+        scene probe(s)."""
+        if not _SPLIT_SCENE_PROBE:
+            x, y_top, w, h = self._scene_probe_rect
+            return self._bounds_match(self._scene_probe.windowNumber(),
+                                      x, y_top, w, h)
+        results = [self._bounds_match(panel.windowNumber(), *expect)
+                   for panel, expect in self._corner_rects]
+        if any(r is None for r in results):
+            return None
+        return all(results)
 
     @objc.python_method
     def _check_scene_transform(self):
@@ -1913,9 +2058,7 @@ class MissionControlButtons(NSObject):
         self._probe_decim = (self._probe_decim + 1) % 3
         if self._settled_thumbs_sig is not None and self._probe_decim:
             return
-        x, y_top, w, h = self._scene_probe_rect
-        match = self._bounds_match(self._scene_probe.windowNumber(),
-                                   x, y_top, w, h)
+        match = self._probe_match()
         if match:
             self._scene_streak += 1
             self._scene_dead_ticks = 0

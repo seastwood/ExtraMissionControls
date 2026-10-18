@@ -506,7 +506,7 @@ def _multi_attributes(element, names):
     return dict(zip(names, values))
 
 
-_THUMB_ATTRS = ["AXTitle", "AXPosition", "AXSize"]
+_THUMB_ATTRS = ["AXTitle", "AXPosition", "AXSize", "AXDescription", "AXIdentifier"]
 _SPACE_ATTRS = ["AXTitle", "AXDescription", "AXPosition", "AXSize"]
 # A display's children are classified and, for macOS 27's direct thumbnail
 # buttons, read in the same single batched call.
@@ -564,6 +564,77 @@ def _current_space_only(buttons):
             if wid is None or wid in _onscreen_ids]
 
 
+def _active_space_id():
+    """The managed id of the space currently shown, via the private (but
+    long-stable) CGSGetActiveSpace; None if unavailable."""
+    global _cgs
+    if _cgs is None:
+        try:
+            import ctypes
+            lib = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            lib.CGSMainConnectionID.restype = ctypes.c_int
+            lib.CGSGetActiveSpace.argtypes = [ctypes.c_int]
+            lib.CGSGetActiveSpace.restype = ctypes.c_uint64
+            _cgs = lib
+        except Exception:
+            _cgs = False
+    if not _cgs:
+        return None
+    try:
+        return int(_cgs.CGSGetActiveSpace(_cgs.CGSMainConnectionID())) or None
+    except Exception:
+        return None
+
+
+_cgs = None
+
+
+def _split_thumb_id(ident):
+    """'com.apple.Safari.space.3' -> ('com.apple.Safari', 3); macOS 27
+    WindowManager names every thumbnail this way. (None, None) otherwise."""
+    if not isinstance(ident, str) or ".space." not in ident:
+        return None, None
+    bundle, _, number = ident.rpartition(".space.")
+    try:
+        return bundle, int(number)
+    except ValueError:
+        return bundle, None
+
+
+def _drop_other_space_thumbs(thumbs, spaces):
+    """macOS 27 lists the windows of EVERY full-screen space among the
+    current desktop's thumbnails — stacked, invisible, at one centred frame
+    (the 'ghost window'). Keep only the shown space's thumbnails: by the
+    active space id when it matches any thumbnail, else by dropping spaces
+    whose thumbnails are the full-screen apps named in the Spaces Bar."""
+    numbered = [t for t in thumbs if t.get("space") is not None]
+    if not numbered:
+        return thumbs
+    active = _active_space_id()
+    if active is not None and any(t["space"] == active for t in numbered):
+        return [t for t in thumbs if t.get("space") in (None, active)]
+    fs_titles = {s["title"] for s in spaces
+                 if s["desc"].startswith("exit to full screen")}
+    by_space = {}
+    for t in numbered:
+        by_space.setdefault(t["space"], []).append(t)
+    fs_spaces = {n for n, members in by_space.items()
+                 if all(m["title"] in fs_titles for m in members)
+                 and len(by_space) > 1}
+    return [t for t in thumbs if t.get("space") not in fs_spaces]
+
+
+def _app_name_for_bundle(bundle_id):
+    from AppKit import NSRunningApplication
+    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+        bundle_id) or []
+    for app in apps:
+        if app.localizedName():
+            return app.localizedName()
+    return None
+
+
 def mission_control_snapshot(group):
     """One walk of the Mission Control subtree returning
     (thumbnails, spaces, window_count) — everything a sync frame needs.
@@ -586,7 +657,16 @@ def mission_control_snapshot(group):
             if position is None or size is None:
                 continue
             title = vals["AXTitle"]
+            if not (isinstance(title, str) and title.strip()):
+                title = vals.get("AXDescription")
+            bundle, space = _split_thumb_id(vals.get("AXIdentifier"))
+            if not (isinstance(title, str) and title.strip()) and bundle:
+                # An untitled window of a real app (Safari's Start Page) —
+                # name it by its app; the window lookups below resolve an
+                # app-name title to that app's lone untitled window.
+                title = _app_name_for_bundle(bundle) or ""
             thumbs.append({
+                "space": space,
                 "title": title if isinstance(title, str) else "",
                 "x": position[0],
                 "y": position[1],
@@ -614,6 +694,10 @@ def mission_control_snapshot(group):
                 # AXPress on this element switches to the space.
                 "element": button,
             })
+    if group is _wm_root:
+        before = len(thumbs)
+        thumbs = _drop_other_space_thumbs(thumbs, spaces)
+        window_count -= before - len(thumbs)
     return thumbs, spaces, window_count
 
 
@@ -657,11 +741,12 @@ def describe_mc_tree(group, max_depth=4):
         title = _attribute(element, AX.kAXTitleAttribute)
         pos = _unpack_point(_attribute(element, AX.kAXPositionAttribute))
         size = _unpack_size(_attribute(element, AX.kAXSizeAttribute))
+        desc = _attribute(element, AX.kAXDescriptionAttribute)
         children = _attribute(element, AX.kAXChildrenAttribute) or []
         frame = ("@(%.0f,%.0f %.0fx%.0f)" % (pos[0], pos[1], size[0], size[1])
                  if pos is not None and size is not None else "")
-        lines.append("    %s%s id=%s sub=%s title=%r %s children=%d"
-                     % ("  " * depth, role, ident, sub, title, frame,
+        lines.append("    %s%s id=%s sub=%s title=%r desc=%r %s children=%d"
+                     % ("  " * depth, role, ident, sub, title, desc, frame,
                         len(children)))
         if depth < max_depth:
             for child in children:
@@ -986,6 +1071,9 @@ def _press_window_button_by_title(title, pids, button_attr):
             elif titles_related(title, window_title):
                 related.append(button)
     target = exact[0] if exact else (related[0] if len(related) == 1 else None)
+    if target is None:
+        window = _untitled_window_of(title, pids)
+        target = _attribute(window, button_attr) if window is not None else None
     return target is not None and AX.AXUIElementPerformAction(
         target, AX.kAXPressAction) == AX.kAXErrorSuccess
 
@@ -1007,7 +1095,26 @@ def _find_window_by_title(title, pids):
                 related.append(window)
     if exact:
         return exact[0]
-    return related[0] if len(related) == 1 else None
+    if len(related) == 1:
+        return related[0]
+    return _untitled_window_of(title, pids)
+
+
+def _untitled_window_of(app_name, pids):
+    """An untitled thumbnail is titled by its app's name (see
+    mission_control_snapshot): resolve it to that app's ONLY untitled window
+    among `pids`, or None when there isn't exactly one."""
+    if not app_name:
+        return None
+    wanted = set(pids)
+    found = []
+    for pid in _pids_named(app_name):
+        if wanted and pid not in wanted:
+            continue
+        for window in _ax_windows(pid):
+            if not (_attribute(window, AX.kAXTitleAttribute) or "").strip():
+                found.append(window)
+    return found[0] if len(found) == 1 else None
 
 
 def _snap_frame(region, win_frame):
