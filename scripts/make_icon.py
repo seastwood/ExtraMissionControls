@@ -1,7 +1,7 @@
 """Generate the app icon and the menu-bar icon.
 
 App icon (assets/icon.icns, assets/icon_256.png): a graphite square holding
-a 2x2 grid — three grey window tiles and, in the top-left, a glowing
+a 2x2 grid — three grey window tiles and, in the top-left, a
 pink-to-violet ring: Mission Control's windows plus the control EMC adds.
 
 Menu-bar icon (assets/tray_icon.png): the same grid and ring with no
@@ -96,14 +96,10 @@ def app_icon():
         edge.putalpha(ImageChops.multiply(edge.getchannel("A"), fade))
         img.alpha_composite(edge)
 
-    # The ring: pink -> violet gradient, with a soft glow and shadow.
+    # The ring: pink -> violet gradient with a soft drop shadow.
     x1, y1, x2, y2 = _cell(0, 0)
     ring = _mask(lambda d: d.ellipse(_box((x1 + 18, y1 + 18, x2 - 18, y2 - 18)),
                                      outline=255, width=48 * S))
-    glow = Image.new("RGBA", (N, N), (210, 110, 230, 0))
-    glow.putalpha(ring.filter(ImageFilter.GaussianBlur(28 * S))
-                  .point(lambda v: min(255, int(v * 1.6))))
-    img.alpha_composite(glow)
     _shadow(img, ring, dy=10, blur=12, alpha=120)
     fill = Image.new("RGBA", (N, N), (0, 0, 0, 0))
     fill.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True), (0, 0), ring)
