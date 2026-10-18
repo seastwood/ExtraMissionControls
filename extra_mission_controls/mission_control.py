@@ -456,11 +456,10 @@ class MissionControlButtons(NSObject):
         # Idle path: a single WindowServer query; only touch the Mission
         # Control AX tree (Dock, or WindowManager on macOS 27) when Mission
         # Control actually looks active.
-        if ax.mission_control_probably_active():
-            group = ax.mission_control_group()
-            if group is not None:
-                self._activate(group)
-                return
+        group = ax.poll_mission_control()
+        if group is not None:
+            self._activate(group)
+            return
         if self._last_registry_scan == 0.0:
             self._scan_registry()  # first scan / forced post-MC rescan
 
@@ -472,9 +471,9 @@ class MissionControlButtons(NSObject):
         # liveness); parking it saves ~7 no-op Python wakeups a second.
         self._stop_detect_timer()
         self._mc_group = group  # cached; syncTick revalidates with one AX call
-        # On macOS 27 the cheap backdrop check starts unverified; trust it
-        # once it agrees with a confirmed session (keeps the idle poll free).
-        ax.note_mission_control_confirmed()
+        _geom_log("ACTIVATE %.3f host=%s backdrop=%s"
+                  % (time.time() % 1000, ax.mission_control_host(group),
+                     ax.backdrop_rule_mode()))
         # AX coordinates are relative to the primary screen's top-left.
         self._screen_height = NSScreen.screens()[0].frame().size.height
         self._screen_width = NSScreen.screens()[0].frame().size.width
@@ -521,6 +520,9 @@ class MissionControlButtons(NSObject):
         if self._active:
             self._sync_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 interval, self, "syncTick:", None, True)
+            # A little slack lets macOS coalesce wake-ups; 10% of a frame is
+            # imperceptible.
+            self._sync_timer.setTolerance_(interval * 0.1)
 
     @objc.python_method
     def _deactivate(self):
@@ -1355,6 +1357,7 @@ class MissionControlButtons(NSObject):
         if self._hover_timer is None:
             self._hover_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 _HOVER_INTERVAL, self, "hoverTick:", None, True)
+            self._hover_timer.setTolerance_(_HOVER_INTERVAL * 0.1)
 
     @objc.python_method
     def _stop_hover_polling(self):

@@ -1,6 +1,8 @@
 """Read the Dock's Mission Control AX tree and close other apps' windows
 through the Accessibility (AX) API."""
 
+import time
+
 import ApplicationServices as AX
 import Quartz
 
@@ -107,84 +109,218 @@ def _macos_major():
     return 0 if major in (10, 16) else major
 
 
-# Whether the cheap WindowServer backdrop rule (layer 18-20 windows) is known
-# to track Mission Control on this system. It was verified on macOS 26; on
-# macOS 27 (or an unknown version) it starts untrusted and the idle poll asks
-# the AX tree directly until a confirmed Mission Control session shows the
-# rule agreeing (note_mission_control_confirmed), then drops back to the
-# cheap path.
-_backdrop_trusted = 13 <= _macos_major() <= 26
+def _owner_layer_counts(raw):
+    """Counter of (owner, layer) over the Dock's/WindowManager's on-screen
+    windows in one CGWindowList result."""
+    counts = {}
+    for entry in raw:
+        owner = entry.get(Quartz.kCGWindowOwnerName)
+        if owner in _MC_WINDOW_OWNERS:
+            key = (owner, entry.get(Quartz.kCGWindowLayer, 0))
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
-def backdrop_rule_trusted():
-    return _backdrop_trusted
+def _legacy_rule(counts):
+    """The verified macOS 13-26 rule: a layer-18 backdrop window, or several
+    in layers 18-20. One resident full-screen layer-20 window exists
+    PERMANENTLY while any fullscreen space does (observed live: name='Dock',
+    1470x956, alpha 1.0, with Mission Control closed), so mere presence in
+    18-20 is NOT 'MC is up'. Mission Control itself adds more: a layer-18
+    window plus another at 20 (observed: {20} idle vs {18, 20, 20} during
+    MC)."""
+    in_band = 0
+    for (owner, layer), n in counts.items():
+        if owner == "Dock" and 18 <= layer <= 20:
+            if layer == 18:
+                return True
+            in_band += n
+    return in_band >= 2
 
 
-def note_mission_control_confirmed():
-    """Called when the AX tree confirms Mission Control is up: if the
-    WindowServer backdrop rule agrees right now, trust it from here on."""
-    global _backdrop_trusted
-    if not _backdrop_trusted:
-        layers, _ = _mc_backdrop_windows()
-        if 18 in layers or len(layers) >= 2:
-            _backdrop_trusted = True
+class _BackdropRule:
+    """Decides 'is Mission Control's backdrop up?' from ONE WindowServer
+    query, so the idle poll never has to wake the Dock or WindowManager.
+
+    macOS 13-26: the verified _legacy_rule. macOS 27 moved the overview into
+    WindowManager and its backdrop windows aren't documented, so there the
+    rule is LEARNED: while unknown, the idle poll asks the AX tree directly
+    (and records the Dock/WindowManager window counts as an idle baseline);
+    the first AX-confirmed Mission Control session diffs its window counts
+    against that baseline, and the windows that appeared become the rule.
+    The rule is checked against every later confirmed session, re-learned if
+    it misses, dropped if it fires repeatedly with no Mission Control, and
+    stored per OS build once it has held twice, so later launches start
+    cheap. A learned rule also gets a slow AX fallback check, so a rule gone
+    wrong costs at most a short delay before it is re-learned."""
+
+    FALLBACK_INTERVAL = 2.0     # learned mode: AX safety-net poll
+    MAX_FALSE_HITS = 12         # rule fired with no MC this many idle polls
+    HOLDS_TO_PERSIST = 2
+    DEFAULTS_KEY = "MissionControlBackdropRule"
+
+    def __init__(self):
+        major = _macos_major()
+        self.mode = "legacy" if 13 <= major <= 26 else "unknown"
+        self.rule = []          # [(owner, layer, min_count)] — any one fires
+        self.holds = 0
+        self.false_hits = 0
+        self.baseline = {}
+        self.sample = {}
+        self.last_fallback = 0.0
+        self.rule_fired = False
+        if self.mode == "unknown":
+            self._load()
+
+    # -- persistence ---------------------------------------------------------
+
+    @staticmethod
+    def _os_build():
+        try:
+            from Foundation import NSProcessInfo
+            return str(NSProcessInfo.processInfo().operatingSystemVersionString())
+        except Exception:
+            return ""
+
+    def _defaults(self):
+        try:
+            from Foundation import NSUserDefaults
+            return NSUserDefaults.standardUserDefaults()
+        except Exception:
+            return None
+
+    def _load(self):
+        defaults = self._defaults()
+        stored = defaults.dictionaryForKey_(self.DEFAULTS_KEY) if defaults else None
+        if not stored or stored.get("os") != self._os_build():
+            return
+        try:
+            rule = [(str(o), int(l), int(n)) for o, l, n in stored.get("rule") or []]
+        except (TypeError, ValueError):
+            return
+        if rule:
+            self.mode, self.rule, self.holds = "learned", rule, self.HOLDS_TO_PERSIST
+
+    def _save(self):
+        defaults = self._defaults()
+        if defaults is not None:
+            defaults.setObject_forKey_(
+                {"os": self._os_build(),
+                 "rule": [[o, l, n] for o, l, n in self.rule]},
+                self.DEFAULTS_KEY)
+
+    def _forget(self):
+        self.mode, self.rule, self.holds, self.false_hits = "unknown", [], 0, 0
+        defaults = self._defaults()
+        if defaults is not None:
+            defaults.removeObjectForKey_(self.DEFAULTS_KEY)
+
+    # -- evaluation ----------------------------------------------------------
+
+    def _learned_fires(self, counts):
+        return any(counts.get((o, l), 0) >= n for o, l, n in self.rule)
+
+    def present(self, counts):
+        """For the per-frame pulse while Mission Control is up. Only the
+        verified legacy rule may end a session early; otherwise report
+        present and let the AX liveness check (mission_control_alive) end it."""
+        if self.mode == "legacy":
+            return _legacy_rule(counts)
+        return True
+
+    def idle_should_check(self, counts, now):
+        """Idle poll: True when the AX tree is worth asking."""
+        self.rule_fired = False
+        self.sample = counts
+        if self.mode == "legacy":
+            return _legacy_rule(counts)
+        if self.mode == "learned":
+            if self._learned_fires(counts):
+                self.rule_fired = True
+                return True
+            if now - self.last_fallback >= self.FALLBACK_INTERVAL:
+                self.last_fallback = now
+                return True
+            return False
+        return True
+
+    def idle_check_found_nothing(self):
+        # The AX tree just confirmed Mission Control is closed: this tick's
+        # window counts are a clean idle baseline to diff a session against.
+        self.baseline = self.sample
+        if self.mode == "learned" and self.rule_fired:
+            self.false_hits += 1
+            if self.false_hits >= self.MAX_FALSE_HITS:
+                self._forget()
+
+    def confirmed(self, counts):
+        """Mission Control confirmed up by the AX tree, `counts` taken now."""
+        if self.mode == "legacy":
+            return
+        self.false_hits = 0
+        if self.mode == "learned" and self._learned_fires(counts):
+            self.holds += 1
+            if self.holds == self.HOLDS_TO_PERSIST:
+                self._save()
+            return
+        rule = [(o, l, self.baseline.get((o, l), 0) + 1)
+                for (o, l), n in counts.items()
+                if n > self.baseline.get((o, l), 0)]
+        if rule:
+            self.mode, self.rule, self.holds = "learned", rule, 1
+        else:
+            self._forget()
 
 
-def _mc_backdrop_windows():
-    """The Dock's layer 18-20 windows: (layers, min_alpha). One resident
-    full-screen layer-20 window exists PERMANENTLY while any fullscreen space
-    does (observed live: name='Dock', 1470x956, alpha 1.0, with Mission
-    Control closed), so mere presence in 18-20 is NOT 'MC is up'. Mission
-    Control itself adds more: a layer-18 window plus another at 20 (observed:
-    {20} idle vs {18, 20, 20} during MC)."""
-    raw = Quartz.CGWindowListCopyWindowInfo(
+_backdrop = _BackdropRule()
+
+
+def _window_list():
+    return Quartz.CGWindowListCopyWindowInfo(
         Quartz.kCGWindowListOptionOnScreenOnly
         | Quartz.kCGWindowListExcludeDesktopElements,
         Quartz.kCGNullWindowID) or []
-    layers = []
-    min_alpha = 1.0
-    for entry in raw:
-        if entry.get(Quartz.kCGWindowOwnerName) in _MC_WINDOW_OWNERS \
-                and 18 <= entry.get(Quartz.kCGWindowLayer, 0) <= 20:
-            layers.append(entry.get(Quartz.kCGWindowLayer, 0))
-            alpha = float(entry.get(Quartz.kCGWindowAlpha, 1.0))
-            if alpha < min_alpha:
-                min_alpha = alpha
-    return layers, min_alpha
+
+
+def backdrop_rule_mode():
+    return _backdrop.mode
 
 
 def mission_control_probably_active():
-    """Cheap idle-poll prefilter: ONE WindowServer query, no AX IPC and no
-    app wake-ups. True when the Dock's Mission Control backdrop is up — a
-    layer-18 window, or several windows in 18-20 (a LONE layer-20 window is
-    the resident fullscreen-space backdrop that exists even with MC closed).
-    Callers confirm a positive with mission_control_group() — this only
-    exists to make the idle poll free. Until the rule is trusted on this
-    macOS (see _backdrop_trusted) it answers True so the AX tree decides."""
-    if not _backdrop_trusted:
-        return True
-    layers, _ = _mc_backdrop_windows()
-    return 18 in layers or len(layers) >= 2
+    """Whether Mission Control's backdrop looks up, from ONE WindowServer
+    query (debug tracing only; the idle poll uses poll_mission_control)."""
+    return _backdrop.present(_owner_layer_counts(_window_list()))
+
+
+def poll_mission_control():
+    """The idle detection poll: the Mission Control tree root when Mission
+    Control is up, else None. Costs one WindowServer query; the Dock /
+    WindowManager are only asked when the backdrop rule says it's worth it."""
+    counts = _owner_layer_counts(_window_list())
+    if not _backdrop.idle_should_check(counts, time.time()):
+        return None
+    group = mission_control_group()
+    if group is None:
+        _backdrop.idle_check_found_nothing()
+    else:
+        _backdrop.confirmed(counts)
+    return group
 
 
 def mission_control_pulse(exclude_pid):
-    """(present, real_window_sig) from ONE WindowServer query — the sync
-    tick's per-frame heartbeat. `present` is the mission_control_probably_active
-    rule. `real_window_sig` is a rounded-bounds signature of the layer-0 app
+    """(present, real_window_sig, watch_ids) from ONE WindowServer query —
+    the sync tick's per-frame heartbeat. `present` is the backdrop rule.
+    `real_window_sig` is a rounded-bounds signature of the layer-0 app
     windows (excluding ours): macOS 26 moves the REAL windows through Mission
     Control's animations, and at a gesture COMMIT the AX tree snaps to the
     final layout while these windows visibly ease after it — so 'AX still but
     real windows moving' identifies the commit, cursor position be damned
     (the Spaces Bar only expands, and so only signals, when the cursor is in
     the top region). One list pass; no extra queries over the old check."""
-    raw = Quartz.CGWindowListCopyWindowInfo(
-        Quartz.kCGWindowListOptionOnScreenOnly
-        | Quartz.kCGWindowListExcludeDesktopElements,
-        Quartz.kCGNullWindowID) or []
-    layers = []
     sig = []
     watch_ids = []
-    for entry in raw:
+    band = {}
+    for entry in _window_list():
         layer = entry.get(Quartz.kCGWindowLayer, 0)
         if layer == 0:
             if entry.get(Quartz.kCGWindowOwnerPID) == exclude_pid:
@@ -196,13 +332,13 @@ def mission_control_pulse(exclude_pid):
                         round(bounds.get("Width", 0)),
                         round(bounds.get("Height", 0))))
             watch_ids.append(number)
-        elif entry.get(Quartz.kCGWindowOwnerName) in _MC_WINDOW_OWNERS \
-                and 18 <= layer <= 20:
-            layers.append(layer)
-            watch_ids.append(entry.get(Quartz.kCGWindowNumber, 0))
-    # Untrusted rule: report present and let the AX liveness check
-    # (mission_control_alive) end the session instead.
-    present = (18 in layers or len(layers) >= 2) or not _backdrop_trusted
+        elif 18 <= layer <= 20:
+            owner = entry.get(Quartz.kCGWindowOwnerName)
+            if owner in _MC_WINDOW_OWNERS:
+                watch_ids.append(entry.get(Quartz.kCGWindowNumber, 0))
+                band[(owner, layer)] = band.get((owner, layer), 0) + 1
+    # The legacy rule only looks at layers 18-20; other modes ignore counts.
+    present = _backdrop.present(band)
     return present, tuple(sig), tuple(watch_ids)
 
 
@@ -231,23 +367,6 @@ def windows_alive_signature(ids):
                     round(rect.origin.x), round(rect.origin.y),
                     round(rect.size.width), round(rect.size.height)))
     return tuple(sig)
-
-
-def mission_control_backdrop_state():
-    """(present, settled) for Mission Control's backdrop, from the same single
-    WindowServer query mission_control_probably_active uses.
-
-    `present`: MC's own backdrop windows exist (same rule as
-    mission_control_probably_active — a lone layer-20 window is the resident
-    fullscreen-space backdrop, not MC). `settled`: every backdrop window sits
-    at FULL alpha. The blur tracks a three-finger gesture's progress, so a
-    partial entry/exit shows alpha < 1 — the one 'fully settled' signal for
-    desktop transitions, where neither the AX tree (frozen at the settled
-    layout throughout) nor the scene probe (desktop zooms don't transform
-    overlay windows) sees anything move."""
-    layers, min_alpha = _mc_backdrop_windows()
-    present = 18 in layers or len(layers) >= 2
-    return present, min_alpha >= 0.999
 
 
 # The AX element mission_control_group() returns for a WindowManager-hosted
@@ -326,45 +445,33 @@ def mission_control_group():
     return None
 
 
+def mission_control_host(group):
+    """'WindowManager' or 'Dock' — which process hosts this tree (logging)."""
+    return "WindowManager" if group is not None and group is _wm_root else "Dock"
+
+
 def mission_control_alive(group):
     """True while `group` (from mission_control_group) still shows Mission
     Control. WindowManager's app element never dies, so for it this means
-    'still has an mc.display group'."""
+    'still has an mc.display group' — one AX call while the display element
+    seen last frame is still listed, a full scan only when it isn't."""
     if group is None:
         return False
     if group is _wm_root:
-        return _has_display(group)
+        children = _attribute(group, AX.kAXChildrenAttribute) or []
+        if _last_display is not None and _last_display in children:
+            return True
+        return any(_attribute(child, "AXIdentifier") == "mc.display"
+                   for child in children)
     return element_alive(group)
+
+
+_last_display = None  # an mc.display element from the latest snapshot
 
 
 def _displays(group):
     return [display for display in _attribute(group, AX.kAXChildrenAttribute) or []
             if _attribute(display, "AXIdentifier") == "mc.display"]
-
-
-def _window_buttons(display):
-    """Window thumbnail elements of one mc.display. macOS 26 nests them in an
-    mc.windows group; macOS 27 drops that group and puts them directly under
-    mc.display (identifier '<bundle id>.space.<n>'), beside mc.spaces."""
-    direct = []
-    for child in _attribute(display, AX.kAXChildrenAttribute) or []:
-        ident = _attribute(child, "AXIdentifier")
-        if ident == "mc.windows":
-            return list(_attribute(child, AX.kAXChildrenAttribute) or [])
-        if not (isinstance(ident, str) and ident.startswith("mc.")) \
-                and _attribute(child, AX.kAXRoleAttribute) == "AXButton":
-            direct.append(child)
-    return direct
-
-
-def _spaces_list(display):
-    for section in _attribute(display, AX.kAXChildrenAttribute) or []:
-        if _attribute(section, "AXIdentifier") != "mc.spaces":
-            continue
-        for child in _attribute(section, AX.kAXChildrenAttribute) or []:
-            if _attribute(child, "AXIdentifier") == "mc.spaces.list":
-                return _attribute(child, AX.kAXChildrenAttribute) or []
-    return []
 
 
 def _space_origin(group, position, size):
@@ -392,25 +499,53 @@ def _multi_attributes(element, names):
 
 _THUMB_ATTRS = ["AXTitle", "AXPosition", "AXSize"]
 _SPACE_ATTRS = ["AXTitle", "AXDescription", "AXPosition", "AXSize"]
+# A display's children are classified and, for macOS 27's direct thumbnail
+# buttons, read in the same single batched call.
+_CHILD_ATTRS = ["AXIdentifier", "AXRole"] + _THUMB_ATTRS
+
+
+def _string(value):
+    return value if isinstance(value, str) else None
+
+
+def _display_parts(display):
+    """One pass over an mc.display: ([(thumb element, attrs)], [space tile
+    elements]). macOS 26 nests thumbnails in an mc.windows group; macOS 27
+    puts them directly under mc.display (identifier '<bundle id>.space.<n>')
+    beside mc.spaces. One batched AX call per child either way."""
+    direct, nested, tiles = [], None, []
+    for child in _attribute(display, AX.kAXChildrenAttribute) or []:
+        vals = _multi_attributes(child, _CHILD_ATTRS)
+        ident = _string(vals["AXIdentifier"])
+        if ident == "mc.windows":
+            nested = [(button, _multi_attributes(button, _THUMB_ATTRS))
+                      for button in _attribute(child, AX.kAXChildrenAttribute) or []]
+        elif ident == "mc.spaces":
+            for part in _attribute(child, AX.kAXChildrenAttribute) or []:
+                if _attribute(part, "AXIdentifier") == "mc.spaces.list":
+                    tiles = list(_attribute(part, AX.kAXChildrenAttribute) or [])
+        elif not (ident or "").startswith("mc.") \
+                and _string(vals["AXRole"]) == "AXButton":
+            direct.append((child, vals))
+    return (nested if nested is not None else direct), tiles
 
 
 def mission_control_snapshot(group):
     """One walk of the Mission Control subtree returning
     (thumbnails, spaces, window_count) — everything a sync frame needs.
 
-    This replaces three separate walks (thumbnails, spaces, window count)
-    that each re-read the same structural nodes, and fetches each leaf's
-    attributes with one batched call instead of three or four — together
-    roughly a 4x cut in AX IPC per frame, which dominates CPU while Mission
-    Control is open (the readers run at 10 Hz)."""
+    Each element's attributes come from one batched AX call, and structure is
+    read once per frame — AX IPC dominates CPU while Mission Control is open
+    (the readers run at 10 Hz), and every call wakes the host process."""
+    global _last_display
     thumbs, spaces, window_count = [], [], 0
     if group is None:
         return thumbs, spaces, window_count
     for display in _displays(group):
-        buttons = _window_buttons(display)
+        _last_display = display
+        buttons, tiles = _display_parts(display)
         window_count += len(buttons)
-        for button in buttons:
-            vals = _multi_attributes(button, _THUMB_ATTRS)
+        for button, vals in buttons:
             position = _unpack_point(vals["AXPosition"])
             size = _unpack_size(vals["AXSize"])
             if position is None or size is None:
@@ -425,7 +560,7 @@ def mission_control_snapshot(group):
                 # AXPress focuses the window (and exits Mission Control).
                 "element": button,
             })
-        for button in _spaces_list(display):
+        for button in tiles:
             vals = _multi_attributes(button, _SPACE_ATTRS)
             position = _unpack_point(vals["AXPosition"])
             size = _unpack_size(vals["AXSize"])
@@ -470,7 +605,7 @@ def mission_control_window_count(group=None):
         group = mission_control_group()
     if group is None:
         return 0
-    return sum(len(_window_buttons(display)) for display in _displays(group))
+    return sum(len(_display_parts(display)[0]) for display in _displays(group))
 
 
 def describe_mc_tree(group, max_depth=4):

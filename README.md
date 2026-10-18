@@ -71,7 +71,10 @@ Mission Control, so the overview never breaks.
   tolerance so macOS coalesces wake-ups) that **stops entirely while the
   display is asleep**; window references refresh only on real events (launch,
   space switches, app activations) instead of polling, so no other app is ever
-  woken while you're not using Mission Control
+  woken while you're not using Mission Control. On macOS 27, where Mission Control's
+  windows changed, the app learns which windows mark Mission Control from your
+  first session or two (asking the accessibility tree directly until then),
+  remembers it per macOS build, and drops back to the one cheap query
 
 ## How it works
 
