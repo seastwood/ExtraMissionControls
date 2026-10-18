@@ -307,6 +307,13 @@ def poll_mission_control():
     return group
 
 
+# On-screen window ids from the latest pulse (the frame's one window-list
+# pass), used to drop thumbnails of windows on OTHER spaces — see
+# _current_space_only.
+_onscreen_ids = frozenset()
+_onscreen_at = 0.0
+
+
 def mission_control_pulse(exclude_pid):
     """(present, real_window_sig, watch_ids) from ONE WindowServer query —
     the sync tick's per-frame heartbeat. `present` is the backdrop rule.
@@ -337,6 +344,8 @@ def mission_control_pulse(exclude_pid):
             if owner in _MC_WINDOW_OWNERS:
                 watch_ids.append(entry.get(Quartz.kCGWindowNumber, 0))
                 band[(owner, layer)] = band.get((owner, layer), 0) + 1
+    global _onscreen_ids, _onscreen_at
+    _onscreen_ids, _onscreen_at = frozenset(watch_ids), time.time()
     # The legacy rule only looks at layers 18-20; other modes ignore counts.
     present = _backdrop.present(band)
     return present, tuple(sig), tuple(watch_ids)
@@ -501,7 +510,7 @@ _THUMB_ATTRS = ["AXTitle", "AXPosition", "AXSize"]
 _SPACE_ATTRS = ["AXTitle", "AXDescription", "AXPosition", "AXSize"]
 # A display's children are classified and, for macOS 27's direct thumbnail
 # buttons, read in the same single batched call.
-_CHILD_ATTRS = ["AXIdentifier", "AXRole"] + _THUMB_ATTRS
+_CHILD_ATTRS = ["AXIdentifier", "AXRole", "wid"] + _THUMB_ATTRS
 
 
 def _string(value):
@@ -530,6 +539,31 @@ def _display_parts(display):
     return (nested if nested is not None else direct), tiles
 
 
+def _window_id(vals):
+    try:
+        return int(vals.get("wid"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _current_space_only(buttons):
+    """macOS 27 lists the DESKTOP's thumbnails, at their desktop-overview
+    positions, even while Mission Control is showing a fullscreen space —
+    buttons drawn for them float over the wrong window. Its thumbnails carry
+    their CGWindowID ('wid'), and only the viewed space's windows are on
+    screen, so keep the thumbnails whose window is on screen. Applied only
+    when the latest window list is fresh and holds at least one thumbnail's
+    window (proof this macOS keeps real windows on screen during Mission
+    Control); otherwise nothing is filtered."""
+    if time.time() - _onscreen_at > 0.5:
+        return buttons
+    ids = [_window_id(vals) for _, vals in buttons]
+    if not any(wid in _onscreen_ids for wid in ids if wid is not None):
+        return buttons
+    return [pair for pair, wid in zip(buttons, ids)
+            if wid is None or wid in _onscreen_ids]
+
+
 def mission_control_snapshot(group):
     """One walk of the Mission Control subtree returning
     (thumbnails, spaces, window_count) — everything a sync frame needs.
@@ -544,6 +578,7 @@ def mission_control_snapshot(group):
     for display in _displays(group):
         _last_display = display
         buttons, tiles = _display_parts(display)
+        buttons = _current_space_only(buttons)
         window_count += len(buttons)
         for button, vals in buttons:
             position = _unpack_point(vals["AXPosition"])
@@ -605,7 +640,8 @@ def mission_control_window_count(group=None):
         group = mission_control_group()
     if group is None:
         return 0
-    return sum(len(_display_parts(display)[0]) for display in _displays(group))
+    return sum(len(_current_space_only(_display_parts(display)[0]))
+               for display in _displays(group))
 
 
 def describe_mc_tree(group, max_depth=4):
