@@ -42,7 +42,10 @@ Mission Control, so the overview never breaks.
     full screen)
   - **⏻ quit** (purple) — quits the whole app with ⌘Q, so it can still prompt
     to save unsaved work. Hover it for a moment (or right-click) to open a menu
-    with **Force Quit** and **Force Kill** for apps that won't go quietly
+    with **Force Quit** (⏼) and **Force Kill** (⭘) for apps that won't go
+    quietly
+  - Buttons a window can't use are hidden: no ⤢ on windows that can't go full
+    screen, no Maximize for fixed-size windows (e.g. System Settings)
 - Close, minimize, quit, and arrange are **deferred until you leave Mission
   Control**:
   the thumbnail dims with the pending symbol so you can see what's queued, and
@@ -51,10 +54,21 @@ Mission Control, so the overview never breaks.
   (blue) — click it to call off the pending action and bring the buttons back,
   so you can pick a different one or leave the window alone (for a fullscreen
   app that already dropped to the desktop, cancel keeps it open as a window)
-- **Fullscreen apps in the Spaces Bar (top section)** get a **✕** that drops
-  the app back to the desktop and closes it as you leave, plus a **❏** that
-  only exits full screen — the app becomes a normal window and Mission Control
-  stays open
+- **Fullscreen apps in the Spaces Bar (top section)** get a **✕** that closes
+  the app's window and a **❏** that exits full screen. On macOS 27 both switch
+  to the app's space, act there, and leave you on the desktop (through macOS 26
+  the window drops back into the overview and Mission Control stays open)
+- **Keyboard shortcuts**: point at a window thumbnail and press **W** to close
+  it, **M** to minimize it, or **Q** to quit its app (press the same key again
+  to take it back). macOS may ask for *Input Monitoring* permission the first
+  time; without it everything else still works
+- **Middle-click** a window thumbnail to close it
+- **Dock bubble**: in Mission Control, rest the pointer on a running app's
+  Dock icon for a menu to **Hide** it, **Close All Windows**, **Quit**, or
+  **Force Quit** — with the app's name as the caption, sitting over the
+  Dock's own name label. The icon dims with the pending action and shows a
+  **↺** to undo
+- **Open at Login** from the menu-bar dropdown
 - Split View tiles get a single **✕2** button that closes both apps of the
   split (closing just one half is not reliably possible on macOS)
 - Buttons, their flyout menus, and the tray behind each row render with

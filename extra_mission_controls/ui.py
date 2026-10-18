@@ -42,7 +42,7 @@ HOVER_TEAL = (0.16, 0.72, 0.70)
 # Glyphs whose drawing sits small inside its em-box (arrows/box/dash/power/undo/
 # split look tiny next to ✕ at the same point size) → drawn larger and heavier
 # so they stay legible in the same circle.
-_SYMBOL_GLYPHS = ("⤢", "❏", "−", "⏻", "⏼", "⭘", "↺", "◫")
+_SYMBOL_GLYPHS = ("⤢", "❏", "−", "⏻", "⏼", "⭘", "◐", "↺", "◫")
 # Per-glyph point-size overrides: ⤢ and ◫ draw especially small even at the
 # symbol size, so bump them to match the other symbols' ink (~12-13 px at 24).
 _GLYPH_POINTS = {"⤢": 28.0, "◫": 21.0}
@@ -69,9 +69,12 @@ ARRANGE_MENU_ITEMS = (
 )
 
 
-# Dock overlay (hover a running app's Dock icon in Mission Control): Quit it
-# gracefully (⌘Q — the app may ask to save) or force-quit it.
+# Dock overlay (hover a running app's Dock icon in Mission Control): hide the
+# app, close all its windows, quit it gracefully (⌘Q — the app may ask to
+# save) or force-quit it.
 DOCK_MENU_ITEMS = (
+    ("◐", "Hide", HOVER_BLUE),
+    ("✕", "Close All Windows", HOVER_RED),
     ("⏻", "Quit", HOVER_PURPLE),
     ("⏼", "Force Quit", HOVER_RED),
 )

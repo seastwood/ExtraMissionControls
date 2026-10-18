@@ -954,6 +954,25 @@ def quit_pid(pid):
     return False
 
 
+def hide_pid(pid):
+    """Hide the app (⌘H). Returns True if the request was delivered."""
+    from AppKit import NSRunningApplication
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    return bool(app.hide()) if app is not None else False
+
+
+def close_all_windows(pid):
+    """Press the close button of every window the app reports. Returns how
+    many were pressed (apps report only the current space's windows)."""
+    pressed = 0
+    for window in _ax_windows(pid):
+        button = _attribute(window, AX.kAXCloseButtonAttribute)
+        if button is not None and AX.AXUIElementPerformAction(
+                button, AX.kAXPressAction) == AX.kAXErrorSuccess:
+            pressed += 1
+    return pressed
+
+
 def force_quit_pid(pid):
     """Force-quit the app with this pid — the Force Quit dialog's behaviour
     (forceTerminate). The app is killed without a chance to prompt or save.

@@ -164,7 +164,11 @@ _MIN_BAR_TILE_HEIGHT = 50.0
 _QUIT_MENU_ACTIONS = ("quit", "forcequit", "kill")
 _ARRANGE_MENU_ACTIONS = ("snapleft", "snapright", "snapmax")
 # Dock overlay menu: graceful quit, force quit.
-_DOCK_MENU_ACTIONS = ("quit", "forcequit")
+_DOCK_MENU_ACTIONS = ("hide", "closeall", "quit", "forcequit")
+_DOCK_GLYPHS = {"hide": "◐", "closeall": "✕", "quit": "⏻", "forcequit": "⏼"}
+# Keyboard shortcuts over a thumbnail in Mission Control (ANSI key codes):
+# W close, M minimize, Q quit the app.
+_SHORTCUT_KEYS = {13: "close", 46: "minimize", 12: "quit"}
 _DOCK_REFRESH = 1.5       # re-read the Dock's icons at most this often (in MC)
 # Gap between a Dock icon's top and the bottom of its menu, chosen so the
 # menu's caption row covers the Dock's own app-name label (which floats just
@@ -341,6 +345,7 @@ class MissionControlButtons(NSObject):
         self._sync_timer = None
         self._hover_timer = None
         self._screen_height = None
+        self._screen_rects = []
         self._tap = None
         self._tap_source = None
         self._swallow_mouse_up = False
@@ -604,6 +609,14 @@ class MissionControlButtons(NSObject):
         # AX coordinates are relative to the primary screen's top-left.
         self._screen_height = NSScreen.screens()[0].frame().size.height
         self._screen_width = NSScreen.screens()[0].frame().size.width
+        # Every display's frame in AX (top-left of primary) coordinates, for
+        # multi-display checks (on-screen, zoom, settled bar).
+        self._screen_rects = []
+        for screen in NSScreen.screens():
+            f = screen.frame()
+            self._screen_rects.append((
+                f.origin.x, self._screen_height - (f.origin.y + f.size.height),
+                f.size.width, f.size.height))
         # Arm the scene gate closed and raise the invisible probe: nothing is
         # read or rendered until the probe proves the enter zoom has finished
         # and a thumbs layout earns trust (bar-commit or a confirmed hold).
@@ -1159,7 +1172,7 @@ class MissionControlButtons(NSObject):
                             None)
                 if icon is None:
                     continue
-                marks.append((icon, "⏼" if action == "forcequit" else "⏻"))
+                marks.append((icon, _DOCK_GLYPHS.get(action, "⏻")))
                 # ↺ floats centred just ABOVE the icon so it never covers the
                 # action glyph on the dimmed icon. _sync_panels sizes a button
                 # from its tile's height and offsets it by _BUTTON_INSET, so
@@ -1275,16 +1288,38 @@ class MissionControlButtons(NSObject):
         button coordinates line up with what's on screen."""
         if not spaces:
             return False
-        return (min(s["height"] for s in spaces) >= _MIN_BAR_TILE_HEIGHT
-                and min(s["y"] for s in spaces) >= 0)
+        if min(s["height"] for s in spaces) < _MIN_BAR_TILE_HEIGHT:
+            return False
+        # Each tile must sit at or below the top of the display it's on (a
+        # display arranged above the primary has negative y throughout).
+        for space in spaces:
+            screen = self._screen_for(space)
+            top = screen[1] if screen is not None else 0.0
+            if space["y"] < top:
+                return False
+        return True
+
+    @objc.python_method
+    def _screen_for(self, tile):
+        """The (x, y, w, h) AX rect of the display holding the tile's centre,
+        or None if it's off every display."""
+        cx = tile["x"] + tile["width"] / 2.0
+        cy = tile["y"] + tile["height"] / 2.0
+        for rect in getattr(self, "_screen_rects", None) or []:
+            sx, sy, sw, sh = rect
+            if sx <= cx <= sx + sw and sy <= cy <= sy + sh:
+                return rect
+        return None
 
     @objc.python_method
     def _on_screen(self, tile):
-        """True when the tile/thumbnail's center is within the display. In
-        Mission Control the window thumbnails slide with the pan, so one whose
-        center has left the screen belongs to a space you've panned away from
-        and gets no button. The Spaces Bar tiles stay put at the top, so their
+        """True when the tile/thumbnail's center is on a display. In Mission
+        Control the window thumbnails slide with the pan, so one whose center
+        has left every display belongs to a space you've panned away from and
+        gets no button. The Spaces Bar tiles stay put at the top, so their
         buttons remain even while you view a fullscreen space."""
+        if getattr(self, "_screen_rects", None):
+            return self._screen_for(tile) is not None
         w = self._screen_width or 0.0
         h = self._screen_height or 0.0
         cx = tile["x"] + tile["width"] / 2.0
@@ -1300,8 +1335,12 @@ class MissionControlButtons(NSObject):
         around three-quarters of the screen), so a thumbnail this large is an
         animation frame, not a place for a button. Suppressing it stops the
         buttons flashing on the window as it zooms in/out of full screen."""
-        w = self._screen_width or 0.0
-        h = self._screen_height or 0.0
+        screen = self._screen_for(tile) if getattr(self, "_screen_rects", None) else None
+        if screen is not None:
+            w, h = screen[2], screen[3]
+        else:
+            w = self._screen_width or 0.0
+            h = self._screen_height or 0.0
         if w <= 0.0 or h <= 0.0:
             return False
         # 0.85 in both dimensions: a real overview thumbnail caps around
@@ -1421,7 +1460,12 @@ class MissionControlButtons(NSObject):
             mouse_mask = (Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseDown)
                           | Quartz.CGEventMaskBit(Quartz.kCGEventLeftMouseUp)
                           | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseDown)
-                          | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseUp))
+                          | Quartz.CGEventMaskBit(Quartz.kCGEventRightMouseUp)
+                          # Middle-click a thumbnail to close it, and W / M / Q
+                          # over a thumbnail (only while Mission Control is up —
+                          # this tap is disabled otherwise).
+                          | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseDown)
+                          | Quartz.CGEventMaskBit(Quartz.kCGEventOtherMouseUp))
             # Also listen (never consume) for raw trackpad touch frames
             # (NSEventTypeGesture, 29): they stream at ~125Hz while fingers
             # touch the pad, so "no touch frames lately" = fingers lifted =
@@ -1452,10 +1496,49 @@ class MissionControlButtons(NSObject):
                 Quartz.CFRunLoopGetMain(), self._tap_source,
                 Quartz.kCFRunLoopCommonModes)
         Quartz.CGEventTapEnable(self._tap, enabled)
+        self._set_key_tap_enabled(enabled)
         if not enabled:
             self._swallow_mouse_up = False
             self._swallow_right_up = False
             self._close_menu()
+
+    @objc.python_method
+    def _set_key_tap_enabled(self, enabled):
+        """A SEPARATE tap for the W / M / Q shortcuts: keyboard taps can need
+        Input Monitoring permission, and if macOS refuses this one only the
+        shortcuts are lost — the button tap above is unaffected."""
+        if getattr(self, "_key_tap", None) is None:
+            if not enabled or getattr(self, "_key_tap_failed", False):
+                return
+            self._key_tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+                self._key_tap_callback, None)
+            if self._key_tap is None:
+                self._key_tap_failed = True
+                print("ExtraMissionControls: keyboard shortcuts (W/M/Q) are "
+                      "unavailable — macOS refused the keyboard event tap "
+                      "(Input Monitoring permission).")
+                return
+            source = Quartz.CFMachPortCreateRunLoopSource(None, self._key_tap, 0)
+            Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetMain(), source,
+                                      Quartz.kCFRunLoopCommonModes)
+            self._key_tap_source = source
+        Quartz.CGEventTapEnable(self._key_tap, enabled)
+
+    @objc.python_method
+    def _key_tap_callback(self, proxy, event_type, event, refcon):
+        if event_type in (Quartz.kCGEventTapDisabledByTimeout,
+                          Quartz.kCGEventTapDisabledByUserInput):
+            if self._active:
+                Quartz.CGEventTapEnable(self._key_tap, True)
+            return event
+        if event_type != Quartz.kCGEventKeyDown:
+            return event
+        location = Quartz.CGEventGetLocation(event)
+        return self._tap_key(event, location.x, location.y)
 
     @objc.python_method
     def _tap_callback(self, proxy, event_type, event, refcon):
@@ -1471,6 +1554,22 @@ class MissionControlButtons(NSObject):
             return event
         location = Quartz.CGEventGetLocation(event)
         x, y = location.x, location.y
+        if event_type == Quartz.kCGEventOtherMouseDown:
+            button = Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGMouseEventButtonNumber)
+            if button == 2 and not self._menu_open:
+                thumb = self._thumb_at(x, y)
+                if thumb is not None:
+                    self._swallow_other_up = True
+                    AppHelper.callAfter(self._shortcut_action, "close",
+                                        thumb["title"])
+                    return None
+            return event
+        if event_type == Quartz.kCGEventOtherMouseUp:
+            if getattr(self, "_swallow_other_up", False):
+                self._swallow_other_up = False
+                return None
+            return event
         if event_type == Quartz.kCGEventLeftMouseDown:
             if self._menu_open:
                 # A click while the quit menu is up: pick its row, or dismiss
@@ -1522,6 +1621,57 @@ class MissionControlButtons(NSObject):
             self._swallow_right_up = False
             return None
         return event
+
+    @objc.python_method
+    def _tap_key(self, event, x, y):
+        """W / M / Q with the pointer over a window thumbnail: close it,
+        minimize it, or quit its app — the same deferred actions as the
+        buttons (press the same key again to take it back). Any modifier, a
+        key repeat, an open menu, or no thumbnail under the pointer lets the
+        key through to Mission Control untouched."""
+        flags = Quartz.CGEventGetFlags(event)
+        modifiers = (Quartz.kCGEventFlagMaskCommand | Quartz.kCGEventFlagMaskControl
+                     | Quartz.kCGEventFlagMaskAlternate | Quartz.kCGEventFlagMaskShift)
+        if flags & modifiers or self._menu_open:
+            return event
+        if Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGKeyboardEventAutorepeat):
+            return event
+        code = Quartz.CGEventGetIntegerValueField(
+            event, Quartz.kCGKeyboardEventKeycode)
+        action = _SHORTCUT_KEYS.get(code)
+        if action is None:
+            return event
+        thumb = self._thumb_at(x, y)
+        if thumb is None:
+            return event
+        AppHelper.callAfter(self._shortcut_action, action, thumb["title"])
+        return None
+
+    @objc.python_method
+    def _thumb_at(self, x, y):
+        """The window thumbnail under the pointer that currently shows EMC's
+        buttons (so: titled, on this space, not already marked), or None."""
+        if not self._active:
+            return None
+        titles = {t[1] for t in self._targets.values()
+                  if t[0] in ("window", "cancel")}
+        for thumb in self._last_thumbs:
+            if (thumb["x"] <= x <= thumb["x"] + thumb["width"]
+                    and thumb["y"] <= y <= thumb["y"] + thumb["height"]
+                    and thumb["title"] in titles):
+                return thumb
+        return None
+
+    @objc.python_method
+    def _shortcut_action(self, action, title):
+        """Queue (or, pressed again, take back) a deferred window action."""
+        pending = self._deferred_action_for(title)
+        if pending is not None and pending[0] == action:
+            self._cancel_deferred_action(title)
+            return
+        _geom_log("CLICK shortcut %s on %r" % (action, title))
+        self._defer_window_action(action, title)
 
     @objc.python_method
     def _button_index_at(self, x, y):
@@ -1690,7 +1840,11 @@ class MissionControlButtons(NSObject):
         bx, by, bw, bh = rect
         caption = title if kind == "dock" else None
         if kind == "dock":
-            width = max(_DOCK_MENU_WIDTH, ui.caption_width(caption) + 36.0)
+            # Wide enough for the longest row label and for the caption (which
+            # must cover the Dock's own name label).
+            longest = max(ui.caption_width(label) for _, label, _ in items)
+            width = max(_DOCK_MENU_WIDTH, ui.caption_width(caption) + 36.0,
+                        42.0 + longest + 16.0)
         else:
             width = ui.MENU_WIDTH
         height = ui.menu_height(items, caption)
@@ -1823,8 +1977,9 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _queue_dock_action(self, action, item):
-        """Quit / force-quit the app when Mission Control exits (acting while
-        it is up leaves ghost thumbnails); mark its windows meanwhile."""
+        """Hide / close-all / quit / force-quit the app when Mission Control
+        exits (acting while it is up leaves ghost thumbnails); mark its
+        windows meanwhile."""
         pid = ax.pid_for_bundle(item["bundle"]) if item.get("bundle") else None
         if pid is None:
             pids = ax._pids_named(item["title"])
@@ -1834,7 +1989,7 @@ class MissionControlButtons(NSObject):
             return
         self._dock_actions = [(a, p, n) for a, p, n in self._dock_actions if p != pid]
         self._dock_actions.append((action, pid, item["title"]))
-        glyph = "⏼" if action == "forcequit" else "⏻"
+        glyph = _DOCK_GLYPHS.get(action, "⏻")
         for thumb in self._last_thumbs:
             if thumb["title"] and (thumb.get("bundle") == item.get("bundle")
                                    or ax.pid_for_title(thumb["title"]) == pid):
@@ -1851,8 +2006,14 @@ class MissionControlButtons(NSObject):
             return
         actions, self._dock_actions = self._dock_actions, []
         for action, pid, name in actions:
-            ok = (ax.force_quit_pid(pid) if action == "forcequit"
-                  else ax.quit_pid(pid))
+            if action == "forcequit":
+                ok = ax.force_quit_pid(pid)
+            elif action == "hide":
+                ok = ax.hide_pid(pid)
+            elif action == "closeall":
+                ok = ax.close_all_windows(pid) > 0
+            else:
+                ok = ax.quit_pid(pid)
             _geom_log("DOCK apply %s %r -> %s" % (action, name, ok))
 
     @objc.python_method

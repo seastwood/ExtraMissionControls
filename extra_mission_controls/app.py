@@ -31,7 +31,7 @@ from AppKit import (
 from Foundation import NSBundle, NSObject, NSTimer, NSURL, NSUserDefaults
 from PyObjCTools import AppHelper
 
-from . import __version__, ax, ui, updates
+from . import __version__, ax, login, ui, updates
 from .mission_control import MissionControlButtons
 
 UPDATE_CHECK_INTERVAL = 6 * 3600.0  # re-check GitHub every 6 hours
@@ -133,6 +133,14 @@ class AppDelegate(NSObject):
                          else NSControlStateValueOff)
         menu.addItem_(colors)
         self._colors_item = colors
+        # Start EMC automatically when you log in (a per-user LaunchAgent).
+        login_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Open at Login", "toggleOpenAtLogin:", "")
+        login_item.setTarget_(self)
+        login_item.setState_(NSControlStateValueOn if login.enabled()
+                             else NSControlStateValueOff)
+        menu.addItem_(login_item)
+        self._login_item = login_item
         # Tray-icon picker: each entry previews its symbol (the per-item icon
         # column is fine here — every row has one, so the labels align).
         icon_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -283,6 +291,11 @@ class AppDelegate(NSObject):
         # Pooled views bake the style in at creation; rebuild them so the
         # change shows the next time Mission Control opens.
         self.mission_control.rebuild_style()
+
+    def toggleOpenAtLogin_(self, sender):
+        state = login.set_enabled(not login.enabled())
+        self._login_item.setState_(NSControlStateValueOn if state
+                                   else NSControlStateValueOff)
 
     def toggleColors_(self, sender):
         ui.set_colors(not ui.colors_enabled())
