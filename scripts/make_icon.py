@@ -1,6 +1,7 @@
 """Generate the app icon and the menu-bar icon.
 
-App icon (assets/icon.icns, assets/icon_256.png): a graphite square holding
+App icon (assets/icon.icns, assets/icon_256.png): full-bleed graphite (macOS
+rounds it) holding
 a 2x2 grid — three grey window tiles and, in the top-left, a
 pink-to-violet ring: Mission Control's windows plus the control EMC adds.
 
@@ -20,9 +21,12 @@ ASSETS = os.path.join(os.path.dirname(__file__), "..", "assets")
 
 S = 4                     # supersampling factor
 N = 1024 * S              # app-icon canvas (designed on a 1024 grid)
-BODY = (100, 100, 924, 924)
-BODY_RADIUS = 64
-TILE, GAP = 300, 56
+# Full-bleed: macOS 26+ applies its own rounded-square mask to app icons;
+# artwork with its own rounded body and transparent margin gets shrunk onto
+# a grey plate instead. So the background fills the whole canvas.
+BODY = (0, 0, 1024, 1024)
+BODY_RADIUS = 0
+TILE, GAP = 350, 64
 X0 = 512 - (2 * TILE + GAP) / 2
 
 
@@ -80,7 +84,7 @@ def app_icon():
                                   ((1, 0), ((92, 92, 100), (68, 68, 75))),
                                   ((1, 1), ((176, 176, 184), (146, 146, 154)))):
         box = _cell(r, c)
-        m = _mask(lambda d, b=box: d.rounded_rectangle(_box(b), radius=44 * S,
+        m = _mask(lambda d, b=box: d.rounded_rectangle(_box(b), radius=52 * S,
                                                        fill=255))
         _shadow(img, m, dy=12, blur=16, alpha=100)
         tile = Image.new("RGBA", (N, N), (0, 0, 0, 0))
@@ -89,7 +93,7 @@ def app_icon():
         x1, y1, x2, y2 = box
         edge = Image.new("RGBA", (N, N), (0, 0, 0, 0))
         ImageDraw.Draw(edge).rounded_rectangle(
-            _box((x1 + 2, y1 + 2, x2 - 2, y2 - 2)), radius=42 * S,
+            _box((x1 + 2, y1 + 2, x2 - 2, y2 - 2)), radius=50 * S,
             outline=(255, 255, 255, 60), width=3 * S)
         fade = _mask(lambda d, y=y1, a=x1, b=x2: d.rectangle(
             _box((a, y, b, y + 70)), fill=255)).filter(ImageFilter.GaussianBlur(24 * S))
@@ -98,8 +102,8 @@ def app_icon():
 
     # The ring: pink -> violet gradient with a soft drop shadow.
     x1, y1, x2, y2 = _cell(0, 0)
-    ring = _mask(lambda d: d.ellipse(_box((x1 + 18, y1 + 18, x2 - 18, y2 - 18)),
-                                     outline=255, width=48 * S))
+    ring = _mask(lambda d: d.ellipse(_box((x1 + 21, y1 + 21, x2 - 21, y2 - 21)),
+                                     outline=255, width=56 * S))
     _shadow(img, ring, dy=10, blur=12, alpha=120)
     fill = Image.new("RGBA", (N, N), (0, 0, 0, 0))
     fill.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True), (0, 0), ring)
@@ -110,12 +114,6 @@ def app_icon():
     sheen.putalpha(ImageChops.multiply(ring, top_half))
     img.alpha_composite(sheen)
 
-    # A hairline highlight around the body edge.
-    rim = Image.new("RGBA", (N, N), (0, 0, 0, 0))
-    ImageDraw.Draw(rim).rounded_rectangle(_box((101, 101, 923, 923)),
-                                          radius=(BODY_RADIUS - 1) * S,
-                                          outline=(255, 255, 255, 34), width=3 * S)
-    img.alpha_composite(rim)
     return img.resize((1024, 1024), Image.LANCZOS)
 
 
