@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build ExtraMissionControls.app with py2app, then wrap it in a DMG.
+# Build Extra Mission Controls.app with py2app, then wrap it in a DMG.
 # Usage: ./scripts/build_dmg.sh   (run from anywhere; uses the project venv)
 set -euo pipefail
 
@@ -22,7 +22,7 @@ fi
 rm -rf build dist
 "$PYTHON" setup.py py2app
 
-APP="dist/ExtraMissionControls.app"
+APP="dist/Extra Mission Controls.app"
 
 # --- Code signing (stable identity → permissions persist across updates) ----
 # Resolve a signing identity: explicit override, else a real Developer ID if
@@ -64,10 +64,10 @@ cp assets/icon.icns "$STAGING/.VolumeIcon.icns"
 
 # The volume custom-icon flag only sticks when set on a mounted RW image,
 # so build RW, flag it, then convert to the final compressed DMG.
-DMG="dist/ExtraMissionControls-$VERSION.dmg"
+DMG="dist/Extra Mission Controls $VERSION.dmg"
 RW_DMG="dist/rw-tmp.dmg"
 rm -f "$RW_DMG"
-hdiutil create -volname "ExtraMissionControls" -srcfolder "$STAGING" \
+hdiutil create -volname "Extra Mission Controls" -srcfolder "$STAGING" \
     -ov -format UDRW "$RW_DMG"
 MOUNT_DIR="$(hdiutil attach "$RW_DMG" -nobrowse | tail -1 | awk -F'\t' '{print $NF}')"
 xattr -wx com.apple.FinderInfo \

@@ -35,7 +35,7 @@ def open_victim():
                         'tell application "TextEdit" to quit'], check=False)
         time.sleep(1.5)
         doc = "/tmp/" + VICTIM_TITLE
-        open(doc, "w").write("ExtraMissionControls test victim\n")
+        open(doc, "w").write("Extra Mission Controls test victim\n")
         subprocess.run(["open", "-e", doc], check=False)
     else:
         subprocess.run(["open", os.path.expanduser("~/Downloads")], check=False)
