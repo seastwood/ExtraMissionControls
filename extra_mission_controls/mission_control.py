@@ -45,7 +45,6 @@ from AppKit import (
     NSWindowSharingReadOnly,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
-    NSWindowCollectionBehaviorMoveToActiveSpace,
     NSWindowCollectionBehaviorIgnoresCycle,
     NSWindowCollectionBehaviorStationary,
     NSWindowStyleMaskBorderless,
@@ -201,7 +200,7 @@ _ACTION_LOG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "emc_actions.log")
 _ACTION_PREFIXES = ("UNFULLSCREEN", "CLOSE-FULLSCREEN", "APPLY-DEFERRED",
-                    "registry")
+                    "MAKE-FULLSCREEN", "PANELS", "registry")
 
 
 def _action_log(message):
@@ -294,12 +293,12 @@ def _write_diag(group, thumbs, spaces):
 # which WindowManager painted black into every Spaces Bar preview.
 _SPLIT_SCENE_PROBE = ax._macos_major() >= 27
 _CORNER_PROBE_SIZE = 4.0
-# Which spaces our panels live on. Joining ALL spaces put a copy of every
-# button into each full-screen space's Spaces Bar preview on macOS 27 (26 hid
-# them via the sharing type above); there, keep them on the active space only.
-_PANEL_SPACES = (NSWindowCollectionBehaviorMoveToActiveSpace
-                 if ax._macos_major() >= 27
-                 else NSWindowCollectionBehaviorCanJoinAllSpaces)
+# Which spaces our panels live on: ALL of them. Tried active-space-only on
+# macOS 27 (to keep button copies out of the full-screen Spaces Bar
+# previews), but then Mission Control counts every panel shown or hidden as a
+# window joining/leaving the desktop and re-lays out the whole overview on
+# each click. All-spaces panels are ignored by its layout.
+_PANEL_SPACES = NSWindowCollectionBehaviorCanJoinAllSpaces
 # macOS 27: un-fullscreen on Mission Control exit, not via AXRemoveDesktop.
 _DEFER_UNFULLSCREEN = False  # superseded by drop + revive
 _REVIVE_AFTER_DROP = False  # superseded by _DROP_VIA_SPACE
@@ -1743,7 +1742,41 @@ class MissionControlButtons(NSObject):
     @objc.python_method
     def _sync_panels(self, targets):
         trays = {}
-        for index, (kind, tile) in enumerate(targets):
+        # Keep each button on the SAME pooled panel from frame to frame.
+        # Assigning panels by list position meant that when one window's
+        # buttons went away (a click), every later button was handed a panel
+        # that had been showing a different window's button — visibly
+        # travelling across the overview into its new place.
+        # Keyed by position too (round x/y), since titles can repeat; an exact
+        # match wins, else the one same-identity panel from last frame (the
+        # tile moved).
+        keys = [(kind, tile["title"], tile.get("slot", 0),
+                 round(tile["x"]), round(tile["y"])) for kind, tile in targets]
+        previous = getattr(self, "_panel_keys", {})
+        assigned = [None] * len(targets)
+        used = set()
+        for i, key in enumerate(keys):
+            index = previous.get(key)
+            if index is not None and index not in used:
+                assigned[i] = index
+                used.add(index)
+        for i, key in enumerate(keys):
+            if assigned[i] is not None:
+                continue
+            same = [index for k, index in previous.items()
+                    if k[:3] == key[:3] and index not in used]
+            if len(same) == 1:
+                assigned[i] = same[0]
+                used.add(same[0])
+        free = 0
+        for i in range(len(targets)):
+            if assigned[i] is None:
+                while free in used:
+                    free += 1
+                assigned[i] = free
+                used.add(free)
+        self._panel_keys = {key: assigned[i] for i, key in enumerate(keys)}
+        for index, (kind, tile) in zip(assigned, targets):
             panel = self._panel_at(index)
             button = self._buttons[index]
             # Scale the ✕ down on small tiles (collapsed Spaces Bar).
@@ -1788,11 +1821,27 @@ class MissionControlButtons(NSObject):
                 _debug("panel %d (%s %r) shown at (%.0f,%.0f) size=%.0f"
                        % (index, kind, tile["title"], x, y_top, size))
             self._show_panel(panel)
-        for index in range(len(targets), len(self._panels)):
+        for index in range(len(self._panels)):
+            if index in used:
+                continue
             self._hide_panel(self._panels[index])
             self._targets.pop(index, None)
             self._rects.pop(index, None)
-        self._sync_trays(list(trays.values()))
+        if keys != getattr(self, "_logged_panel_keys", None) and keys:
+            self._logged_panel_keys = keys
+            sample = []
+            for index, key in list(zip(assigned, keys))[:6]:
+                p = self._panels[index]
+                f = p.frame()
+                sample.append("%d:%s/%s vis=%s a=%.2f fade=%s @(%.0f,%.0f %.0fx%.0f) hidden=%s"
+                              % (index, key[0], key[1][:18], bool(p.isVisible()),
+                                 p.alphaValue(), self._fade_target.get(id(p)),
+                                 f.origin.x, f.origin.y, f.size.width,
+                                 f.size.height,
+                                 bool(self._buttons[index].outerView().isHidden())))
+            _geom_log("PANELS n=%d pool=%d %s" % (len(keys), len(self._panels),
+                                                  " | ".join(sample)))
+        self._sync_trays(trays)
 
     @objc.python_method
     def _panel_at(self, index):
@@ -1900,7 +1949,39 @@ class MissionControlButtons(NSObject):
         against busy thumbnails. `boxes` are [x0, y0, x1, y1] button-row bounds
         in top-left screen coords, grown by a small pad."""
         pad = 3.0
-        for i, (x0, y0, x1, y1) in enumerate(boxes):
+        # Stable tray-per-tile assignment (keyed by the tile), for the same
+        # reason as the buttons: no tray sliding over from another window.
+        # Keyed by (title, x, y): two tiles can share a title (a full-screen
+        # app's Spaces Bar tile and a window of the same app), and a
+        # title-only key made them trade one tray back and forth every frame.
+        # An exact match wins; else a same-title tray that moved (a re-flow).
+        keys = list(boxes)
+        previous = getattr(self, "_tray_keys", {})
+        assigned, used = {}, set()
+        for key in keys:
+            i = previous.get(key)
+            if i is not None and i not in used:
+                assigned[key] = i
+                used.add(i)
+        for key in keys:
+            if key in assigned:
+                continue
+            same = [i for k, i in previous.items()
+                    if k[0] == key[0] and i not in used]
+            if len(same) == 1:
+                assigned[key] = same[0]
+                used.add(same[0])
+        free = 0
+        for key in keys:
+            if key not in assigned:
+                while free in used:
+                    free += 1
+                assigned[key] = free
+                used.add(free)
+        self._tray_keys = {key: assigned[key] for key in keys}
+        for key in keys:
+            i = assigned[key]
+            x0, y0, x1, y1 = boxes[key]
             tx, ty = x0 - pad, y0 - pad
             tw, th = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
             panel = self._tray_panel_at(i)
@@ -1912,7 +1993,9 @@ class MissionControlButtons(NSObject):
                 y = self._screen_height - ty - th  # flip to bottom-left origin
                 panel.setFrame_display_(NSMakeRect(tx, y, tw, th), True)
             self._show_panel(panel)
-        for i in range(len(boxes), len(self._tray_panels)):
+        for i in range(len(self._tray_panels)):
+            if i in used:
+                continue
             self._hide_panel(self._tray_panels[i])
             self._tray_applied.pop(i, None)
 
@@ -2182,6 +2265,8 @@ class MissionControlButtons(NSObject):
             panel.close()  # releasedWhenClosed is False; close just detaches
         self._panels = []
         self._buttons = []
+        self._panel_keys = {}
+        self._tray_keys = {}
         self._mark_panels = []
         self._tray_panels = []
         self._fade_target = {}
@@ -2582,6 +2667,28 @@ class MissionControlButtons(NSObject):
         self._fs_make_title = None
         if not title:
             return
+        # macOS 27: the thumbnail's own bundle id names the app exactly, and
+        # its focused window is the one AXPress just brought forward — no
+        # dependence on CG window titles (blank without Screen Recording).
+        pid = ax.pid_for_title(title)
+        if pid is not None:
+            window = ax.focused_window_of_pid(pid)
+            frame = ax.window_frame(window) if window is not None else None
+            _geom_log("MAKE-FULLSCREEN %r pid=%s window=%s frame=%s"
+                      % (title, pid, window is not None, frame))
+            if window is not None:
+                ax.activate_pid(pid)
+                self._fs_make_rect = ((title, frame[0], frame[1])
+                                      if frame else None)
+                self._fs_make_window = window
+                button = ax._attribute(window, "AXFullScreenButton")
+                if button is not None:
+                    ax.press_element(button)
+                else:
+                    ax.set_fullscreen(window, True)
+                self.performSelector_withObject_afterDelay_(
+                    "verifyMakeFullscreenWindow", None, 1.0)
+                return
         # Mission Control has exited and the window is un-parked. Find it and
         # raise its app frontmost.
         info = self._match_window_info(
@@ -2600,6 +2707,18 @@ class MissionControlButtons(NSObject):
             self.performSelector_withObject_afterDelay_(
                 "verifyMakeFullscreen", None, 1.0)
         else:
+            self.clickFullscreenButton()
+
+    def verifyMakeFullscreenWindow(self):
+        window, self._fs_make_window = getattr(self, "_fs_make_window", None), None
+        if window is None:
+            return
+        state = ax._attribute(window, "AXFullScreen")
+        _geom_log("MAKE-FULLSCREEN verify fullscreen=%r" % (state,))
+        if state:
+            self._fs_make_rect = None
+            return
+        if self._fs_make_rect is not None:
             self.clickFullscreenButton()
 
     def verifyMakeFullscreen(self):

@@ -670,6 +670,13 @@ def fullscreen_window_of_pid(pid):
     return None
 
 
+def focused_window_of_pid(pid):
+    app = AX.AXUIElementCreateApplication(pid)
+    AX.AXUIElementSetMessagingTimeout(app, 0.5)
+    return (_attribute(app, "AXFocusedWindow")
+            or _attribute(app, "AXMainWindow"))
+
+
 def app_name_for_pid(pid):
     from AppKit import NSRunningApplication
     app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
