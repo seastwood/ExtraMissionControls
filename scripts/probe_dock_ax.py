@@ -1,5 +1,6 @@
-"""Dev tool: trigger Mission Control and dump the Dock's AX tree while it is
-active, to discover what thumbnail elements macOS exposes. Run from the venv:
+"""Dev tool: trigger Mission Control and dump the AX trees of the processes
+that may host it — the Dock (through macOS 26) and WindowManager (macOS 27) —
+to discover what thumbnail elements macOS exposes. Run from the venv:
 
     .venv/bin/python scripts/probe_dock_ax.py
 """
@@ -13,11 +14,14 @@ import Quartz
 from AppKit import NSWorkspace
 
 
-def dock_pid():
+HOSTS = (("DOCK", "com.apple.dock"), ("WINDOWMANAGER", "com.apple.WindowManager"))
+
+
+def bundle_pid(bundle_id):
     for app in NSWorkspace.sharedWorkspace().runningApplications():
-        if app.bundleIdentifier() == "com.apple.dock":
+        if app.bundleIdentifier() == bundle_id:
             return app.processIdentifier()
-    raise SystemExit("Dock not running?")
+    return None
 
 
 def attr(element, name):
@@ -64,7 +68,7 @@ def describe(element):
     return "  ".join(parts)
 
 
-def walk(element, depth=0, max_depth=8):
+def walk(element, depth=0, max_depth=10):
     print("%s%s" % ("  " * depth, describe(element)))
     if depth >= max_depth:
         return
@@ -76,24 +80,29 @@ def walk(element, depth=0, max_depth=8):
 
 
 def dump_dock(label):
-    print("=" * 70)
-    print("DOCK AX TREE — %s" % label)
-    print("=" * 70)
-    dock = AX.AXUIElementCreateApplication(dock_pid())
-    walk(dock)
+    for name, bundle_id in HOSTS:
+        print("=" * 70)
+        print("%s AX TREE — %s" % (name, label))
+        print("=" * 70)
+        pid = bundle_pid(bundle_id)
+        if pid is None:
+            print("  (%s not running)" % bundle_id)
+            continue
+        walk(AX.AXUIElementCreateApplication(pid))
     sys.stdout.flush()
 
 
 def dock_windows(label):
     print("-" * 70)
-    print("DOCK-OWNED CG WINDOWS — %s" % label)
+    print("ALL ON-SCREEN CG WINDOWS — %s" % label)
     raw = Quartz.CGWindowListCopyWindowInfo(
         Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []
     for entry in raw:
         owner = entry.get(Quartz.kCGWindowOwnerName, "")
-        if owner in ("Dock", "WindowManager"):
-            print("  owner=%s layer=%s name=%r bounds=%s" % (
-                owner,
+        if True:
+            print("  owner=%s pid=%s layer=%s alpha=%s name=%r bounds=%s" % (
+                owner, entry.get(Quartz.kCGWindowOwnerPID),
+                entry.get(Quartz.kCGWindowAlpha),
                 entry.get(Quartz.kCGWindowLayer),
                 entry.get(Quartz.kCGWindowName, ""),
                 dict(entry.get(Quartz.kCGWindowBounds) or {})))
@@ -115,7 +124,7 @@ def main():
 
     print("\n>>> Triggering Mission Control...\n")
     subprocess.run(["open", "-b", "com.apple.exposelauncher"], check=False)
-    time.sleep(1.5)
+    time.sleep(2.5)
 
     try:
         dump_dock("MISSION CONTROL ACTIVE")

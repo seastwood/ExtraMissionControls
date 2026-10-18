@@ -17,6 +17,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from extra_mission_controls import ax  # noqa: E402
 
 VICTIM_APP = "TextEdit"
+VICTIM_BUNDLE = "com.apple.TextEdit"
+
+
+def find_victim(spaces):
+    """The victim's Spaces Bar tile. Through macOS 26 it's titled with the
+    app name; macOS 27 titles it with the WINDOW title ("Untitled"), so
+    also match by the bundle id EMC records for each thumbnail title."""
+    for s in spaces:
+        if s["title"] == VICTIM_APP:
+            return s
+    for s in spaces:
+        if ("full screen" in s.get("desc", "")
+                and ax.fullscreen_bundles.get(s["title"]) == VICTIM_BUNDLE):
+            return s
+    return None
 
 
 def our_panels(app_pid):
@@ -90,7 +105,7 @@ def main():
 
         spaces = ax.mission_control_spaces()
         print("   spaces:", [(s["title"], int(s["x"]), int(s["y"])) for s in spaces])
-        victim = next((s for s in spaces if s["title"] == VICTIM_APP), None)
+        victim = find_victim(spaces)
         if victim is None:
             raise SystemExit("FAIL: no %r space tile" % VICTIM_APP)
 
@@ -109,7 +124,7 @@ def main():
         time.sleep(1.0)
         # Spaces bar may expand/re-layout on hover; re-read positions.
         spaces = ax.mission_control_spaces()
-        victim = next((s for s in spaces if s["title"] == VICTIM_APP), victim)
+        victim = find_victim(spaces) or victim
         panels = our_panels(app.pid)
         target = min(panels, key=lambda p: (p["x"] - victim["x"]) ** 2
                                            + (p["y"] - victim["y"]) ** 2)
@@ -119,7 +134,9 @@ def main():
         post_mouse(Quartz.kCGEventLeftMouseDown, cx, cy)
         time.sleep(0.05)
         post_mouse(Quartz.kCGEventLeftMouseUp, cx, cy)
-        time.sleep(3.0)  # close + space removal animation
+        # close + space removal animation (macOS 27 also switches to the
+        # app's space first, waits for Mission Control to close, then closes)
+        time.sleep(4.0)
 
         # AX window lookups are unreliable while MC is open — dismiss first.
         press_escape()

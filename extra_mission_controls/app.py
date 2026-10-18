@@ -31,7 +31,7 @@ from AppKit import (
 from Foundation import NSBundle, NSObject, NSTimer, NSURL, NSUserDefaults
 from PyObjCTools import AppHelper
 
-from . import __version__, ax, ui, updates
+from . import __version__, ax, login, ui, updates
 from .mission_control import MissionControlButtons
 
 UPDATE_CHECK_INTERVAL = 6 * 3600.0  # re-check GitHub every 6 hours
@@ -100,16 +100,10 @@ class AppDelegate(NSObject):
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 UPDATE_CHECK_INTERVAL, self, "checkForUpdates:", None, True))
 
-        ax_ok, capture_ok = ax.ensure_permissions()
-        if not ax_ok:
+        if not ax.ensure_permissions():
             print("ExtraMissionControls: Accessibility permission missing — "
                   "nothing will work until it is granted "
                   "(System Settings → Privacy & Security → Accessibility).")
-        if not capture_ok:
-            print("ExtraMissionControls: Screen Recording permission missing — "
-                  "window-title matching is degraded, so closing apps with "
-                  "broken accessibility (e.g. Steam) may fail "
-                  "(System Settings → Privacy & Security → Screen Recording).")
 
     def _setup_status_item(self):
         self._status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
@@ -122,8 +116,8 @@ class AppDelegate(NSObject):
         info.setEnabled_(False)
         menu.addItem_(info)
         menu.addItem_(NSMenuItem.separatorItem())
-        # Liquid Glass is off by default (vibrancy is the most GPU-expensive
-        # part of the overlay); this checkbox turns it on for looks.
+        # Liquid Glass is on by default (unset = on); unchecking it switches
+        # to the lighter flat style.
         glass = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Liquid Glass", "toggleLiquidGlass:", "")
         glass.setTarget_(self)
@@ -139,6 +133,14 @@ class AppDelegate(NSObject):
                          else NSControlStateValueOff)
         menu.addItem_(colors)
         self._colors_item = colors
+        # Start EMC automatically when you log in (a per-user LaunchAgent).
+        login_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Open at Login", "toggleOpenAtLogin:", "")
+        login_item.setTarget_(self)
+        login_item.setState_(NSControlStateValueOn if login.enabled()
+                             else NSControlStateValueOff)
+        menu.addItem_(login_item)
+        self._login_item = login_item
         # Tray-icon picker: each entry previews its symbol (the per-item icon
         # column is fine here — every row has one, so the labels align).
         icon_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -290,6 +292,11 @@ class AppDelegate(NSObject):
         # change shows the next time Mission Control opens.
         self.mission_control.rebuild_style()
 
+    def toggleOpenAtLogin_(self, sender):
+        state = login.set_enabled(not login.enabled())
+        self._login_item.setState_(NSControlStateValueOn if state
+                                   else NSControlStateValueOff)
+
     def toggleColors_(self, sender):
         ui.set_colors(not ui.colors_enabled())
         self._colors_item.setState_(
@@ -301,10 +308,64 @@ class AppDelegate(NSObject):
 _delegate = None  # NSApplication.delegate is weak; keep a strong reference
 
 
+_PID_FILE = os.path.join(os.environ.get("TMPDIR", "/tmp"),
+                         "extramissioncontrols.pid")
+
+
+def _replace_running_instance():
+    """Only one EMC may run: two draw duplicate buttons and tray icons. A
+    copy left behind (a suspended Ctrl+Z, a Terminal that kept it alive) is
+    stopped here so a fresh launch always wins with the current code."""
+    import signal
+    import time
+    try:
+        with open(_PID_FILE) as fh:
+            old = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        old = 0
+    if old and old != os.getpid():
+        try:
+            # Only stop it if it really is EMC (the pid may have been reused).
+            cmd = subprocess.run(["ps", "-p", str(old), "-o", "command="],
+                                 capture_output=True, text=True).stdout
+        except OSError:
+            cmd = ""
+        if "main.py" in cmd or "ExtraMissionControls" in cmd:
+            for sig in (signal.SIGCONT, signal.SIGTERM):
+                try:
+                    os.kill(old, sig)
+                except OSError:
+                    break
+            for _ in range(20):  # up to 1s for a clean exit, then force it
+                try:
+                    os.kill(old, 0)
+                except OSError:
+                    break
+                time.sleep(0.05)
+            else:
+                try:
+                    os.kill(old, signal.SIGKILL)
+                except OSError:
+                    pass
+    try:
+        with open(_PID_FILE, "w") as fh:
+            fh.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
 def main():
     global _delegate
+    _replace_running_instance()
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     _delegate = AppDelegate.alloc().init()
     app.setDelegate_(_delegate)
+    # Ctrl+C / kill quit immediately. The Cocoa run loop never hands SIGINT
+    # to Python's default handler (KeyboardInterrupt), and PyObjC's
+    # installInterrupt didn't fire on macOS 27; a plain handler runs on the
+    # next Python callback (EMC's poll timers tick several times a second).
+    import signal
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: os._exit(0))
     AppHelper.runEventLoop()
