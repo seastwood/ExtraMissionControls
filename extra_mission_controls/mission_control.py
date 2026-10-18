@@ -163,6 +163,9 @@ _MIN_BAR_TILE_HEIGHT = 50.0
 # Arrange menu: left half / right half / maximize on the window's own screen.
 _QUIT_MENU_ACTIONS = ("quit", "forcequit", "kill")
 _ARRANGE_MENU_ACTIONS = ("snapleft", "snapright", "snapmax")
+# Dock overlay menu: graceful quit, force quit.
+_DOCK_MENU_ACTIONS = ("quit", "forcequit")
+_DOCK_REFRESH = 1.5       # re-read the Dock's icons at most this often (in MC)
 
 
 def _debug(message):
@@ -200,7 +203,7 @@ _ACTION_LOG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "emc_actions.log")
 _ACTION_PREFIXES = ("UNFULLSCREEN", "CLOSE-FULLSCREEN", "APPLY-DEFERRED",
-                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK",
+                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK", "DOCK",
                     "registry")
 
 
@@ -382,6 +385,15 @@ class MissionControlButtons(NSObject):
         self._last_thumbs = []
         self._fs_busy_until = 0.0      # one full-screen transition at a time
         self._no_max_titles = set()    # thumbnails whose window can't maximize
+        self._dock_items = []          # running apps' Dock icons (in MC)
+        self._dock_items_at = 0.0
+        self._dock_hover = None        # Dock icon under the cursor (title)
+        self._dock_hover_since = 0.0
+        self._dock_latched = None      # icon whose menu just closed: no reopen
+        self._menu_kind = None
+        self._menu_dock = None         # the Dock item the open menu acts on
+        self._dock_actions = []        # [(action, pid, name)] run on MC exit
+        self._dock_marked = {}         # window title -> Dock app name it marks
         self._revive_windows = []     # (title, held AX window) to un-fullscreen
         self._drop_watch_baseline = None
         self._drop_watch_until = 0.0
@@ -686,6 +698,11 @@ class MissionControlButtons(NSObject):
             # Control closes; apply any deferred fullscreen closes then.
             self.performSelector_withObject_afterDelay_(
                 "processDeferredCloses", None, 0.9)
+        self._dock_marked = {}
+        if self._dock_actions:
+            self.performSelector_withObject_afterDelay_(
+                "applyDockActions", None, 0.35)
+        self._dock_items_at = 0.0
         if self._revive_pids or self._revive_windows:
             self._revive_round = 0
             self.performSelector_withObject_afterDelay_(
@@ -904,17 +921,19 @@ class MissionControlButtons(NSObject):
         self._window_registry = by_pid
         self._running_names = running
         _debug("registry: fullscreen=%s windows=%d apps"
-               % (sorted(merged), len(by_pid)))
-        caps_view = sorted((ax.app_name_for_pid(p) or p, t, v)
+               % (sorted(str(k) for k in merged), len(by_pid)))
+        caps_view = sorted((str(ax.app_name_for_pid(p) or p), str(t), v)
                            for (p, t), v in ax.caps_debug.items())
         if caps_view != getattr(self, "_logged_caps", None):
             self._logged_caps = caps_view
             _geom_log("registry caps (fsbtn, enabled, subrole, resizable, "
                       "zoom_enabled)=%s" % caps_view)
-        if sorted(merged) != getattr(self, "_logged_fs", None):
-            self._logged_fs = sorted(merged)
+        fs_names = sorted(str(k) for k in merged)
+        if fs_names != getattr(self, "_logged_fs", None):
+            self._logged_fs = fs_names
             _geom_log("registry fullscreen=%s"
-                      % [(k, v[2]) for k, v in sorted(merged.items())])
+                      % [(k, v[2]) for k, v in sorted(merged.items(),
+                                                      key=lambda kv: str(kv[0]))])
 
     # -- targets ---------------------------------------------------------------
 
@@ -1136,7 +1155,8 @@ class MissionControlButtons(NSObject):
                     # the desktop as this thumbnail (cancel keeps it open, though
                     # it has already left full screen).
                     if (self._deferred_action_for(thumb["title"]) is not None
-                            or thumb["title"] in self._unfs_pending):
+                            or thumb["title"] in self._unfs_pending
+                            or thumb["title"] in self._dock_marked):
                         targets.append(("cancel",
                                         self._slot(thumb, 0, "↺", ui.HOVER_BLUE)))
                     continue
@@ -1161,6 +1181,27 @@ class MissionControlButtons(NSObject):
                 targets.append(("quit",
                                 self._slot(thumb, slot, "⏻", ui.HOVER_PURPLE)))
 
+        # Dock icons with a pending Quit / Force Quit (the Dock overlay): dim the
+        # icon with the action's glyph and float ↺ on it to take it back — the
+        # visible "this happens when you leave Mission Control".
+        if self._dock_actions:
+            for action, pid, name in self._dock_actions:
+                icon = next((d for d in self._dock_items if d["title"] == name),
+                            None)
+                if icon is None:
+                    continue
+                marks.append((icon, "⏼" if action == "forcequit" else "⏻"))
+                # ↺ floats centred just ABOVE the icon so it never covers the
+                # action glyph on the dimmed icon. _sync_panels sizes a button
+                # from its tile's height and offsets it by _BUTTON_INSET, so
+                # build the tile to land the button exactly there.
+                size = min(ui.CLOSE_BUTTON_SIZE,
+                           max(_MIN_BUTTON_SIZE, icon["height"] * 0.45))
+                badge = dict(icon)
+                badge["x"] = (icon["x"] + icon["width"] / 2.0 - size / 2.0
+                              - _BUTTON_INSET)
+                badge["y"] = icon["y"] - size - 6.0 - _BUTTON_INSET
+                targets.append(("cancel", self._slot(badge, 0, "↺", ui.HOVER_BLUE)))
         # Bar-tile buttons only exist while the bar is still AND expanded at the
         # top of the screen; collapsed tiles sit above the screen edge (negative
         # y) so there is nowhere to draw them until the user hovers the bar open.
@@ -1585,6 +1626,8 @@ class MissionControlButtons(NSObject):
                 self._buttons[hit].setHovered_(True)
             self._hover_index = hit
         self._update_quit_hover(hit)
+        if hit is None:
+            self._update_dock_hover(x, y_top)
 
     @objc.python_method
     def _update_quit_hover(self, hit):
@@ -1665,12 +1708,17 @@ class MissionControlButtons(NSObject):
                                 _ARRANGE_MENU_ACTIONS, via_hover)
 
     @objc.python_method
-    def _open_menu(self, index, kind, items, actions, via_hover=False):
-        entry = self._targets.get(index)
-        rect = self._rects.get(index)
-        if entry is None or rect is None or entry[0] != kind:
-            return
-        title = entry[1]
+    def _open_menu(self, index, kind, items, actions, via_hover=False,
+                   anchor=None, title=None):
+        if anchor is None:
+            entry = self._targets.get(index)
+            rect = self._rects.get(index)
+            if entry is None or rect is None or entry[0] != kind:
+                return
+            title = entry[1]
+        else:
+            rect = anchor  # a Dock icon (the dock overlay), not a button
+        self._menu_kind = kind
         bx, by, bw, bh = rect
         width = ui.MENU_WIDTH
         height = ui.menu_height(items)
@@ -1742,9 +1790,86 @@ class MissionControlButtons(NSObject):
         actions = self._menu_actions or ()
         action = actions[row] if 0 <= row < len(actions) else None
         title = self._menu_title
+        kind, dock_item = self._menu_kind, self._menu_dock
         self._close_menu()
+        if kind == "dock":
+            if action and dock_item is not None:
+                self._queue_dock_action(action, dock_item)
+            return
         if action and title:
             self._defer_window_action(action, title)
+
+    # -- Dock overlay ----------------------------------------------------------
+
+    @objc.python_method
+    def _update_dock_hover(self, x, y):
+        """Hovering a running app's Dock icon in Mission Control opens a small
+        Close / Force Quit menu above it after the usual dwell."""
+        now = time.time()
+        if now - self._dock_items_at > _DOCK_REFRESH:
+            self._dock_items_at = now
+            try:
+                self._dock_items = ax.dock_app_items()
+            except Exception:
+                self._dock_items = []
+        item = None
+        for candidate in self._dock_items:
+            if (candidate["x"] <= x <= candidate["x"] + candidate["width"]
+                    and candidate["y"] <= y <= candidate["y"] + candidate["height"]):
+                item = candidate
+                break
+        key = item["title"] if item is not None else None
+        if key != self._dock_latched:
+            self._dock_latched = None
+        if key is None or key == self._dock_latched:
+            self._dock_hover, self._dock_hover_since = None, 0.0
+            return
+        if key != self._dock_hover:
+            self._dock_hover, self._dock_hover_since = key, now
+            return
+        if self._dock_hover_since and now - self._dock_hover_since >= _QUIT_HOVER_DELAY:
+            self._dock_hover_since = 0.0
+            self._dock_latched = key
+            self._menu_dock = item
+            self._open_menu(None, "dock", ui.DOCK_MENU_ITEMS, _DOCK_MENU_ACTIONS,
+                            via_hover=True,
+                            anchor=(item["x"], item["y"], item["width"],
+                                    item["height"]),
+                            title=item["title"])
+
+    @objc.python_method
+    def _queue_dock_action(self, action, item):
+        """Quit / force-quit the app when Mission Control exits (acting while
+        it is up leaves ghost thumbnails); mark its windows meanwhile."""
+        pid = ax.pid_for_bundle(item["bundle"]) if item.get("bundle") else None
+        if pid is None:
+            pids = ax._pids_named(item["title"])
+            pid = pids[0] if pids else None
+        _geom_log("DOCK %s %r pid=%s" % (action, item["title"], pid))
+        if pid is None:
+            return
+        self._dock_actions = [(a, p, n) for a, p, n in self._dock_actions if p != pid]
+        self._dock_actions.append((action, pid, item["title"]))
+        glyph = "⏼" if action == "forcequit" else "⏻"
+        for thumb in self._last_thumbs:
+            if thumb["title"] and (thumb.get("bundle") == item.get("bundle")
+                                   or ax.pid_for_title(thumb["title"]) == pid):
+                self._marked[thumb["title"]] = glyph
+                self._dock_marked[thumb["title"]] = item["title"]
+        self._watch_sig = None  # show the marks on the next frame
+
+    def applyDockActions(self):
+        if not self._dock_actions:
+            return
+        if ax.mission_control_group() is not None:
+            self.performSelector_withObject_afterDelay_(
+                "applyDockActions", None, 0.4)
+            return
+        actions, self._dock_actions = self._dock_actions, []
+        for action, pid, name in actions:
+            ok = (ax.force_quit_pid(pid) if action == "forcequit"
+                  else ax.quit_pid(pid))
+            _geom_log("DOCK apply %s %r -> %s" % (action, name, ok))
 
     @objc.python_method
     def _close_menu(self):
@@ -1752,6 +1877,8 @@ class MissionControlButtons(NSObject):
             return
         self._menu_open = False
         self._menu_title = None
+        self._menu_kind = None
+        self._menu_dock = None
         self._menu_rects = {}
         self._menu_via_hover = False
         self._menu_away_since = 0.0
@@ -1797,13 +1924,18 @@ class MissionControlButtons(NSObject):
             if len(same) == 1:
                 assigned[i] = same[0]
                 used.add(same[0])
+        # A new button takes a panel that was NOT on screen last frame —
+        # repurposing one that just showed another button made it visibly
+        # slide from there to here.
+        busy = used | set(previous.values())
         free = 0
         for i in range(len(targets)):
             if assigned[i] is None:
-                while free in used:
+                while free in busy:
                     free += 1
                 assigned[i] = free
                 used.add(free)
+                busy.add(free)
         self._panel_keys = {key: assigned[i] for i, key in enumerate(keys)}
         for index, (kind, tile) in zip(assigned, targets):
             panel = self._panel_at(index)
@@ -1934,13 +2066,15 @@ class MissionControlButtons(NSObject):
                 if len(same) == 1:
                     assigned[i] = same[0]
                     used.add(same[0])
+        busy = used | set(previous.values())
         free = 0
         for i in range(len(marks)):
             if assigned[i] is None:
-                while free in used:
+                while free in busy:
                     free += 1
                 assigned[i] = free
                 used.add(free)
+                busy.add(free)
         self._mark_keys = {key: assigned[i] for i, key in enumerate(keys)}
         for index, (tile, glyph) in zip(assigned, marks):
             panel = self._mark_panel_at(index)
@@ -2029,13 +2163,15 @@ class MissionControlButtons(NSObject):
             if len(same) == 1:
                 assigned[key] = same[0]
                 used.add(same[0])
+        busy = used | set(previous.values())
         free = 0
         for key in keys:
             if key not in assigned:
-                while free in used:
+                while free in busy:
                     free += 1
                 assigned[key] = free
                 used.add(free)
+                busy.add(free)
         self._tray_keys = {key: assigned[key] for key in keys}
         for key in keys:
             i = assigned[key]
@@ -2430,7 +2566,7 @@ class MissionControlButtons(NSObject):
         self._deferred_actions.append((action, title))
         # Show a dim "marked" overlay on this thumbnail instead of its buttons.
         self._marked[title] = {"minimize": "−", "quit": "⏻",
-                               "forcequit": "☠️", "kill": "💀", "snapleft": "◧",
+                               "forcequit": "⏼", "kill": "⭘", "snapleft": "◧",
                                "snapright": "◨", "snapmax": "■"}.get(action, "✕")
         for i, (k, t, e) in list(self._targets.items()):
             if t == title:
@@ -2449,6 +2585,17 @@ class MissionControlButtons(NSObject):
         just keeps it open as an ordinary window); and a held-reference
         full-screen close still sitting fullscreen in the Spaces Bar."""
         cancelled = False
+        app = self._dock_marked.get(title, title)
+        if any(d[2] == app for d in self._dock_actions):
+            # ↺ on a Dock icon OR on one of that app's marked windows: drop the
+            # queued quit and every mark it made.
+            self._dock_actions = [d for d in self._dock_actions if d[2] != app]
+            for window_title, owner in list(self._dock_marked.items()):
+                if owner == app:
+                    self._dock_marked.pop(window_title, None)
+                    self._marked.pop(window_title, None)
+            _geom_log("DOCK cancel %r" % app)
+            return
         if title in self._deferred_unfs:
             self._deferred_unfs.remove(title)
             self._marked.pop(title, None)

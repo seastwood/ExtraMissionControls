@@ -42,7 +42,7 @@ HOVER_TEAL = (0.16, 0.72, 0.70)
 # Glyphs whose drawing sits small inside its em-box (arrows/box/dash/power/undo/
 # split look tiny next to ✕ at the same point size) → drawn larger and heavier
 # so they stay legible in the same circle.
-_SYMBOL_GLYPHS = ("⤢", "❏", "−", "⏻", "↺", "◫")
+_SYMBOL_GLYPHS = ("⤢", "❏", "−", "⏻", "⏼", "⭘", "↺", "◫")
 # Per-glyph point-size overrides: ⤢ and ◫ draw especially small even at the
 # symbol size, so bump them to match the other symbols' ink (~12-13 px at 24).
 _GLYPH_POINTS = {"⤢": 28.0, "◫": 21.0}
@@ -57,8 +57,8 @@ MENU_PAD = 6.0
 # Quit button (right-click / hover-dwell): quit, then two escalations.
 QUIT_MENU_ITEMS = (
     ("⏻", "Quit", HOVER_PURPLE),
-    ("☠️", "Force Quit", HOVER_RED),
-    ("💀", "Force Kill", HOVER_RED),
+    ("⏼", "Force Quit", HOVER_RED),
+    ("⭘", "Force Kill", HOVER_RED),
 )
 # Arrange button (◫, click): fill the left/right half of the window's screen,
 # or maximize it to the whole desktop (not macOS full screen).
@@ -66,6 +66,14 @@ ARRANGE_MENU_ITEMS = (
     ("◧", "Left Half", HOVER_TEAL),
     ("◨", "Right Half", HOVER_TEAL),
     ("■", "Maximize", HOVER_TEAL),
+)
+
+
+# Dock overlay (hover a running app's Dock icon in Mission Control): Quit it
+# gracefully (⌘Q — the app may ask to save) or force-quit it.
+DOCK_MENU_ITEMS = (
+    ("⏻", "Quit", HOVER_PURPLE),
+    ("⏼", "Force Quit", HOVER_RED),
 )
 
 
@@ -145,15 +153,17 @@ _liquid_glass = None  # cached setting; loaded from user defaults on first use
 
 
 def liquid_glass_enabled():
-    """Whether the overlays use Liquid Glass (NSGlassEffectView). Default OFF:
-    vibrancy is the most GPU-expensive thing the overlay draws, so the flat
-    style is the energy-efficient default; the menu-bar dropdown toggles it
-    (persisted in user defaults)."""
+    """Whether the overlays use Liquid Glass (NSGlassEffectView). Default ON
+    (unset counts as on); the menu-bar dropdown toggles it, persisted in user
+    defaults. The flat style is the lighter-weight option."""
     global _liquid_glass
     if _liquid_glass is None:
         from Foundation import NSUserDefaults
-        _liquid_glass = bool(
-            NSUserDefaults.standardUserDefaults().boolForKey_(_GLASS_KEY))
+        defaults = NSUserDefaults.standardUserDefaults()
+        if defaults.objectForKey_(_GLASS_KEY) is None:
+            _liquid_glass = True  # default ON when never set
+        else:
+            _liquid_glass = bool(defaults.boolForKey_(_GLASS_KEY))
     return _liquid_glass
 
 
@@ -173,18 +183,16 @@ _button_colors = None  # cached setting; loaded from user defaults on first use
 
 def colors_enabled():
     """Whether the round buttons carry their traffic-light hues (close red,
-    minimize yellow, zoom green, …). Default ON — the colours echo the macOS
-    traffic lights and make each button's job obvious; the menu-bar dropdown
-    can switch to a neutral dark disc. Applies to both the Liquid Glass and
+    minimize yellow, zoom green, …). Default OFF (monochrome) — the menu-bar
+    dropdown turns the traffic-light hues on. Applies to both the Liquid Glass and
     the flat styles (applyStyle reads this each time it runs). Unset in user
-    defaults counts as ON, so boolForKey_ (which is False when unset) is only
-    trusted once the key actually exists."""
+    defaults counts as OFF; the key is only trusted once it actually exists."""
     global _button_colors
     if _button_colors is None:
         from Foundation import NSUserDefaults
         defaults = NSUserDefaults.standardUserDefaults()
         if defaults.objectForKey_(_COLORS_KEY) is None:
-            _button_colors = True
+            _button_colors = False  # default: monochrome
         else:
             _button_colors = bool(defaults.boolForKey_(_COLORS_KEY))
     return _button_colors
@@ -443,9 +451,14 @@ class MenuView(NSView):
         for index, (glyph, label, rgb) in enumerate(self._items or ()):
             row_y = MENU_PAD + index * MENU_ROW_HEIGHT
             if index == highlight:
-                r, g, b = rgb
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    r, g, b, 0.95).set()
+                if colors_enabled():
+                    r, g, b = rgb
+                    NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                        r, g, b, 0.95).set()
+                else:
+                    # Monochrome mode: a neutral highlight, matching the
+                    # buttons' grey hover.
+                    NSColor.colorWithCalibratedWhite_alpha_(0.42, 0.85).set()
                 NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                     NSMakeRect(4.0, row_y, width - 8.0, MENU_ROW_HEIGHT),
                     5.0, 5.0).fill()

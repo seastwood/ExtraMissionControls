@@ -116,8 +116,8 @@ class AppDelegate(NSObject):
         info.setEnabled_(False)
         menu.addItem_(info)
         menu.addItem_(NSMenuItem.separatorItem())
-        # Liquid Glass is off by default (vibrancy is the most GPU-expensive
-        # part of the overlay); this checkbox turns it on for looks.
+        # Liquid Glass is on by default (unset = on); unchecking it switches
+        # to the lighter flat style.
         glass = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Liquid Glass", "toggleLiquidGlass:", "")
         glass.setTarget_(self)

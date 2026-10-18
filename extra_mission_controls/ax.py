@@ -1107,6 +1107,48 @@ def caps_for(pid, title):
     return mine[0] if len(mine) == 1 else (True, True)
 
 
+def dock_app_items():
+    """Running apps' Dock icons as dicts with title/x/y/width/height/bundle
+    (top-left coords). The Dock still hosts its icons on macOS 27 (only
+    Mission Control's tree moved to WindowManager)."""
+    pid = _dock_pid()
+    if pid is None:
+        return []
+    dock = AX.AXUIElementCreateApplication(pid)
+    AX.AXUIElementSetMessagingTimeout(dock, 0.5)
+    items = []
+    for child in _attribute(dock, AX.kAXChildrenAttribute) or []:
+        if _attribute(child, AX.kAXRoleAttribute) != "AXList":
+            continue
+        for item in _attribute(child, AX.kAXChildrenAttribute) or []:
+            vals = _multi_attributes(item, ["AXSubrole", "AXTitle", "AXPosition",
+                                            "AXSize", "AXIsApplicationRunning",
+                                            "AXURL"])
+            if vals.get("AXSubrole") != "AXApplicationDockItem":
+                continue
+            running = vals.get("AXIsApplicationRunning")
+            if not (isinstance(running, (bool, int)) and running):
+                continue
+            position = _unpack_point(vals.get("AXPosition"))
+            size = _unpack_size(vals.get("AXSize"))
+            if position is None or size is None:
+                continue
+            bundle = None
+            try:
+                from Foundation import NSBundle
+                url = vals.get("AXURL")
+                bundle_obj = NSBundle.bundleWithURL_(url) if url is not None else None
+                bundle = bundle_obj.bundleIdentifier() if bundle_obj else None
+            except Exception:
+                bundle = None
+            title = vals.get("AXTitle")
+            items.append({"title": title if isinstance(title, str) else "",
+                          "x": position[0], "y": position[1],
+                          "width": size[0], "height": size[1],
+                          "bundle": bundle})
+    return items
+
+
 def press_element(element):
     return AX.AXUIElementPerformAction(
         element, AX.kAXPressAction) == AX.kAXErrorSuccess

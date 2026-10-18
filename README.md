@@ -57,13 +57,10 @@ Mission Control, so the overview never breaks.
   stays open
 - Split View tiles get a single **✕2** button that closes both apps of the
   split (closing just one half is not reliably possible on macOS)
-- Works even on apps with **broken accessibility** (e.g. Steam): close and
-  minimize fall back to a synthetic click on the real traffic-light button,
-  and full screen uses the window's own full-screen button
 - Buttons, their flyout menus, and the tray behind each row render with
-  **Liquid Glass** on macOS 26+ (a translucent dark disc on older systems); each
-  button rests as a glassy tint of its color and fills solid in that
-  traffic-light color on hover
+  **Liquid Glass** on macOS 26+ (a translucent dark disc on older systems),
+  monochrome by default; turn on **Colors** in the menu-bar dropdown for
+  traffic-light hues
 - Buttons track Mission Control's layout live (thumbnail re-flow, Spaces Bar
   expanding/shrinking) and scale down on small tiles
 - Just a menu-bar item — no Dock icon, no windows of its own
