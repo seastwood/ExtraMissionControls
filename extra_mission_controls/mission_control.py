@@ -1195,12 +1195,13 @@ class MissionControlButtons(NSObject):
         # the bar tiles pass spaces_still mid-swipe and the buttons would flash
         # on before the new overview settles. Waiting for thumbs_still too holds
         # them back until the pan finishes (a settled overview has both still).
-        if not (spaces_still and thumbs_still and self._bar_settled(spaces)):
+        settled_spaces = self._settled_spaces(spaces)
+        if not (spaces_still and thumbs_still and settled_spaces):
             self._trace_gate("bar-gated emit W=%d sp_still=%d th_still=%d"
                              % (len(targets), spaces_still, thumbs_still),
                              window_count, spaces, thumbs)
             return targets, marks
-        for space in spaces:
+        for space in settled_spaces:
             if not self._on_screen(space):
                 continue
             if ("acted", space["title"]) in self._recently_closed:
@@ -1283,21 +1284,27 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _bar_settled(self, spaces):
-        """True only when the Spaces Bar is expanded at the top of the screen
-        (full-height tiles at non-negative y) — the one state in which our
-        button coordinates line up with what's on screen."""
-        if not spaces:
-            return False
-        if min(s["height"] for s in spaces) < _MIN_BAR_TILE_HEIGHT:
-            return False
-        # Each tile must sit at or below the top of the display it's on (a
-        # display arranged above the primary has negative y throughout).
+        """True when at least one display's Spaces Bar is expanded at the top
+        of its screen (full-height tiles at or below that display's top) —
+        the state in which button coordinates line up with what's on screen."""
+        return bool(self._settled_spaces(spaces))
+
+    @objc.python_method
+    def _settled_spaces(self, spaces):
+        """The Spaces Bar tiles on displays whose bar is settled. Each display
+        has its own bar and expands it on hover, so one display's collapsed
+        bar must not hide the buttons on another's."""
+        groups = {}
         for space in spaces:
             screen = self._screen_for(space)
+            groups.setdefault(screen, []).append(space)
+        settled = []
+        for screen, members in groups.items():
             top = screen[1] if screen is not None else 0.0
-            if space["y"] < top:
-                return False
-        return True
+            if (min(m["height"] for m in members) >= _MIN_BAR_TILE_HEIGHT
+                    and min(m["y"] for m in members) >= top):
+                settled.extend(members)
+        return settled
 
     @objc.python_method
     def _screen_for(self, tile):
@@ -1848,25 +1855,31 @@ class MissionControlButtons(NSObject):
         else:
             width = ui.MENU_WIDTH
         height = ui.menu_height(items, caption)
-        sw = self._screen_width or 0.0
-        sh = self._screen_height or 0.0
+        sh = self._screen_height or 0.0  # primary height: only for the flip
+        # Keep the menu on the display its button is on (not the primary).
+        screen = self._screen_for({"x": bx, "y": by, "width": bw, "height": bh})
+        if screen is not None:
+            dx, dy, dw, dh = screen
+        else:
+            dx, dy, dw, dh = 0.0, 0.0, self._screen_width or 0.0, sh
         if kind == "dock":
             # Centred ABOVE the Dock's own app-name label (which sits just over
             # the icon), so the name reads as the menu's caption instead of
             # being covered. The column from the menu down to the icon counts
             # as part of the menu for hover, so travelling up keeps it open.
-            mx = max(2.0, min(bx + bw / 2.0 - width / 2.0, sw - width - 2.0))
+            mx = max(dx + 2.0, min(bx + bw / 2.0 - width / 2.0,
+                                   dx + dw - width - 2.0))
             # The caption row lands exactly over the Dock's own name label.
-            my_top = max(2.0, by - _DOCK_MENU_BOTTOM_GAP - height)
+            my_top = max(dy + 2.0, by - _DOCK_MENU_BOTTOM_GAP - height)
             bridge_top = my_top + height
             rect = (mx, bridge_top, width, by + bh - bridge_top)
             bx, by, bw, bh = rect
         else:
             # Anchor the menu just under the button, kept fully on screen.
-            mx = max(2.0, min(bx, sw - width - 2.0))
+            mx = max(dx + 2.0, min(bx, dx + dw - width - 2.0))
             my_top = by + bh + 2.0
-            if my_top + height > sh:
-                my_top = max(2.0, by - height - 2.0)
+            if my_top + height > dy + dh:
+                my_top = max(dy + 2.0, by - height - 2.0)
         self._menu_rects = {
             i: (mx, my_top + ui.MENU_PAD + i * ui.MENU_ROW_HEIGHT,
                 width, ui.MENU_ROW_HEIGHT)

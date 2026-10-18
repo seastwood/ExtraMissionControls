@@ -507,7 +507,19 @@ def _space_preview_rect(group, x, y, width, height):
     screens = NSScreen.screens()
     aspect = 956.0 / 1470.0
     if screens:
-        frame = screens[0].frame()
+        # The preview has the shape of the display the tile is on (an iPad in
+        # Sidecar is shaped differently from the Mac's own screen).
+        primary_h = screens[0].frame().size.height
+        cx, cy = x + width / 2.0, y + height / 2.0
+        chosen = screens[0]
+        for screen in screens:
+            f = screen.frame()
+            top = primary_h - (f.origin.y + f.size.height)
+            if (f.origin.x <= cx <= f.origin.x + f.size.width
+                    and top <= cy <= top + f.size.height):
+                chosen = screen
+                break
+        frame = chosen.frame()
         if frame.size.width > 0:
             aspect = frame.size.height / frame.size.width
     pw = width * _PREVIEW_WIDTH_RATIO
@@ -635,6 +647,45 @@ def _split_thumb_id(ident):
         return bundle, None
 
 
+def _active_space_ids():
+    """The CURRENT space id of every display (CGSCopyManagedDisplaySpaces).
+    CGSGetActiveSpace only answers for the display with the menu-bar focus,
+    so on its own it filtered out every window on a second display (an iPad
+    in Sidecar). Falls back to {CGSGetActiveSpace()} when unavailable."""
+    global _cgs_spaces
+    ids = set()
+    try:
+        import ctypes
+        import objc
+        if _cgs_spaces is None:
+            lib = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            lib.CGSMainConnectionID.restype = ctypes.c_int
+            lib.CGSCopyManagedDisplaySpaces.argtypes = [ctypes.c_int]
+            lib.CGSCopyManagedDisplaySpaces.restype = ctypes.c_void_p
+            _cgs_spaces = lib
+        if _cgs_spaces:
+            ptr = _cgs_spaces.CGSCopyManagedDisplaySpaces(
+                _cgs_spaces.CGSMainConnectionID())
+            if ptr:
+                displays = objc.objc_object(c_void_p=ptr)
+                for display in displays:
+                    current = display.get("Current Space") or {}
+                    space_id = current.get("ManagedSpaceID") or current.get("id64")
+                    if space_id:
+                        ids.add(int(space_id))
+    except Exception:
+        _cgs_spaces = False
+    if not ids:
+        active = _active_space_id()
+        if active is not None:
+            ids.add(active)
+    return ids
+
+
+_cgs_spaces = None
+
+
 def _drop_other_space_thumbs(thumbs, spaces):
     """macOS 27 lists the windows of EVERY full-screen space among the
     current desktop's thumbnails — stacked, invisible, at one centred frame
@@ -645,14 +696,15 @@ def _drop_other_space_thumbs(thumbs, spaces):
     numbered = [t for t in thumbs if t.get("space") is not None]
     if not numbered:
         return thumbs
-    active = _active_space_id()
-    if active is not None and any(t["space"] == active for t in numbered):
+    active = _active_space_ids()
+    if active and any(t["space"] in active for t in numbered):
         _space_ids_verified = True
-        return [t for t in thumbs if t.get("space") in (None, active)]
-    if active is not None and _space_ids_verified:
-        # The active id has matched real thumbnails before, so it is the
-        # right numbering: no match now means an EMPTY desktop, whose
-        # overview lists other desktops' windows — show none of them.
+        return [t for t in thumbs if t.get("space") is None
+                or t["space"] in active]
+    if active and _space_ids_verified:
+        # The active ids have matched real thumbnails before, so they use the
+        # right numbering: no match now means EMPTY desktops, whose overview
+        # lists other desktops' windows — show none of them.
         return [t for t in thumbs if t.get("space") is None]
     fs_titles = {s["title"] for s in spaces
                  if s["desc"].startswith("exit to full screen")}
