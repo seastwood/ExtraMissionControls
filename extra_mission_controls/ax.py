@@ -490,6 +490,34 @@ def _space_origin(group, position, size):
     return position
 
 
+# macOS 26's Dock reported a Spaces Bar tile as just its preview image
+# (138x90 on a 1470x956 screen); macOS 27's WindowManager reports the whole
+# tile (168x129), padding and name label included. Buttons laid out from that
+# frame's corner covered macOS's own remove/close (X) button on the preview,
+# so convert back to the preview: same width ratio, the screen's aspect,
+# horizontally centred, offset down as measured.
+_PREVIEW_WIDTH_RATIO = 138.0 / 168.0
+_PREVIEW_TOP_SHARE = 0.44
+
+
+def _space_preview_rect(group, x, y, width, height):
+    if group is not _wm_root or width <= 0:
+        return x, y, width, height
+    from AppKit import NSScreen
+    screens = NSScreen.screens()
+    aspect = 956.0 / 1470.0
+    if screens:
+        frame = screens[0].frame()
+        if frame.size.width > 0:
+            aspect = frame.size.height / frame.size.width
+    pw = width * _PREVIEW_WIDTH_RATIO
+    ph = min(height, pw * aspect)
+    # The preview isn't flush with the tile's top: measured ~17pt down on a
+    # 129pt tile with a 90pt preview, i.e. ~44% of the leftover height (the
+    # rest is the name label below).
+    return x + (width - pw) / 2.0, y + (height - ph) * _PREVIEW_TOP_SHARE, pw, ph
+
+
 def _multi_attributes(element, names):
     """Read several attributes of one element with a SINGLE AX round-trip
     (AXUIElementCopyMultipleAttributeValues) instead of one Mach IPC per
@@ -589,6 +617,12 @@ def _active_space_id():
 _cgs = None
 
 
+# Set once CGSGetActiveSpace's id has matched a thumbnail's '.space.<n>' —
+# proof the two use the same numbering, so an empty desktop can be filtered
+# strictly.
+_space_ids_verified = False
+
+
 def _split_thumb_id(ident):
     """'com.apple.Safari.space.3' -> ('com.apple.Safari', 3); macOS 27
     WindowManager names every thumbnail this way. (None, None) otherwise."""
@@ -607,12 +641,19 @@ def _drop_other_space_thumbs(thumbs, spaces):
     (the 'ghost window'). Keep only the shown space's thumbnails: by the
     active space id when it matches any thumbnail, else by dropping spaces
     whose thumbnails are the full-screen apps named in the Spaces Bar."""
+    global _space_ids_verified
     numbered = [t for t in thumbs if t.get("space") is not None]
     if not numbered:
         return thumbs
     active = _active_space_id()
     if active is not None and any(t["space"] == active for t in numbered):
+        _space_ids_verified = True
         return [t for t in thumbs if t.get("space") in (None, active)]
+    if active is not None and _space_ids_verified:
+        # The active id has matched real thumbnails before, so it is the
+        # right numbering: no match now means an EMPTY desktop, whose
+        # overview lists other desktops' windows — show none of them.
+        return [t for t in thumbs if t.get("space") is None]
     fs_titles = {s["title"] for s in spaces
                  if s["desc"].startswith("exit to full screen")}
     by_space = {}
@@ -742,15 +783,17 @@ def mission_control_snapshot(group):
             if position is None or size is None:
                 continue
             position = _space_origin(group, position, size)
+            px, py, pw, ph = _space_preview_rect(group, position[0], position[1],
+                                                 size[0], size[1])
             title = vals["AXTitle"]
             desc = vals["AXDescription"]
             spaces.append({
                 "title": title if isinstance(title, str) else "",
                 "desc": desc if isinstance(desc, str) else "",
-                "x": position[0],
-                "y": position[1],
-                "width": size[0],
-                "height": size[1],
+                "x": px,
+                "y": py,
+                "width": pw,
+                "height": ph,
                 # AXPress on this element switches to the space.
                 "element": button,
             })

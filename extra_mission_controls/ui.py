@@ -77,9 +77,26 @@ DOCK_MENU_ITEMS = (
 )
 
 
-def menu_height(items):
-    """Total height of a flyout menu panel for the given rows."""
-    return MENU_PAD * 2 + MENU_ROW_HEIGHT * len(items)
+# Optional caption row under a menu's items (the Dock menu shows the app's
+# name there, sitting exactly over the Dock's own name label so the two read
+# as one bubble).
+MENU_CAPTION_HEIGHT = 28.0
+_CAPTION_FONT_SIZE = 13.0
+
+
+def menu_height(items, caption=None):
+    """Total height of a flyout menu panel for the given rows (+ caption)."""
+    return (MENU_PAD * 2 + MENU_ROW_HEIGHT * len(items)
+            + (MENU_CAPTION_HEIGHT if caption else 0.0))
+
+
+def caption_width(text):
+    """Width the caption text needs (to size the menu to cover the Dock's own
+    name label for long app names)."""
+    attr = NSAttributedString.alloc().initWithString_attributes_(
+        text or "", {NSFontAttributeName: NSFont.systemFontOfSize_(
+            _CAPTION_FONT_SIZE)})
+    return attr.size().width
 
 
 _glyph_image_cache = {}
@@ -422,13 +439,15 @@ class MenuView(NSView):
 
     _highlight = objc.ivar()
     _items = objc.ivar()
+    _caption = objc.ivar()
 
     def isFlipped(self):
         return True  # row 0 at the top, so row math counts downward
 
     @objc.python_method
-    def set_items(self, items):
+    def set_items(self, items, caption=None):
         self._items = list(items)
+        self._caption = caption
         self.setNeedsDisplay_(True)
 
     @objc.python_method
@@ -481,6 +500,23 @@ class MenuView(NSView):
             lsize = label_text.size()
             label_text.drawAtPoint_(NSMakePoint(
                 42.0, row_y + (MENU_ROW_HEIGHT - lsize.height) / 2.0))
+        caption = self._caption
+        if caption:
+            # Footer caption in the style of the Dock's name bubble: a hairline
+            # separator, then the name centred in white.
+            cap_y = MENU_PAD + MENU_ROW_HEIGHT * len(self._items or ())
+            NSColor.whiteColor().colorWithAlphaComponent_(0.14).set()
+            NSBezierPath.fillRect_(NSMakeRect(10.0, cap_y + 1.0, width - 20.0, 1.0))
+            cap_text = NSAttributedString.alloc().initWithString_attributes_(
+                caption, {
+                    NSForegroundColorAttributeName: NSColor.whiteColor(),
+                    NSFontAttributeName: NSFont.systemFontOfSize_(
+                        _CAPTION_FONT_SIZE),
+                })
+            csize = cap_text.size()
+            cap_text.drawAtPoint_(NSMakePoint(
+                (width - csize.width) / 2.0,
+                cap_y + 2.0 + (MENU_CAPTION_HEIGHT - 2.0 - csize.height) / 2.0))
 
 
 def make_menu(frame):

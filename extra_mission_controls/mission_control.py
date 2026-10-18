@@ -166,6 +166,12 @@ _ARRANGE_MENU_ACTIONS = ("snapleft", "snapright", "snapmax")
 # Dock overlay menu: graceful quit, force quit.
 _DOCK_MENU_ACTIONS = ("quit", "forcequit")
 _DOCK_REFRESH = 1.5       # re-read the Dock's icons at most this often (in MC)
+# Gap between a Dock icon's top and the bottom of its menu, chosen so the
+# menu's caption row covers the Dock's own app-name label (which floats just
+# above the icon) — the menu and the name read as one bubble.
+_DOCK_MENU_BOTTOM_GAP = 6.0
+# The Dock menu's two short rows need less room than the shared menu width.
+_DOCK_MENU_WIDTH = 128.0
 
 
 def _debug(message):
@@ -1682,15 +1688,31 @@ class MissionControlButtons(NSObject):
             rect = anchor  # a Dock icon (the dock overlay), not a button
         self._menu_kind = kind
         bx, by, bw, bh = rect
-        width = ui.MENU_WIDTH
-        height = ui.menu_height(items)
+        caption = title if kind == "dock" else None
+        if kind == "dock":
+            width = max(_DOCK_MENU_WIDTH, ui.caption_width(caption) + 36.0)
+        else:
+            width = ui.MENU_WIDTH
+        height = ui.menu_height(items, caption)
         sw = self._screen_width or 0.0
         sh = self._screen_height or 0.0
-        # Anchor the menu just under the button, kept fully on screen.
-        mx = max(2.0, min(bx, sw - width - 2.0))
-        my_top = by + bh + 2.0
-        if my_top + height > sh:
-            my_top = max(2.0, by - height - 2.0)
+        if kind == "dock":
+            # Centred ABOVE the Dock's own app-name label (which sits just over
+            # the icon), so the name reads as the menu's caption instead of
+            # being covered. The column from the menu down to the icon counts
+            # as part of the menu for hover, so travelling up keeps it open.
+            mx = max(2.0, min(bx + bw / 2.0 - width / 2.0, sw - width - 2.0))
+            # The caption row lands exactly over the Dock's own name label.
+            my_top = max(2.0, by - _DOCK_MENU_BOTTOM_GAP - height)
+            bridge_top = my_top + height
+            rect = (mx, bridge_top, width, by + bh - bridge_top)
+            bx, by, bw, bh = rect
+        else:
+            # Anchor the menu just under the button, kept fully on screen.
+            mx = max(2.0, min(bx, sw - width - 2.0))
+            my_top = by + bh + 2.0
+            if my_top + height > sh:
+                my_top = max(2.0, by - height - 2.0)
         self._menu_rects = {
             i: (mx, my_top + ui.MENU_PAD + i * ui.MENU_ROW_HEIGHT,
                 width, ui.MENU_ROW_HEIGHT)
@@ -1703,7 +1725,7 @@ class MissionControlButtons(NSObject):
         self._menu_via_hover = via_hover
         self._menu_away_since = 0.0
         panel = self._menu_panel_ensure()
-        self._menu_view.set_items(items)
+        self._menu_view.set_items(items, caption)
         self._menu_view.set_highlight(-1)
         y = sh - my_top - height  # flip to bottom-left origin
         panel.setFrame_display_(NSMakeRect(mx, y, width, height), True)
