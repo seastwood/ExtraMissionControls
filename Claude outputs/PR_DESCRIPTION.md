@@ -18,7 +18,7 @@ macOS 27 moved Mission Control's accessibility tree from the Dock into WindowMan
 - **Keyboard shortcuts:** W / M / Q over a thumbnail to close / minimize / quit. These run on a separate event tap.
 - **Middle-click** a thumbnail to close it.
 - **Open at Login** (per-user LaunchAgent).
-- **Multi-display** aware on-screen, zoom and Spaces Bar checks.
+- **Multi-display:** current-space filtering, on-screen/zoom checks, Spaces Bar gating, preview placement and menus all work per display (tested with an iPad as an extended display).
 - **Power-symbol glyphs** (⏻ ⏼ ⭘).
 - **Defaults:** monochrome + Liquid Glass.
 
@@ -29,4 +29,4 @@ macOS 27 moved Mission Control's accessibility tree from the Dock into WindowMan
 - **Removed:** dead code from superseded approaches.
 
 ## Testing
-Tested by hand on macOS 27 throughout (single display). Not yet exercised: multiple displays, and the built `.app` (login item, permissions).
+Tested by hand on macOS 27 throughout, including an iPad as an extended display. Not yet exercised: the built `.app` (login item, permissions).
