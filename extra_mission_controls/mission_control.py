@@ -277,6 +277,8 @@ _CORNER_PROBE_SIZE = 4.0
 _PANEL_SPACES = (NSWindowCollectionBehaviorMoveToActiveSpace
                  if ax._macos_major() >= 27
                  else NSWindowCollectionBehaviorCanJoinAllSpaces)
+# macOS 27: un-fullscreen on Mission Control exit, not via AXRemoveDesktop.
+_DEFER_UNFULLSCREEN = ax._macos_major() >= 27
 _PANEL_SHARING = (NSWindowSharingReadOnly if ax._macos_major() >= 27
                   else NSWindowSharingNone)
 
@@ -345,6 +347,8 @@ class MissionControlButtons(NSObject):
         # App names whose (just un-fullscreened) main window is closed on MC
         # exit, by name with retries while the window un-parks.
         self._deferred_app_closes = []
+        # macOS 27: full-screen tiles to un-fullscreen once MC closes.
+        self._deferred_unfs = []
         self._app_close_attempts = 0
         # To scrim the desktop thumbnail a closed full-screen app reappears as
         # (its title is unpredictable): the thumbnail titles present when the ✕
@@ -640,6 +644,10 @@ class MissionControlButtons(NSObject):
             # Control closes; apply any deferred fullscreen closes then.
             self.performSelector_withObject_afterDelay_(
                 "processDeferredCloses", None, 0.9)
+        if self._deferred_unfs:
+            self._unfs_attempts = 0
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredUnfullscreen", None, 0.5)
         if self._deferred_app_closes:
             # Un-fullscreened apps: close their main window by name once MC is
             # gone and the window has un-parked (applyDeferredAppCloses retries).
@@ -1096,7 +1104,8 @@ class MissionControlButtons(NSObject):
                 # A held-reference full-screen close still sits in the Spaces
                 # Bar (it never left full screen), so it is fully reversible —
                 # give it the same cancel (↺) button.
-                if space["title"] in self._deferred_close:
+                if (space["title"] in self._deferred_close
+                        or space["title"] in self._deferred_unfs):
                     targets.append(("cancel",
                                     self._slot(space, 0, "↺", ui.HOVER_BLUE)))
                 continue
@@ -2224,6 +2233,10 @@ class MissionControlButtons(NSObject):
         just keeps it open as an ordinary window); and a held-reference
         full-screen close still sitting fullscreen in the Spaces Bar."""
         cancelled = False
+        if title in self._deferred_unfs:
+            self._deferred_unfs.remove(title)
+            self._marked.pop(title, None)
+            cancelled = True
         # Window actions queued via _defer_window_action.
         kept = []
         for action, t in self._deferred_actions:
@@ -2563,6 +2576,16 @@ class MissionControlButtons(NSObject):
             return
         self._panels[index].orderOut_(None)
         self._rects.pop(index, None)
+        if _DEFER_UNFULLSCREEN:
+            # macOS 27: AXRemoveDesktop while Mission Control is open brings
+            # the window back permanently INVISIBLE (black, until the app is
+            # relaunched). Mark the tile and let the app leave full screen
+            # itself — AXFullScreen=False — once Mission Control has closed.
+            if title not in self._deferred_unfs:
+                self._deferred_unfs.append(title)
+            self._marked[title] = "❏"
+            _geom_log("UNFULLSCREEN tile=%r deferred to MC exit" % title)
+            return
         if ax.remove_space(element):
             _geom_log("UNFULLSCREEN tile=%r" % title)
             self._recently_closed[("acted", title)] = time.time() + 2.5
@@ -2809,6 +2832,40 @@ class MissionControlButtons(NSObject):
             None, kind, Quartz.CGPointMake(x, y), Quartz.kCGMouseButtonLeft)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         time.sleep(0.06)
+
+    def applyDeferredUnfullscreen(self):
+        """Take each marked full-screen app out of full screen now that
+        Mission Control is gone, via the window's own AXFullScreen (the
+        app's normal exit animation). Retries briefly while the app's AX
+        windows reappear after Mission Control."""
+        if not self._deferred_unfs:
+            return
+        if ax.mission_control_group() is not None:
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredUnfullscreen", None, 0.4)
+            return
+        pending = []
+        for title in self._deferred_unfs:
+            window = ax.find_fullscreen_target(title)
+            if window is None:
+                entry = self._fullscreen_registry.get(title)
+                if entry is not None and ax.element_alive(entry[0]):
+                    window = entry[0]
+            if window is not None and ax.set_fullscreen(window, False):
+                _geom_log("UNFULLSCREEN %r applied" % title)
+                self._fullscreen_registry.pop(title, None)
+            else:
+                pending.append(title)
+        self._unfs_attempts = getattr(self, "_unfs_attempts", 0) + 1
+        if pending and self._unfs_attempts < 8:
+            self._deferred_unfs = pending
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredUnfullscreen", None, 0.3)
+            return
+        for title in pending:
+            print("ExtraMissionControls: could not exit full screen for %r"
+                  % title)
+        self._deferred_unfs = []
 
     def processDeferredCloses(self):
         # One title at a time so the verify/escalate steps below can use single
