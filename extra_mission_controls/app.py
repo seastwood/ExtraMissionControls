@@ -41,6 +41,7 @@ _ICON_KEY = "EMCTrayIcon"
 # present on macOS 26 — unresolvable names are skipped when building the
 # picker, and _apply_tray_icon falls back to the default.
 TRAY_ICONS = (
+    ("emc", "EMC"),  # our own icon (assets/tray_icon.png); the rest are SF Symbols
     ("rectangle.grid.2x2", "Grid"),
     ("rectangle.3.group", "Overview"),
     ("rectangle.on.rectangle", "Overlapping"),
@@ -56,6 +57,22 @@ def _current_icon_name():
     if name in tuple(symbol for symbol, _ in TRAY_ICONS):
         return name
     return TRAY_ICONS[0][0]
+
+
+def _tray_image(name, label="ExtraMissionControls"):
+    """The NSImage for a tray-icon choice: EMC's own template image, or an
+    SF Symbol by name. None if unavailable."""
+    if name == "emc":
+        base = os.environ.get("RESOURCEPATH") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+        image = NSImage.alloc().initWithContentsOfFile_(
+            os.path.join(base, "tray_icon.png"))
+        if image is not None:
+            image.setSize_((18, 18))
+            image.setTemplate_(True)  # macOS tints it for light/dark menu bars
+            image.setAccessibilityDescription_(label)
+        return image
+    return NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, label)
 
 
 def _symbol_item(target, title, action, key, symbol_name):
@@ -148,8 +165,7 @@ class AppDelegate(NSObject):
         icon_menu = NSMenu.alloc().init()
         current = _current_icon_name()
         for symbol_name, label in TRAY_ICONS:
-            preview = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                symbol_name, label)
+            preview = _tray_image(symbol_name, label)
             if preview is None:
                 continue
             entry = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -179,11 +195,9 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _apply_tray_icon(self):
         button = self._status_item.button()
-        symbol = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            _current_icon_name(), "ExtraMissionControls")
+        symbol = _tray_image(_current_icon_name())
         if symbol is None:
-            symbol = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                TRAY_ICONS[0][0], "ExtraMissionControls")
+            symbol = _tray_image("rectangle.grid.2x2")
         if symbol is not None:
             button.setImage_(symbol)
         else:

@@ -9,6 +9,7 @@ APP = ["main.py"]
 OPTIONS = {
     "packages": ["extra_mission_controls"],
     "iconfile": "assets/icon.icns",
+    "resources": ["assets/tray_icon.png"],  # the menu-bar icon
     "plist": {
         "CFBundleName": "ExtraMissionControls",
         "CFBundleDisplayName": "ExtraMissionControls",
