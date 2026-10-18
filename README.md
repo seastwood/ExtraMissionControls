@@ -75,13 +75,18 @@ Mission Control, so the overview never breaks.
 
 ## How it works
 
-Mission Control is rendered by the system `Dock` process and cannot be
-modified directly, but the Dock publishes the thumbnail layout through the
-Accessibility API (an `AXGroup` with identifier `mc` appears in its AX tree
-while Mission Control is active, with one `AXButton` per thumbnail exposing
-title/position/size). This app:
+Mission Control is rendered by the system and cannot be modified directly,
+but its thumbnail layout is published through the Accessibility API, with one
+`AXButton` per thumbnail exposing title/position/size. Through macOS 26 it is
+the `Dock` process that publishes it (an `AXGroup` with identifier `mc` appears
+in its AX tree while Mission Control is active, holding `mc.display` →
+`mc.windows`). macOS 27 moved it to the `WindowManager` process: its
+application element holds the `mc.display` groups directly, the thumbnails
+sit straight under `mc.display` (no `mc.windows`), and Spaces Bar tiles report
+their center as their position. The Dock keeps only an empty `mc` stub. The app
+reads whichever host has the populated tree. This app:
 
-1. polls the Dock's AX tree to detect Mission Control opening, then re-syncs
+1. polls that AX tree to detect Mission Control opening, then re-syncs
    button positions at 10 Hz so they track thumbnails re-flowing and the
    Spaces Bar expanding/shrinking (✕ buttons scale down on small tiles),
 2. floats a tiny always-on-top ✕ panel over each window thumbnail and each
@@ -116,7 +121,7 @@ button.
 
 ## Install
 
-Requires macOS 13 or later (developed and tested on macOS 26).
+Requires macOS 13 or later (developed and tested on macOS 26; updated for macOS 27).
 
 ### 1. Download
 
@@ -258,20 +263,23 @@ Env hooks: `EMC_DEBUG=1` (log close paths), `EMC_NO_REGISTRY=1` /
 | `extra_mission_controls/app.py` | Menu-bar shell, permission prompts |
 | `extra_mission_controls/mission_control.py` | ✕ buttons over Mission Control (AX polling + event tap + close chains) |
 | `extra_mission_controls/windows.py` | Window enumeration (CG window list) |
-| `extra_mission_controls/ax.py` | Dock AX tree reading; window close primitives |
+| `extra_mission_controls/ax.py` | Mission Control AX tree reading (Dock / WindowManager); window close primitives |
 | `extra_mission_controls/ui.py` | Shared button, flyout-menu, and Liquid Glass styling |
 | `scripts/make_icon.py` | Generates the app/volume icon |
 | `scripts/setup_signing.sh` | Creates the stable self-signed signing identity |
-| `scripts/probe_dock_ax.py` | Dev tool: dump the Dock's AX tree with Mission Control open |
+| `scripts/probe_dock_ax.py` | Dev tool: dump the Dock's and WindowManager's AX trees with Mission Control open |
 | `scripts/test_mc_e2e.py` | E2E test: window thumbnails |
 | `scripts/test_mc_fullscreen_e2e.py` | E2E test: Spaces Bar fullscreen tiles |
 | `setup.py`, `scripts/build_dmg.sh` | py2app + DMG packaging |
 
 ## Known limitations
 
-- The Dock's Mission Control AX layout (`mc` / `mc.display` / `mc.windows`
-  identifiers) is undocumented and can change between macOS releases — this is
-  the fragile part of the technique, verified working on macOS 26.
+- Mission Control's AX layout (`mc` / `mc.display` / `mc.windows`
+  identifiers, and which process hosts it) is undocumented and changes between
+  macOS releases. This is the fragile part of the technique. It was verified on
+  macOS 26, and macOS 27 moved it from the Dock to WindowManager. If buttons stop
+  appearing after an update, run `scripts/probe_dock_ax.py` and compare its dump
+  with the layout described above.
 - Windows are matched to thumbnails by title; two windows with identical
   titles in the same app may close the wrong twin.
 - Buttons appear on the current display only (multi-monitor support TODO).

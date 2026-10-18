@@ -58,19 +58,76 @@ def _unpack_size(ax_value):
         return None
 
 
-_dock_pid_cache = None
+_pid_cache = {}
+
+
+def _bundle_pid(bundle_id):
+    """PID of a running system process by bundle id (cached; re-resolved by
+    _forget_pid when its AX element stops answering, e.g. after a respawn)."""
+    pid = _pid_cache.get(bundle_id)
+    if pid is not None:
+        return pid
+    from AppKit import NSWorkspace
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        if app.bundleIdentifier() == bundle_id:
+            _pid_cache[bundle_id] = app.processIdentifier()
+            return _pid_cache[bundle_id]
+    return None
+
+
+def _forget_pid(bundle_id):
+    _pid_cache.pop(bundle_id, None)
 
 
 def _dock_pid():
-    global _dock_pid_cache
-    if _dock_pid_cache is not None:
-        return _dock_pid_cache
-    from AppKit import NSWorkspace
-    for app in NSWorkspace.sharedWorkspace().runningApplications():
-        if app.bundleIdentifier() == "com.apple.dock":
-            _dock_pid_cache = app.processIdentifier()
-            return _dock_pid_cache
-    return None
+    return _bundle_pid(_DOCK)
+
+
+_DOCK = "com.apple.dock"
+# macOS 27 moved Mission Control's AX tree (and its overview windows) out of
+# the Dock into WindowManager. The Dock keeps an EMPTY 'mc' stub group there.
+_WINDOW_MANAGER = "com.apple.WindowManager"
+_MC_WINDOW_OWNERS = ("Dock", "WindowManager")
+
+
+def _macos_major():
+    """Major macOS version, or 0 when it can't be told (a binary linked
+    against an old SDK is shown the 10.16/16.0 compatibility version)."""
+    import platform
+    try:
+        major = int(platform.mac_ver()[0].split(".")[0])
+    except (ValueError, IndexError):
+        major = 0
+    try:
+        from Foundation import NSProcessInfo
+        major = max(major, int(
+            NSProcessInfo.processInfo().operatingSystemVersion().majorVersion))
+    except Exception:
+        pass
+    return 0 if major in (10, 16) else major
+
+
+# Whether the cheap WindowServer backdrop rule (layer 18-20 windows) is known
+# to track Mission Control on this system. It was verified on macOS 26; on
+# macOS 27 (or an unknown version) it starts untrusted and the idle poll asks
+# the AX tree directly until a confirmed Mission Control session shows the
+# rule agreeing (note_mission_control_confirmed), then drops back to the
+# cheap path.
+_backdrop_trusted = 13 <= _macos_major() <= 26
+
+
+def backdrop_rule_trusted():
+    return _backdrop_trusted
+
+
+def note_mission_control_confirmed():
+    """Called when the AX tree confirms Mission Control is up: if the
+    WindowServer backdrop rule agrees right now, trust it from here on."""
+    global _backdrop_trusted
+    if not _backdrop_trusted:
+        layers, _ = _mc_backdrop_windows()
+        if 18 in layers or len(layers) >= 2:
+            _backdrop_trusted = True
 
 
 def _mc_backdrop_windows():
@@ -87,7 +144,7 @@ def _mc_backdrop_windows():
     layers = []
     min_alpha = 1.0
     for entry in raw:
-        if entry.get(Quartz.kCGWindowOwnerName) == "Dock" \
+        if entry.get(Quartz.kCGWindowOwnerName) in _MC_WINDOW_OWNERS \
                 and 18 <= entry.get(Quartz.kCGWindowLayer, 0) <= 20:
             layers.append(entry.get(Quartz.kCGWindowLayer, 0))
             alpha = float(entry.get(Quartz.kCGWindowAlpha, 1.0))
@@ -102,7 +159,10 @@ def mission_control_probably_active():
     layer-18 window, or several windows in 18-20 (a LONE layer-20 window is
     the resident fullscreen-space backdrop that exists even with MC closed).
     Callers confirm a positive with mission_control_group() — this only
-    exists to make the idle poll free."""
+    exists to make the idle poll free. Until the rule is trusted on this
+    macOS (see _backdrop_trusted) it answers True so the AX tree decides."""
+    if not _backdrop_trusted:
+        return True
     layers, _ = _mc_backdrop_windows()
     return 18 in layers or len(layers) >= 2
 
@@ -136,11 +196,13 @@ def mission_control_pulse(exclude_pid):
                         round(bounds.get("Width", 0)),
                         round(bounds.get("Height", 0))))
             watch_ids.append(number)
-        elif entry.get(Quartz.kCGWindowOwnerName) == "Dock" \
+        elif entry.get(Quartz.kCGWindowOwnerName) in _MC_WINDOW_OWNERS \
                 and 18 <= layer <= 20:
             layers.append(layer)
             watch_ids.append(entry.get(Quartz.kCGWindowNumber, 0))
-    present = 18 in layers or len(layers) >= 2
+    # Untrusted rule: report present and let the AX liveness check
+    # (mission_control_alive) end the session instead.
+    present = (18 in layers or len(layers) >= 2) or not _backdrop_trusted
     return present, tuple(sig), tuple(watch_ids)
 
 
@@ -188,16 +250,129 @@ def mission_control_backdrop_state():
     return present, min_alpha >= 0.999
 
 
-def mission_control_group():
-    """The Dock's 'mc' AX group — present only while Mission Control is up."""
+# The AX element mission_control_group() returns for a WindowManager-hosted
+# tree (macOS 27): WindowManager's application element itself, whose children
+# are the mc.display groups. Kept so mission_control_alive can tell it apart
+# from the Dock's 'mc' group (the app element outlives Mission Control).
+_wm_root = None
+
+
+def _has_display(root):
+    return any(_attribute(child, "AXIdentifier") == "mc.display"
+               for child in _attribute(root, AX.kAXChildrenAttribute) or [])
+
+
+def _dock_mc_group():
     pid = _dock_pid()
     if pid is None:
         return None
     dock = AX.AXUIElementCreateApplication(pid)
-    for child in _attribute(dock, AX.kAXChildrenAttribute) or []:
+    AX.AXUIElementSetMessagingTimeout(dock, 0.5)
+    children = _attribute(dock, AX.kAXChildrenAttribute)
+    if children is None:
+        _forget_pid(_DOCK)
+        return None
+    for child in children:
         if _attribute(child, "AXIdentifier") == "mc":
-            return child
+            # macOS 27 leaves an empty 'mc' stub here; only a populated
+            # group is the real tree.
+            if _attribute(child, AX.kAXChildrenAttribute):
+                return child
+            return None
     return None
+
+
+def _window_manager_root():
+    global _wm_root
+    pid = _bundle_pid(_WINDOW_MANAGER)
+    if pid is None:
+        return None
+    if _wm_root is None or _wm_root_pid != pid:
+        _set_wm_root(pid)
+    if _attribute(_wm_root, AX.kAXChildrenAttribute) is None:
+        _forget_pid(_WINDOW_MANAGER)
+        return None
+    return _wm_root if _has_display(_wm_root) else None
+
+
+_wm_root_pid = None
+
+
+def _set_wm_root(pid):
+    global _wm_root, _wm_root_pid
+    _wm_root = AX.AXUIElementCreateApplication(pid)
+    AX.AXUIElementSetMessagingTimeout(_wm_root, 0.5)
+    _wm_root_pid = pid
+
+
+_prefer_window_manager = _macos_major() >= 27
+
+
+def mission_control_group():
+    """The element whose children are Mission Control's mc.display groups —
+    present only while Mission Control is up. Through macOS 26 that is the
+    Dock's 'mc' group; on macOS 27 the tree lives in WindowManager, whose
+    application element holds the mc.display groups directly."""
+    global _prefer_window_manager
+    lookups = [_dock_mc_group, _window_manager_root]
+    if _prefer_window_manager:
+        lookups.reverse()
+    for lookup in lookups:
+        group = lookup()
+        if group is not None:
+            # Ask the host that answered first next time.
+            _prefer_window_manager = lookup is _window_manager_root
+            return group
+    return None
+
+
+def mission_control_alive(group):
+    """True while `group` (from mission_control_group) still shows Mission
+    Control. WindowManager's app element never dies, so for it this means
+    'still has an mc.display group'."""
+    if group is None:
+        return False
+    if group is _wm_root:
+        return _has_display(group)
+    return element_alive(group)
+
+
+def _displays(group):
+    return [display for display in _attribute(group, AX.kAXChildrenAttribute) or []
+            if _attribute(display, "AXIdentifier") == "mc.display"]
+
+
+def _window_buttons(display):
+    """Window thumbnail elements of one mc.display. macOS 26 nests them in an
+    mc.windows group; macOS 27 drops that group and puts them directly under
+    mc.display (identifier '<bundle id>.space.<n>'), beside mc.spaces."""
+    direct = []
+    for child in _attribute(display, AX.kAXChildrenAttribute) or []:
+        ident = _attribute(child, "AXIdentifier")
+        if ident == "mc.windows":
+            return list(_attribute(child, AX.kAXChildrenAttribute) or [])
+        if not (isinstance(ident, str) and ident.startswith("mc.")) \
+                and _attribute(child, AX.kAXRoleAttribute) == "AXButton":
+            direct.append(child)
+    return direct
+
+
+def _spaces_list(display):
+    for section in _attribute(display, AX.kAXChildrenAttribute) or []:
+        if _attribute(section, "AXIdentifier") != "mc.spaces":
+            continue
+        for child in _attribute(section, AX.kAXChildrenAttribute) or []:
+            if _attribute(child, "AXIdentifier") == "mc.spaces.list":
+                return _attribute(child, AX.kAXChildrenAttribute) or []
+    return []
+
+
+def _space_origin(group, position, size):
+    """Spaces Bar tiles report their CENTER as AXPosition when WindowManager
+    hosts the tree (macOS 27); the Dock reported the top-left corner."""
+    if group is _wm_root:
+        return (position[0] - size[0] / 2, position[1] - size[1] / 2)
+    return position
 
 
 def _multi_attributes(element, names):
@@ -231,52 +406,44 @@ def mission_control_snapshot(group):
     thumbs, spaces, window_count = [], [], 0
     if group is None:
         return thumbs, spaces, window_count
-    for display in _attribute(group, AX.kAXChildrenAttribute) or []:
-        if _attribute(display, "AXIdentifier") != "mc.display":
-            continue
-        for section in _attribute(display, AX.kAXChildrenAttribute) or []:
-            ident = _attribute(section, "AXIdentifier")
-            if ident == "mc.windows":
-                children = _attribute(section, AX.kAXChildrenAttribute) or []
-                window_count = len(children)
-                for button in children:
-                    vals = _multi_attributes(button, _THUMB_ATTRS)
-                    position = _unpack_point(vals["AXPosition"])
-                    size = _unpack_size(vals["AXSize"])
-                    if position is None or size is None:
-                        continue
-                    title = vals["AXTitle"]
-                    thumbs.append({
-                        "title": title if isinstance(title, str) else "",
-                        "x": position[0],
-                        "y": position[1],
-                        "width": size[0],
-                        "height": size[1],
-                        # AXPress focuses the window (and exits Mission Control).
-                        "element": button,
-                    })
-            elif ident == "mc.spaces":
-                for child in _attribute(section, AX.kAXChildrenAttribute) or []:
-                    if _attribute(child, "AXIdentifier") != "mc.spaces.list":
-                        continue
-                    for button in _attribute(child, AX.kAXChildrenAttribute) or []:
-                        vals = _multi_attributes(button, _SPACE_ATTRS)
-                        position = _unpack_point(vals["AXPosition"])
-                        size = _unpack_size(vals["AXSize"])
-                        if position is None or size is None:
-                            continue
-                        title = vals["AXTitle"]
-                        desc = vals["AXDescription"]
-                        spaces.append({
-                            "title": title if isinstance(title, str) else "",
-                            "desc": desc if isinstance(desc, str) else "",
-                            "x": position[0],
-                            "y": position[1],
-                            "width": size[0],
-                            "height": size[1],
-                            # AXPress on this element switches to the space.
-                            "element": button,
-                        })
+    for display in _displays(group):
+        buttons = _window_buttons(display)
+        window_count += len(buttons)
+        for button in buttons:
+            vals = _multi_attributes(button, _THUMB_ATTRS)
+            position = _unpack_point(vals["AXPosition"])
+            size = _unpack_size(vals["AXSize"])
+            if position is None or size is None:
+                continue
+            title = vals["AXTitle"]
+            thumbs.append({
+                "title": title if isinstance(title, str) else "",
+                "x": position[0],
+                "y": position[1],
+                "width": size[0],
+                "height": size[1],
+                # AXPress focuses the window (and exits Mission Control).
+                "element": button,
+            })
+        for button in _spaces_list(display):
+            vals = _multi_attributes(button, _SPACE_ATTRS)
+            position = _unpack_point(vals["AXPosition"])
+            size = _unpack_size(vals["AXSize"])
+            if position is None or size is None:
+                continue
+            position = _space_origin(group, position, size)
+            title = vals["AXTitle"]
+            desc = vals["AXDescription"]
+            spaces.append({
+                "title": title if isinstance(title, str) else "",
+                "desc": desc if isinstance(desc, str) else "",
+                "x": position[0],
+                "y": position[1],
+                "width": size[0],
+                "height": size[1],
+                # AXPress on this element switches to the space.
+                "element": button,
+            })
     return thumbs, spaces, window_count
 
 
@@ -285,38 +452,15 @@ def mission_control_thumbnails(group=None):
     title/x/y/width/height (top-left-origin global coordinates).
 
     Dock AX layout on macOS 26: mc → mc.display → mc.windows → AXButton per
-    thumbnail. Undocumented; may shift across macOS releases."""
+    thumbnail; on macOS 27 WindowManager → mc.display → AXButton.
+    Undocumented; may shift across macOS releases."""
     if group is None:
         group = mission_control_group()
-    if group is None:
-        return []
-    thumbs = []
-    for display in _attribute(group, AX.kAXChildrenAttribute) or []:
-        if _attribute(display, "AXIdentifier") != "mc.display":
-            continue
-        for section in _attribute(display, AX.kAXChildrenAttribute) or []:
-            if _attribute(section, "AXIdentifier") != "mc.windows":
-                continue
-            for button in _attribute(section, AX.kAXChildrenAttribute) or []:
-                position = _unpack_point(
-                    _attribute(button, AX.kAXPositionAttribute))
-                size = _unpack_size(_attribute(button, AX.kAXSizeAttribute))
-                if position is None or size is None:
-                    continue
-                thumbs.append({
-                    "title": _attribute(button, AX.kAXTitleAttribute) or "",
-                    "x": position[0],
-                    "y": position[1],
-                    "width": size[0],
-                    "height": size[1],
-                    # AXPress focuses the window (and exits Mission Control).
-                    "element": button,
-                })
-    return thumbs
+    return mission_control_snapshot(group)[0]
 
 
 def mission_control_window_count(group=None):
-    """Number of children in the mc.windows section, readable or not.
+    """Number of window thumbnail elements, readable or not.
 
     Zero means an empty desktop overview. A positive count paired with no
     readable thumbnails means a fullscreen/split space is being viewed: its
@@ -326,13 +470,7 @@ def mission_control_window_count(group=None):
         group = mission_control_group()
     if group is None:
         return 0
-    for display in _attribute(group, AX.kAXChildrenAttribute) or []:
-        if _attribute(display, "AXIdentifier") != "mc.display":
-            continue
-        for section in _attribute(display, AX.kAXChildrenAttribute) or []:
-            if _attribute(section, "AXIdentifier") == "mc.windows":
-                return len(_attribute(section, AX.kAXChildrenAttribute) or [])
-    return 0
+    return sum(len(_window_buttons(display)) for display in _displays(group))
 
 
 def describe_mc_tree(group, max_depth=4):
@@ -369,37 +507,7 @@ def mission_control_spaces(group=None):
     app's name as the title."""
     if group is None:
         group = mission_control_group()
-    if group is None:
-        return []
-    spaces = []
-    for display in _attribute(group, AX.kAXChildrenAttribute) or []:
-        if _attribute(display, "AXIdentifier") != "mc.display":
-            continue
-        for section in _attribute(display, AX.kAXChildrenAttribute) or []:
-            if _attribute(section, "AXIdentifier") != "mc.spaces":
-                continue
-            for child in _attribute(section, AX.kAXChildrenAttribute) or []:
-                if _attribute(child, "AXIdentifier") != "mc.spaces.list":
-                    continue
-                for button in _attribute(child, AX.kAXChildrenAttribute) or []:
-                    position = _unpack_point(
-                        _attribute(button, AX.kAXPositionAttribute))
-                    size = _unpack_size(
-                        _attribute(button, AX.kAXSizeAttribute))
-                    if position is None or size is None:
-                        continue
-                    spaces.append({
-                        "title": _attribute(button, AX.kAXTitleAttribute) or "",
-                        "desc": _attribute(
-                            button, AX.kAXDescriptionAttribute) or "",
-                        "x": position[0],
-                        "y": position[1],
-                        "width": size[0],
-                        "height": size[1],
-                        # AXPress on this element switches to the space.
-                        "element": button,
-                    })
-    return spaces
+    return mission_control_snapshot(group)[1]
 
 
 def _pids_named(app_name):

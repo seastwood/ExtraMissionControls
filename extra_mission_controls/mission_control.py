@@ -222,7 +222,7 @@ class MissionControlButtons(NSObject):
         self._prev_layout = None      # last frame's positions, for motion detect
         self._screen_width = None
         self._active = False
-        self._mc_group = None   # cached Dock 'mc' element while MC is up
+        self._mc_group = None   # cached MC tree root (Dock 'mc' / WindowManager)
         self._sync_interval = 0.0   # current sync cadence (fast until settled)
         self._timer = None
         self._sync_timer = None
@@ -453,8 +453,9 @@ class MissionControlButtons(NSObject):
             # syncTick (10 Hz) owns liveness while Mission Control is up;
             # walking the Dock's tree here too would just double the AX load.
             return
-        # Idle path: a single WindowServer query; only touch the Dock's
-        # AX tree when Mission Control actually looks active.
+        # Idle path: a single WindowServer query; only touch the Mission
+        # Control AX tree (Dock, or WindowManager on macOS 27) when Mission
+        # Control actually looks active.
         if ax.mission_control_probably_active():
             group = ax.mission_control_group()
             if group is not None:
@@ -471,6 +472,9 @@ class MissionControlButtons(NSObject):
         # liveness); parking it saves ~7 no-op Python wakeups a second.
         self._stop_detect_timer()
         self._mc_group = group  # cached; syncTick revalidates with one AX call
+        # On macOS 27 the cheap backdrop check starts unverified; trust it
+        # once it agrees with a confirmed session (keeps the idle poll free).
+        ax.note_mission_control_confirmed()
         # AX coordinates are relative to the primary screen's top-left.
         self._screen_height = NSScreen.screens()[0].frame().size.height
         self._screen_width = NSScreen.screens()[0].frame().size.width
@@ -674,7 +678,7 @@ class MissionControlButtons(NSObject):
             # single AX call, where re-discovering it walks the Dock's whole
             # child list every frame.
             group = self._mc_group
-            if group is None or not ax.element_alive(group):
+            if group is None or not ax.mission_control_alive(group):
                 group = ax.mission_control_group()
                 self._mc_group = group
             if group is None:
