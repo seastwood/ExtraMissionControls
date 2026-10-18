@@ -1,9 +1,11 @@
 """Generate the app icon and the menu-bar icon.
 
-App icon (assets/icon.icns, assets/icon_256.png): full-bleed graphite (macOS
-rounds it) holding
+App icon (assets/icon.icns): full-bleed graphite (macOS rounds it) holding
 a 2x2 grid — three grey window tiles and, in the top-left, a
 pink-to-violet ring: Mission Control's windows plus the control EMC adds.
+
+README image (assets/icon_256.png): the same icon with the macOS rounded
+shape baked in, since GitHub shows it as-is.
 
 Menu-bar icon (assets/tray_icon.png): the same grid and ring with no
 background, drawn as a macOS *template* image (black + alpha) — macOS shows
@@ -141,12 +143,35 @@ def tray_icon(px=36):
     return img.resize((px, px), Image.LANCZOS)
 
 
+def _squircle_mask(size, k=4):
+    """macOS's app-icon shape: a superellipse (|x|^5 + |y|^5 = 1), drawn at
+    k-times resolution and downsampled for smooth edges."""
+    n = size * k
+    small = Image.new("L", (n, n), 0)
+    px = small.load()
+    half = n / 2.0
+    exp = 5.0
+    for y in range(n):
+        dy = abs((y + 0.5 - half) / half) ** exp
+        if dy >= 1.0:
+            continue
+        span = (1.0 - dy) ** (1.0 / exp) * half
+        x0, x1 = int(round(half - span)), int(round(half + span))
+        for x in range(max(0, x0), min(n, x1)):
+            px[x, y] = 255
+    return small.resize((size, size), Image.LANCZOS)
+
+
 def main():
     icon = app_icon()
     icon.save(os.path.join(ASSETS, "icon.icns"),
               sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256),
                      (512, 512), (1024, 1024)])
-    icon.resize((256, 256), Image.LANCZOS).save(
+    # README / web copy: macOS rounds the app icon itself, but GitHub shows
+    # the file as-is, so this one gets the macOS icon shape baked in.
+    rounded = Image.new("RGBA", icon.size, (0, 0, 0, 0))
+    rounded.paste(icon, (0, 0), _squircle_mask(icon.size[0]))
+    rounded.resize((256, 256), Image.LANCZOS).save(
         os.path.join(ASSETS, "icon_256.png"))
     tray_icon().save(os.path.join(ASSETS, "tray_icon.png"))
     print("wrote assets/icon.icns, assets/icon_256.png, assets/tray_icon.png")
