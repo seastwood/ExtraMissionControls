@@ -625,6 +625,111 @@ def _drop_other_space_thumbs(thumbs, spaces):
     return [t for t in thumbs if t.get("space") not in fs_spaces]
 
 
+# {window title: bundle id} of the full-screen-space thumbnails macOS 27
+# lists (and we hide) — lets a Spaces Bar tile title be traced to its app.
+fullscreen_bundles = {}
+
+
+def _remember_fullscreen(all_thumbs, kept):
+    kept_ids = {id(t) for t in kept}
+    for t in all_thumbs:
+        if id(t) not in kept_ids and t.get("bundle") and t.get("title"):
+            fullscreen_bundles[t["title"]] = t["bundle"]
+
+
+def _note_bundles(buttons):
+    """Record {title: bundle} for every thumbnail BEFORE any space filter, so
+    a full-screen tile's title can be traced to its app."""
+    for _, vals in buttons:
+        bundle, _space = _split_thumb_id(vals.get("AXIdentifier"))
+        title = vals.get("AXTitle")
+        if bundle and isinstance(title, str) and title.strip():
+            fullscreen_bundles[title] = bundle
+
+
+def pid_for_title(title):
+    """Best-effort pid behind a Spaces Bar tile title: the thumbnail's
+    bundle id, else an app with that name."""
+    bundle = fullscreen_bundles.get(title)
+    if bundle is None:
+        for t, b in fullscreen_bundles.items():
+            if titles_related(title, t):
+                bundle = b
+                break
+    pid = pid_for_bundle(bundle) if bundle else None
+    if pid is None:
+        pids = _pids_named(title)
+        pid = pids[0] if pids else None
+    return pid
+
+
+def fullscreen_window_of_pid(pid):
+    for window in _ax_windows(pid):
+        if _attribute(window, "AXFullScreen"):
+            return window
+    return None
+
+
+def app_name_for_pid(pid):
+    from AppKit import NSRunningApplication
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    return app.localizedName() if app is not None else None
+
+
+def pid_for_bundle(bundle_id):
+    from AppKit import NSRunningApplication
+    apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(
+        bundle_id) or []
+    return apps[0].processIdentifier() if apps else None
+
+
+def window_states(pid):
+    """[(window number, layer, alpha, on_screen, (x, y, w, h))] for every
+    CG window of a pid, on screen or not — the 'is it actually visible?'
+    check after a full-screen window drops back to the desktop."""
+    onscreen = {e.get(Quartz.kCGWindowNumber) for e in
+                Quartz.CGWindowListCopyWindowInfo(
+                    Quartz.kCGWindowListOptionOnScreenOnly,
+                    Quartz.kCGNullWindowID) or []}
+    out = []
+    for e in Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID) or []:
+        if e.get(Quartz.kCGWindowOwnerPID) != pid:
+            continue
+        b = e.get(Quartz.kCGWindowBounds) or {}
+        number = e.get(Quartz.kCGWindowNumber)
+        out.append((number, e.get(Quartz.kCGWindowLayer, 0),
+                    float(e.get(Quartz.kCGWindowAlpha, 1.0)),
+                    number in onscreen,
+                    (b.get("X", 0), b.get("Y", 0),
+                     b.get("Width", 0), b.get("Height", 0))))
+    return out
+
+
+def revive_windows(pid, hard=False):
+    """Nudge a pid's AX windows back into view: raise them (and, when
+    `hard`, minimize+restore, which makes the WindowServer re-show the
+    window from scratch). Returns how many windows were touched."""
+    touched = 0
+    for window in _ax_windows(pid):
+        if _attribute(window, "AXFullScreen"):
+            # The drop removed the window's full-screen space but the app
+            # still thinks the window is full screen, so it sits off screen
+            # with nowhere to draw. Let the app leave full screen properly.
+            set_fullscreen(window, False)
+            touched += 1
+            continue
+        if _attribute(window, AX.kAXCloseButtonAttribute) is None:
+            continue
+        if hard:
+            AX.AXUIElementSetAttributeValue(window, "AXMinimized", True)
+            AX.AXUIElementSetAttributeValue(window, "AXMinimized", False)
+        AX.AXUIElementPerformAction(window, AX.kAXRaiseAction)
+        touched += 1
+    activate_pid(pid)
+    return touched
+
+
 def _app_name_for_bundle(bundle_id):
     from AppKit import NSRunningApplication
     apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(
@@ -649,6 +754,7 @@ def mission_control_snapshot(group):
     for display in _displays(group):
         _last_display = display
         buttons, tiles = _display_parts(display)
+        _note_bundles(buttons)
         buttons = _current_space_only(buttons)
         window_count += len(buttons)
         for button, vals in buttons:
@@ -667,6 +773,7 @@ def mission_control_snapshot(group):
                 title = _app_name_for_bundle(bundle) or ""
             thumbs.append({
                 "space": space,
+                "bundle": bundle,
                 "title": title if isinstance(title, str) else "",
                 "x": position[0],
                 "y": position[1],
@@ -696,7 +803,9 @@ def mission_control_snapshot(group):
             })
     if group is _wm_root:
         before = len(thumbs)
+        all_thumbs = thumbs
         thumbs = _drop_other_space_thumbs(thumbs, spaces)
+        _remember_fullscreen(all_thumbs, thumbs)
         window_count -= before - len(thumbs)
     return thumbs, spaces, window_count
 

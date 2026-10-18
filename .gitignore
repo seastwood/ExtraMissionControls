@@ -21,3 +21,4 @@ assets/icon.iconset/
 run_probe.command
 probe_out.txt
 emc_diag.txt
+emc_actions.log*
