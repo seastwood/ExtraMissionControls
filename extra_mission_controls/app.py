@@ -28,7 +28,7 @@ from AppKit import (
     NSVariableStatusItemLength,
     NSWorkspace,
 )
-from Foundation import NSBundle, NSObject, NSTimer, NSURL, NSUserDefaults
+from Foundation import NSBundle, NSObject, NSTimer, NSURL
 from PyObjCTools import AppHelper
 
 from . import __version__, ax, login, ui, updates
@@ -36,43 +36,18 @@ from .mission_control import MissionControlButtons
 
 UPDATE_CHECK_INTERVAL = 6 * 3600.0  # re-check GitHub every 6 hours
 
-_ICON_KEY = "EMCTrayIcon"
-# (SF Symbol name, menu label); the first entry is the default. All verified
-# present on macOS 26 — unresolvable names are skipped when building the
-# picker, and _apply_tray_icon falls back to the default.
-TRAY_ICONS = (
-    ("emc", "EMC"),  # our own icon (assets/tray_icon.png); the rest are SF Symbols
-    ("rectangle.grid.2x2", "Grid"),
-    ("rectangle.3.group", "Overview"),
-    ("rectangle.on.rectangle", "Overlapping"),
-    ("rectangle.stack", "Stack"),
-    ("macwindow", "Window"),
-    ("macwindow.on.rectangle", "Desktop"),
-    ("rectangle.badge.xmark", "Close Badge"),
-)
-
-
-def _current_icon_name():
-    name = NSUserDefaults.standardUserDefaults().stringForKey_(_ICON_KEY)
-    if name in tuple(symbol for symbol, _ in TRAY_ICONS):
-        return name
-    return TRAY_ICONS[0][0]
-
-
-def _tray_image(name, label="ExtraMissionControls"):
-    """The NSImage for a tray-icon choice: EMC's own template image, or an
-    SF Symbol by name. None if unavailable."""
-    if name == "emc":
-        base = os.environ.get("RESOURCEPATH") or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
-        image = NSImage.alloc().initWithContentsOfFile_(
-            os.path.join(base, "tray_icon.png"))
-        if image is not None:
-            image.setSize_((18, 18))
-            image.setTemplate_(True)  # macOS tints it for light/dark menu bars
-            image.setAccessibilityDescription_(label)
-        return image
-    return NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, label)
+def _tray_image(label="ExtraMissionControls"):
+    """EMC's branded menu-bar icon (assets/tray_icon.png) as a template image,
+    so macOS tints it for light and dark menu bars. None if it can't load."""
+    base = os.environ.get("RESOURCEPATH") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+    image = NSImage.alloc().initWithContentsOfFile_(
+        os.path.join(base, "tray_icon.png"))
+    if image is not None:
+        image.setSize_((18, 18))
+        image.setTemplate_(True)
+        image.setAccessibilityDescription_(label)
+    return image
 
 
 def _symbol_item(target, title, action, key, symbol_name):
@@ -158,27 +133,6 @@ class AppDelegate(NSObject):
                              else NSControlStateValueOff)
         menu.addItem_(login_item)
         self._login_item = login_item
-        # Tray-icon picker: each entry previews its symbol (the per-item icon
-        # column is fine here — every row has one, so the labels align).
-        icon_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Icon", None, "")
-        icon_menu = NSMenu.alloc().init()
-        current = _current_icon_name()
-        for symbol_name, label in TRAY_ICONS:
-            preview = _tray_image(symbol_name, label)
-            if preview is None:
-                continue
-            entry = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                label, "selectTrayIcon:", "")
-            entry.setTarget_(self)
-            entry.setRepresentedObject_(symbol_name)
-            entry.setImage_(preview)
-            entry.setState_(NSControlStateValueOn if symbol_name == current
-                            else NSControlStateValueOff)
-            icon_menu.addItem_(entry)
-        icon_item.setSubmenu_(icon_menu)
-        menu.addItem_(icon_item)
-        self._icon_menu = icon_menu
         menu.addItem_(NSMenuItem.separatorItem())
         menu.addItem_(_symbol_item(self, "Restart", "restartApp:", "",
                                    "arrow.clockwise"))
@@ -195,23 +149,11 @@ class AppDelegate(NSObject):
     @objc.python_method
     def _apply_tray_icon(self):
         button = self._status_item.button()
-        symbol = _tray_image(_current_icon_name())
-        if symbol is None:
-            symbol = _tray_image("rectangle.grid.2x2")
-        if symbol is not None:
-            button.setImage_(symbol)
+        image = _tray_image()
+        if image is not None:
+            button.setImage_(image)
         else:
-            button.setTitle_("⧉")
-
-    def selectTrayIcon_(self, sender):
-        name = sender.representedObject()
-        NSUserDefaults.standardUserDefaults().setObject_forKey_(name, _ICON_KEY)
-        self._apply_tray_icon()
-        for index in range(self._icon_menu.numberOfItems()):
-            entry = self._icon_menu.itemAtIndex_(index)
-            entry.setState_(NSControlStateValueOn
-                            if entry.representedObject() == name
-                            else NSControlStateValueOff)
+            button.setTitle_("EMC")
 
     def checkForUpdates_(self, sender):
         updates.check_async(self._show_update_available)
