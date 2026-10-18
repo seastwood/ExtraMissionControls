@@ -354,6 +354,11 @@ def main():
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     _delegate = AppDelegate.alloc().init()
     app.setDelegate_(_delegate)
-    # installInterrupt: Ctrl+C in the launching Terminal quits cleanly
-    # (the Cocoa run loop otherwise swallows SIGINT).
-    AppHelper.runEventLoop(installInterrupt=True)
+    # Ctrl+C / kill quit immediately. The Cocoa run loop never hands SIGINT
+    # to Python's default handler (KeyboardInterrupt), and PyObjC's
+    # installInterrupt didn't fire on macOS 27; a plain handler runs on the
+    # next Python callback (EMC's poll timers tick several times a second).
+    import signal
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: os._exit(0))
+    AppHelper.runEventLoop()
