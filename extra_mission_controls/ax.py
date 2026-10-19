@@ -757,6 +757,7 @@ def _note_bundles(buttons):
 def pid_for_title(title):
     """Best-effort pid behind a Spaces Bar tile title: the thumbnail's
     bundle id, else an app with that name."""
+    title = base_title(title)
     bundle = fullscreen_bundles.get(title)
     if bundle is None:
         for t, b in fullscreen_bundles.items():
@@ -1259,6 +1260,7 @@ def caps_for(pid, title):
     unknown — never hide a button on a guess."""
     if pid is None:
         return True, True
+    title = base_title(title)
     caps = window_caps.get((pid, title))
     if caps is not None:
         return caps
@@ -1411,6 +1413,112 @@ def close_fullscreen_window(tile_title):
         close_button, AX.kAXPressAction) == AX.kAXErrorSuccess
 
 
+# -- Same-titled windows -----------------------------------------------------
+# Several windows of one app can share a title (Terminal: "user — -zsh —
+# 80×24"). Mission Control thumbnails carry no window id, so the controller
+# keys such thumbnails "<title><KEY_SEP><n>" and, when one is acted on, PINS
+# each to a real window by geometry (pin_group). The title lookups below then
+# resolve a pinned key to exactly that window, never its twin.
+KEY_SEP = "\u2063#"   # invisible separator + '#'
+pinned = {}           # thumbnail key -> (pid, CG window number)
+
+
+def base_title(title):
+    """The window title behind a thumbnail key."""
+    if title and KEY_SEP in title:
+        return title.split(KEY_SEP, 1)[0]
+    return title
+
+
+_get_window = None
+
+
+def ax_window_number(window):
+    """The CG window number of an AX window (private _AXUIElementGetWindow,
+    the call window managers use), or None."""
+    global _get_window
+    if _get_window is None:
+        try:
+            import objc
+            from Foundation import NSBundle
+            bundle = NSBundle.bundleWithPath_(
+                "/System/Library/Frameworks/ApplicationServices.framework/"
+                "Frameworks/HIServices.framework")
+            found = {}
+            objc.loadBundleFunctions(
+                bundle, found, [("_AXUIElementGetWindow", b"i@o^I")])
+            _get_window = found.get("_AXUIElementGetWindow") or False
+        except Exception:
+            _get_window = False
+    if not _get_window:
+        return None
+    try:
+        err, number = _get_window(window, None)
+    except Exception:
+        return None
+    return number if err == 0 else None
+
+
+def pinned_window(key):
+    """The live AX window a thumbnail key was pinned to, or None."""
+    entry = pinned.get(key)
+    if not entry:
+        return None
+    pid, number = entry
+    for window in _ax_windows(pid):
+        if ax_window_number(window) == number:
+            return window
+    return None
+
+
+def app_window_rects(pid):
+    """[(window number, (x, y, w, h))] for the app's on-screen windows."""
+    out = []
+    for entry in _window_list():
+        if entry.get(Quartz.kCGWindowOwnerPID) != pid \
+                or entry.get(Quartz.kCGWindowLayer, 0) != 0:
+            continue
+        b = entry.get(Quartz.kCGWindowBounds) or {}
+        if b.get("Width", 0) < 80 or b.get("Height", 0) < 80:
+            continue
+        out.append((entry.get(Quartz.kCGWindowNumber),
+                    (b.get("X", 0), b.get("Y", 0), b["Width"], b["Height"])))
+    return out
+
+
+def _layout_points(rects):
+    """Each rect's centre normalised to the group's bounding box, plus its
+    log aspect ratio — comparable between thumbnails and real windows."""
+    import math
+    x0 = min(r[0] for r in rects)
+    y0 = min(r[1] for r in rects)
+    w = max(max(r[0] + r[2] for r in rects) - x0, 1.0)
+    h = max(max(r[1] + r[3] for r in rects) - y0, 1.0)
+    return [((r[0] + r[2] / 2.0 - x0) / w, (r[1] + r[3] / 2.0 - y0) / h,
+             math.log(max(r[2], 1.0) / max(r[3], 1.0))) for r in rects]
+
+
+def match_layout(thumb_rects, window_rects):
+    """Pair thumbnails with windows (equal counts): the assignment that best
+    keeps their relative layout and shapes (Mission Control keeps both).
+    Returns a list of window indexes, one per thumbnail."""
+    import itertools
+    a, b = _layout_points(thumb_rects), _layout_points(window_rects)
+    cost = [[abs(p[0] - q[0]) + abs(p[1] - q[1]) + 0.5 * abs(p[2] - q[2])
+             for q in b] for p in a]
+    n = len(a)
+    if n <= 7:
+        best = min(itertools.permutations(range(n)),
+                   key=lambda perm: sum(cost[i][perm[i]] for i in range(n)))
+        return list(best)
+    order, used = [], set()   # many windows: greedy is plenty
+    for i in range(n):
+        j = min((j for j in range(n) if j not in used), key=lambda j: cost[i][j])
+        used.add(j)
+        order.append(j)
+    return order
+
+
 def titles_related(a, b):
     """True when two window titles refer to the same window despite the Dock
     showing a shortened form for the Mission Control thumbnail — e.g. thumbnail
@@ -1443,6 +1551,12 @@ def _press_window_button_by_title(title, pids, button_attr):
     matches are ignored so the wrong window is never touched."""
     if not title:
         return False
+    if title in pinned:
+        window = pinned_window(title)
+        target = _attribute(window, button_attr) if window is not None else None
+        return target is not None and AX.AXUIElementPerformAction(
+            target, AX.kAXPressAction) == AX.kAXErrorSuccess
+    title = base_title(title)
     exact, related = [], []
     for pid in pids:
         for window in _ax_windows(pid):
@@ -1496,6 +1610,9 @@ def _find_window_by_title(title, pids):
     same rule the close/minimize matching uses."""
     if not title:
         return None
+    if title in pinned:
+        return pinned_window(title)
+    title = base_title(title)
     exact, related = [], []
     for pid in pids:
         for window in _ax_windows(pid):
