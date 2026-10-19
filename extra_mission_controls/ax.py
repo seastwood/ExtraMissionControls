@@ -1108,6 +1108,24 @@ def _show_desktop_hotkey():
     return int(params[1]), int(params[2])
 
 
+def app_window_frames():
+    """{window number: (x, y, w, h)} of on-screen app windows (layer 0). Show
+    Desktop moves every one of them, so comparing two snapshots tells whether
+    it took effect."""
+    info = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly
+        | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID) or []
+    frames = {}
+    for w in info:
+        if w.get("kCGWindowLayer", 1) != 0:
+            continue
+        b = w.get("kCGWindowBounds") or {}
+        frames[w.get("kCGWindowNumber")] = (
+            round(b.get("X", 0)), round(b.get("Y", 0)),
+            round(b.get("Width", 0)), round(b.get("Height", 0)))
+    return frames
+
+
 def show_desktop(method="dock"):
     """Toggle Show Desktop. `method` 'dock' posts the Dock notification (falls
     back to the shortcut if unavailable); 'key' presses the user's Show Desktop

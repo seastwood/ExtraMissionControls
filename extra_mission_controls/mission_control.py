@@ -252,7 +252,7 @@ _ACTION_LOG = os.path.join(
     "emc_actions.log")
 _ACTION_PREFIXES = ("UNFULLSCREEN", "CLOSE-FULLSCREEN", "APPLY-DEFERRED",
                     "NATIVE-DROP",
-                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK", "DOCK",
+                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK", "DOCK", "DESKTOP",
                     "registry")
 
 
@@ -3532,20 +3532,11 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _show_desktop(self):
-        """Leave Mission Control into Show Desktop. Ask the Dock directly
-        first; if Mission Control is still up a moment later, close it and ask
-        again once it's gone."""
+        """Leave Mission Control, then Show Desktop (every window swept to the
+        screen edges). Asked for while Mission Control is up, macOS only closes
+        Mission Control, so close it first and ask once it's gone."""
         self._latch_exit()
-        sent = ax.show_desktop()
-        _geom_log("DESKTOP sent=%s (in MC)" % sent)
         self._desktop_wait = 0
-        self.performSelector_withObject_afterDelay_(
-            "showDesktopCheck", None, 0.6)
-
-    def showDesktopCheck(self):
-        if ax.mission_control_group() is None:
-            return  # it took
-        _geom_log("DESKTOP still in MC: closing it first")
         subprocess.Popen(["open", "-b", "com.apple.exposelauncher"])
         self.performSelector_withObject_afterDelay_(
             "showDesktopAfterExit", None, 0.15)
@@ -3553,12 +3544,29 @@ class MissionControlButtons(NSObject):
     def showDesktopAfterExit(self):
         if ax.mission_control_group() is not None:
             self._desktop_wait += 1
-            if self._desktop_wait < 20:
+            if self._desktop_wait < 30:
                 self.performSelector_withObject_afterDelay_(
                     "showDesktopAfterExit", None, 0.1)
+            else:
+                _geom_log("DESKTOP gave up: Mission Control never closed")
             return
-        sent = ax.show_desktop()
-        _geom_log("DESKTOP sent=%s (after exit)" % sent)
+        self._desktop_before = ax.app_window_frames()
+        sent = ax.show_desktop("dock")
+        _geom_log("DESKTOP dock sent=%s windows=%d"
+                  % (sent, len(self._desktop_before)))
+        self.performSelector_withObject_afterDelay_(
+            "showDesktopVerify", None, 0.8)
+
+    def showDesktopVerify(self):
+        """No window moved → the Dock request didn't take: press the user's
+        Show Desktop shortcut instead."""
+        before = self._desktop_before or {}
+        after = ax.app_window_frames()
+        moved = sum(1 for n, f in before.items() if after.get(n) != f)
+        _geom_log("DESKTOP verify moved=%d/%d" % (moved, len(before)))
+        if before and not moved:
+            sent = ax.show_desktop("key")
+            _geom_log("DESKTOP shortcut sent=%s" % sent)
 
     @objc.python_method
     def _reopen_mission_control(self, delay):
