@@ -3009,6 +3009,8 @@ class MissionControlButtons(NSObject):
         twins apart; the action later resolves the key to exactly that window
         (ax.pinned). No pin when the counts don't line up — then the usual
         title matching applies."""
+        if not ax.window_numbers_available():
+            return  # can't resolve a pin later — keep the old title matching
         base = ax.base_title(key)
         group = [t for t in self._last_thumbs if ax.base_title(t["title"]) == base]
         bundle = next((t.get("bundle") for t in group if t.get("bundle")), None)

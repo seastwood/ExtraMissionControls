@@ -1433,9 +1433,7 @@ def base_title(title):
 _get_window = None
 
 
-def ax_window_number(window):
-    """The CG window number of an AX window (private _AXUIElementGetWindow,
-    the call window managers use), or None."""
+def _load_get_window():
     global _get_window
     if _get_window is None:
         try:
@@ -1450,13 +1448,25 @@ def ax_window_number(window):
             _get_window = found.get("_AXUIElementGetWindow") or False
         except Exception:
             _get_window = False
-    if not _get_window:
+    return _get_window
+
+
+def ax_window_number(window):
+    """The CG window number of an AX window (private _AXUIElementGetWindow,
+    the call window managers use), or None."""
+    if window is None or not _load_get_window():
         return None
     try:
         err, number = _get_window(window, None)
     except Exception:
         return None
     return number if err == 0 else None
+
+
+def window_numbers_available():
+    """Whether AX windows can be mapped to CG window numbers here (pinning
+    needs it; without it the plain title matching is used)."""
+    return bool(_load_get_window())
 
 
 def pinned_window(key):
