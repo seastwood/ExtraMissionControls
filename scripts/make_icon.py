@@ -35,6 +35,7 @@ MARK = os.environ.get("EMC_ICON_MARK", "E").lower()   # "e" or "ring"
 STROKE = 56  # the mark's line weight (1024 grid)
 LETTER_INSET = 0    # M / C reach their tiles' edges
 LETTER_STROKE = STROKE
+LETTER_GREYS = ((236, 236, 242), (198, 198, 206))  # M / C: monochrome, lit from the top
 X0 = 512 - (2 * TILE + GAP) / 2
 
 
@@ -152,8 +153,8 @@ def app_icon():
     img.alpha_composite(sheen)
 
     if MARK != "ring":
-        # "M" and "C" on the bottom tiles: the same gradient strokes, their
-        # outer edges on the tiles' edges.
+        # "M" and "C" on the bottom tiles, monochrome (only the E carries
+        # colour), their outer edges on the tiles' edges.
         for letter, cell in (("M", _cell(1, 0)), ("C", _cell(1, 1))):
             m = _mask(lambda d, c=cell, l=letter: [
                 d.rounded_rectangle(box, radius=radius, fill=255)
@@ -161,8 +162,7 @@ def app_icon():
                                                 inset=LETTER_INSET)])
             _shadow(img, m, dy=6, blur=8, alpha=110)
             ink = Image.new("RGBA", (N, N), (0, 0, 0, 0))
-            ink.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True),
-                      (0, 0), m)
+            ink.paste(_grad(*LETTER_GREYS), (0, 0), m)
             img.alpha_composite(ink)
 
     return img.resize((1024, 1024), Image.LANCZOS)
