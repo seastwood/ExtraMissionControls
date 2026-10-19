@@ -33,6 +33,15 @@ BODY_RADIUS = 0
 TILE, GAP = 350, 64
 MARK = os.environ.get("EMC_ICON_MARK", "E").lower()   # "e" or "ring"
 STROKE = 56  # the mark's line weight (1024 grid)
+# The mark's colour: (from, to, vertical). Pink -> violet across the icon, or
+# a gold from light at the top of the E to deep at its foot.
+MARK_PALETTES = {
+    "pink": ((255, 96, 140), (128, 108, 255), False),
+    "gold": ((255, 222, 120), (206, 142, 36), True),
+    "champagne": ((246, 224, 168), (190, 150, 82), True),
+    "amber": ((255, 204, 84), (224, 120, 28), True),
+}
+MARK_COLORS = MARK_PALETTES[os.environ.get("EMC_ICON_COLOR", "gold")]
 LETTER_INSET = 0    # M / C reach their tiles' edges
 LETTER_STROKE = STROKE
 LETTER_GREYS = ((160, 160, 168), (134, 134, 142))  # M / C: monochrome mid grey
@@ -101,6 +110,15 @@ def _grad(c1, c2, horizontal=False):
     return g.resize((N, N), Image.BICUBIC)
 
 
+def _grad_span(c1, c2, a, b, vertical=False):
+    """c1 -> c2 between a and b (1024 grid) along one axis, flat outside."""
+    g = Image.new("RGBA", (1, 1024) if vertical else (1024, 1))
+    for i in range(1024):
+        t = min(1.0, max(0.0, (i - a) / float(b - a)))
+        g.putpixel((0, i) if vertical else (i, 0), _lerp(c1, c2, t) + (255,))
+    return g.resize((N, N), Image.BICUBIC)
+
+
 def _mask(draw_fn):
     m = Image.new("L", (N, N), 0)
     draw_fn(ImageDraw.Draw(m))
@@ -151,7 +169,11 @@ def app_icon():
         ring = _mask(draw_e)
     _shadow(img, ring, dy=10, blur=12, alpha=120)
     fill = Image.new("RGBA", (N, N), (0, 0, 0, 0))
-    fill.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True), (0, 0), ring)
+    c1, c2, vertical = MARK_COLORS
+    if vertical:   # spans the mark's own cell, top to bottom (metallic)
+        fill.paste(_grad_span(c1, c2, y1, y2, vertical=True), (0, 0), ring)
+    else:          # spans the whole icon, left to right (as the ring had it)
+        fill.paste(_grad(c1, c2, horizontal=True), (0, 0), ring)
     img.alpha_composite(fill)
     sheen = Image.new("RGBA", (N, N), (255, 255, 255, 0))
     top_half = _mask(lambda d: d.rectangle(_box((x1, y1, x2, (y1 + y2) / 2)),
