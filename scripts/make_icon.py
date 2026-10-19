@@ -33,8 +33,8 @@ BODY_RADIUS = 0
 TILE, GAP = 350, 64
 MARK = os.environ.get("EMC_ICON_MARK", "E").lower()   # "e" or "ring"
 STROKE = 56  # the mark's line weight (1024 grid)
-LETTER_INSET = 62   # M / C sit this far inside their tiles
-LETTER_STROKE = 46
+LETTER_INSET = 0    # M / C reach their tiles' edges
+LETTER_STROKE = STROKE
 X0 = 512 - (2 * TILE + GAP) / 2
 
 
@@ -152,8 +152,8 @@ def app_icon():
     img.alpha_composite(sheen)
 
     if MARK != "ring":
-        # "M" and "C" on the bottom tiles: the same gradient strokes, inset
-        # so each tile shows around its letter.
+        # "M" and "C" on the bottom tiles: the same gradient strokes, their
+        # outer edges on the tiles' edges.
         for letter, cell in (("M", _cell(1, 0)), ("C", _cell(1, 1))):
             m = _mask(lambda d, c=cell, l=letter: [
                 d.rounded_rectangle(box, radius=radius, fill=255)
@@ -183,15 +183,19 @@ def tray_icon(px=36):
         y = margin + r * (tile + gap)
         return [x * k, y * k, (x + tile) * k, (y + tile) * k]
 
+    lettered = MARK != "ring"
     for r, c in ((0, 1), (1, 0), (1, 1)):
-        d.rounded_rectangle(cell(r, c), radius=3.2 * k, fill=ink)
-    if MARK != "ring":
-        # M / C cut out of their squares (template images are alpha only).
+        # Template images are alpha only: under a letter the square is faint
+        # so the full-strength letter (edge to edge) reads on top of it.
+        faint = lettered and r == 1
+        d.rounded_rectangle(cell(r, c), radius=3.2 * k,
+                            fill=(0, 0, 0, 90) if faint else ink)
+    if lettered:
         for letter, (r, c) in (("M", (1, 0)), ("C", (1, 1))):
             x1, y1, x2, y2 = cell(r, c)
             for box, radius in _letter_bars(letter, x1 / k, y1 / k, x2 / k,
-                                            y2 / k, 1.9, k, inset=2.6):
-                d.rounded_rectangle(box, radius=radius, fill=(0, 0, 0, 0))
+                                            y2 / k, 2.6, k):
+                d.rounded_rectangle(box, radius=radius, fill=ink)
     x1, y1, x2, y2 = cell(0, 0)
     if MARK == "ring":
         inset = 0.6 * k
