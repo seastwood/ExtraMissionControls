@@ -35,7 +35,16 @@ MARK = os.environ.get("EMC_ICON_MARK", "E").lower()   # "e" or "ring"
 STROKE = 56  # the mark's line weight (1024 grid)
 LETTER_INSET = 0    # M / C reach their tiles' edges
 LETTER_STROKE = STROKE
-LETTER_GREYS = ((236, 236, 242), (198, 198, 206))  # M / C: monochrome, lit from the top
+LETTER_GREYS = ((160, 160, 168), (134, 134, 142))  # M / C: monochrome mid grey
+LETTER_RIM = 0      # alpha of a light rim around M / C (0 = none)
+TILE_SHADES = {     # (row, col): (top, bottom) grey of each window tile
+    (0, 1): ((128, 128, 136), (100, 100, 108)),
+    (1, 0): ((92, 92, 100), (68, 68, 75)),
+    (1, 1): ((176, 176, 184), (146, 146, 154)),
+}
+if MARK != "ring":
+    # Dark panels under the M and C so the mid-grey letters stand out.
+    TILE_SHADES[(1, 0)] = TILE_SHADES[(1, 1)] = ((62, 62, 70), (46, 46, 52))
 X0 = 512 - (2 * TILE + GAP) / 2
 
 
@@ -112,9 +121,7 @@ def app_icon():
     img.paste(_diag((62, 63, 70), (16, 16, 20)), (0, 0), body)
 
     # Window tiles: solid greys, lit from the top, with soft shadows.
-    for (r, c), (top, bottom) in (((0, 1), ((128, 128, 136), (100, 100, 108))),
-                                  ((1, 0), ((92, 92, 100), (68, 68, 75))),
-                                  ((1, 1), ((176, 176, 184), (146, 146, 154)))):
+    for (r, c), (top, bottom) in TILE_SHADES.items():
         box = _cell(r, c)
         m = _mask(lambda d, b=box: d.rounded_rectangle(_box(b), radius=52 * S,
                                                        fill=255))
@@ -164,6 +171,13 @@ def app_icon():
             ink = Image.new("RGBA", (N, N), (0, 0, 0, 0))
             ink.paste(_grad(*LETTER_GREYS), (0, 0), m)
             img.alpha_composite(ink)
+            if not LETTER_RIM:
+                continue
+            # A faint light rim, like the tiles' top edge.
+            rim = ImageChops.subtract(m, m.filter(ImageFilter.MinFilter(4 * S + 1)))
+            edge = Image.new("RGBA", (N, N), (255, 255, 255, 0))
+            edge.putalpha(rim.point(lambda v: v * LETTER_RIM // 255))
+            img.alpha_composite(edge)
 
     return img.resize((1024, 1024), Image.LANCZOS)
 
