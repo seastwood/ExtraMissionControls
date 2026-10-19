@@ -116,7 +116,39 @@ def _glyph_image(text, point, size=CLOSE_BUTTON_SIZE):
     return image
 
 
+# Labels of the form "sf:<name>|<fallback>" draw that SF Symbol (white),
+# falling back to the plain glyph if the symbol isn't on this system.
+def _symbol_image(name, point, size):
+    base = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+    if base is None:
+        return None
+    config = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        point, AppKit.NSFontWeightBold)
+    symbol = base.imageWithSymbolConfiguration_(config) or base
+    w, h = symbol.size().width, symbol.size().height
+    scale = min(1.0, (size - 6.0) / max(w, h, 1.0))
+    w, h = w * scale, h * scale
+    rect = NSMakeRect((size - w) / 2.0, (size - h) / 2.0, w, h)
+    image = NSImage.alloc().initWithSize_(NSMakeSize(size, size))
+    image.lockFocus()
+    symbol.drawInRect_(rect)
+    NSColor.whiteColor().set()
+    AppKit.NSRectFillUsingOperation(rect, AppKit.NSCompositingOperationSourceAtop)
+    image.unlockFocus()
+    image.setTemplate_(False)
+    return image
+
+
 def _render_centered_glyph(text, point, size):
+    if text.startswith("sf:"):
+        name, _, fallback = text[3:].partition("|")
+        try:
+            image = _symbol_image(name, point, size)
+        except Exception:
+            image = None
+        if image is not None:
+            return image
+        text = fallback or "?"
     font = NSFont.systemFontOfSize_weight_(point, NSFontWeightHeavy)
     attrs = {NSForegroundColorAttributeName: NSColor.whiteColor(),
              NSFontAttributeName: font}
@@ -274,7 +306,9 @@ class CloseButton(NSButton):
         if self._label == text:
             return
         self._label = text
-        if text in _GLYPH_POINTS:
+        if text.startswith("sf:"):
+            point = 13.0
+        elif text in _GLYPH_POINTS:
             point = _GLYPH_POINTS[text]
         elif text in _SYMBOL_GLYPHS:
             point = 17.0
