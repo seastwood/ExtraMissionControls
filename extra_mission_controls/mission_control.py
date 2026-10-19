@@ -58,6 +58,12 @@ from PyObjCTools import AppHelper
 from . import ax, ui, windows
 
 _DOZE_INTERVAL = 5.0     # detect poll while the displays sleep (self-heals wake)
+_WATCHDOG_INTERVAL = 1.0  # detect poll while MC is up: only checks sync is alive
+_SYNC_STALL = 3.0         # no sync tick for this long while active => reset
+_SYNC_ERRORS_MAX = 30     # consecutive failing sync ticks => reset
+# Errors are always appended here (rare, so it costs nothing in normal use):
+# the built app has no Terminal, and a silent failure looked like EMC "dying".
+_ERROR_LOG = os.path.expanduser("~/Library/Logs/ExtraMissionControls.log")
 _DETECT_INTERVAL = 0.15   # Mission Control open/close detection (was 0.25;
                           # tightened with its tolerance so the buttons appear
                           # sooner after MC opens — the check is one ~0.1ms
@@ -397,6 +403,8 @@ class MissionControlButtons(NSObject):
         self._sync_interval = 0.0   # current sync cadence (fast until settled)
         self._timer = None
         self._dozing = False
+        self._last_sync_tick = 0.0
+        self._sync_errors = 0
         self._sync_timer = None
         self._hover_timer = None
         self._screen_height = None
@@ -646,6 +654,19 @@ class MissionControlButtons(NSObject):
 
     # -- Mission Control detection -------------------------------------------
 
+    @objc.python_method
+    def _report_exception(self, where):
+        text = "%s %s\n%s" % (time.strftime("%Y-%m-%d %H:%M:%S"), where,
+                              traceback.format_exc())
+        print(text)
+        try:
+            if os.path.exists(_ERROR_LOG) and os.path.getsize(_ERROR_LOG) > 512 * 1024:
+                os.replace(_ERROR_LOG, _ERROR_LOG + ".old")
+            with open(_ERROR_LOG, "a") as fh:
+                fh.write(text + "\n")
+        except OSError:
+            pass
+
     def tick_(self, timer):
         try:
             if self._dozing:
@@ -655,13 +676,20 @@ class MissionControlButtons(NSObject):
                 return
             self._do_tick()
         except Exception:
-            traceback.print_exc()
+            self._report_exception("detect tick")
 
     @objc.python_method
     def _do_tick(self):
         if self._active:
-            # syncTick (10 Hz) owns liveness while Mission Control is up;
-            # walking the Dock's tree here too would just double the AX load.
+            # syncTick (10 Hz) owns liveness while Mission Control is up; this
+            # slow tick only makes sure it is still running. A session whose
+            # sync stopped (an error mid-activation, a lost timer) left EMC
+            # "active" with nothing driving it — dead until relaunched.
+            timer = self._sync_timer
+            if (timer is None or not timer.isValid()
+                    or time.time() - self._last_sync_tick > _SYNC_STALL):
+                print("Extra Mission Controls: watchdog reset a stalled session")
+                self._deactivate()
             return
         # Idle path: a single WindowServer query; only touch the Mission
         # Control AX tree (Dock, or WindowManager on macOS 27) when Mission
@@ -675,11 +703,23 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _activate(self, group):
+        try:
+            self._activate_session(group)
+        except Exception:
+            # Never leave a half-started session behind: back to idle, and the
+            # detect poll picks Mission Control up again next tick.
+            self._report_exception("activate")
+            self._deactivate()
+
+    @objc.python_method
+    def _activate_session(self, group):
         self._active = True
         self._activated_at = time.time()
+        self._last_sync_tick = time.time()
+        self._sync_errors = 0
         # The idle detect poll has nothing to do while MC is up (syncTick owns
-        # liveness); parking it saves ~7 no-op Python wakeups a second.
-        self._stop_detect_timer()
+        # liveness), so it slows to a 1 Hz watchdog.
+        self._start_detect_timer(_WATCHDOG_INTERVAL)
         self._mc_group = group  # cached; syncTick revalidates with one AX call
         ax.pinned.clear()  # last session's same-title pins have been applied
         _geom_log("ACTIVATE %.3f host=%s backdrop=%s"
@@ -796,6 +836,7 @@ class MissionControlButtons(NSObject):
                 "applyDeferredAppCloses", None, 0.5)
 
     def syncTick_(self, timer):
+        self._last_sync_tick = time.time()
         try:
             if not self._active:
                 return
@@ -920,8 +961,13 @@ class MissionControlButtons(NSObject):
             # Re-arm the watchdog against the state just rendered.
             self._watch_ids = watch_ids
             self._watch_sig = ax.windows_alive_signature(watch_ids)
+            self._sync_errors = 0
         except Exception:
-            traceback.print_exc()
+            self._sync_errors = getattr(self, "_sync_errors", 0) + 1
+            if self._sync_errors in (1, _SYNC_ERRORS_MAX):
+                self._report_exception("sync tick (#%d)" % self._sync_errors)
+            if self._sync_errors >= _SYNC_ERRORS_MAX and self._active:
+                self._deactivate()  # stuck failing: reset rather than linger
 
     @objc.python_method
     def _sync(self, group):
