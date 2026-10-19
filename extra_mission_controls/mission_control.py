@@ -371,6 +371,13 @@ _PANEL_SHARING = (NSWindowSharingReadOnly if ax._macos_major() >= 27
                   else NSWindowSharingNone)
 
 
+
+def _in_rect(x, y, rect):
+    if not rect:
+        return False
+    rx, ry, rw, rh = rect
+    return rx <= x <= rx + rw and ry <= y <= ry + rh
+
 class MissionControlButtons(NSObject):
     """Polls the Dock for Mission Control and manages the ✕ button panels."""
 
@@ -1900,6 +1907,18 @@ class MissionControlButtons(NSObject):
                 self._bar_burst_until = time.time() + _BAR_BURST
                 self._watch_sig = None
                 self._set_sync_interval(_SYNC_INTERVAL_FAST)
+        if self._menu_open and self._menu_kind == "dock":
+            # Sliding along the Dock with a bubble up moves the bubble to the
+            # icon now under the pointer right away, like a menu bar.
+            other = self._dock_item_at(x, y_top)
+            if (other is not None and other["title"] != self._menu_title
+                    and not _in_rect(x, y_top, self._menu_panel_rect)):
+                self._close_menu()
+                self._dock_latched = None
+                self._dock_hover = other["title"]
+                self._dock_hover_since = time.time() - _QUIT_HOVER_DELAY
+                self._update_dock_hover(x, y_top)
+                return
         if self._menu_open:
             # Highlight the quit menu's hovered row; keep the buttons quiet.
             row = self._menu_row_at(x, y_top)
@@ -2156,6 +2175,14 @@ class MissionControlButtons(NSObject):
     # -- Dock overlay ----------------------------------------------------------
 
     @objc.python_method
+    def _dock_item_at(self, x, y):
+        for item in self._dock_items or []:
+            if (item["x"] <= x <= item["x"] + item["width"]
+                    and item["y"] <= y <= item["y"] + item["height"]):
+                return item
+        return None
+
+    @objc.python_method
     def _update_dock_hover(self, x, y):
         """Hovering a running app's Dock icon in Mission Control opens a small
         Close / Force Quit menu above it after the usual dwell."""
@@ -2166,12 +2193,7 @@ class MissionControlButtons(NSObject):
                 self._dock_items = ax.dock_app_items()
             except Exception:
                 self._dock_items = []
-        item = None
-        for candidate in self._dock_items:
-            if (candidate["x"] <= x <= candidate["x"] + candidate["width"]
-                    and candidate["y"] <= y <= candidate["y"] + candidate["height"]):
-                item = candidate
-                break
+        item = self._dock_item_at(x, y)
         key = item["title"] if item is not None else None
         if key != self._dock_latched:
             self._dock_latched = None
