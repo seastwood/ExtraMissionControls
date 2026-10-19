@@ -141,6 +141,10 @@ _SCENE_DEAD_TICKS_MAX = 90
 _SCENE_CLOSED_TICKS_MAX = 900
 _BUTTON_INSET = 4.0
 _BUTTON_GAP = 5.0         # spacing between the traffic-light-style buttons
+# Show Desktop button: bottom-right of the Dock's display, just above the Dock
+# (or the screen edge), inset clear of the hot corner.
+_DESKTOP_MARGIN = 16.0
+_DOCK_PAD = 10.0          # the Dock's backdrop reaches a little above its icons
 _MIN_BUTTON_SIZE = 14.0   # shrink ✕ on collapsed Spaces Bar tiles
 _DEBUG = bool(os.environ.get("EMC_DEBUG"))
 # When EMC_DEBUG is set, also append to this file so geometry can be captured
@@ -444,6 +448,7 @@ class MissionControlButtons(NSObject):
         self._no_max_titles = set()    # thumbnails whose window can't maximize
         self._dock_items = []          # running apps' Dock icons (in MC)
         self._dock_items_at = 0.0
+        self._desktop_tile = None      # Show Desktop button tile (per MC session)
         self._dock_hover = None        # Dock icon under the cursor (title)
         self._dock_hover_since = 0.0
         self._dock_latched = None      # icon whose menu just closed: no reopen
@@ -759,6 +764,7 @@ class MissionControlButtons(NSObject):
             self.performSelector_withObject_afterDelay_(
                 "applyDockActions", None, 0.35)
         self._dock_items_at = 0.0
+        self._desktop_tile = None
         if self._deferred_app_closes:
             # Un-fullscreened apps: close their main window by name once MC is
             # gone and the window has un-parked (applyDeferredAppCloses retries).
@@ -1225,6 +1231,12 @@ class MissionControlButtons(NSObject):
                 targets.append(("quit",
                                 self._slot(thumb, slot, "⏻", ui.HOVER_PURPLE)))
 
+        # Show Desktop, alone in the bottom-right corner above the Dock.
+        if thumbs_still or gliding:
+            desktop = self._desktop_tile_for()
+            if desktop is not None:
+                targets.append(("desktop", desktop))
+
         # Dock icons with a pending Quit / Force Quit (the Dock overlay): dim the
         # icon with the action's glyph and float ↺ on it to take it back — the
         # visible "this happens when you leave Mission Control".
@@ -1393,6 +1405,47 @@ class MissionControlButtons(NSObject):
                     and min(m["y"] for m in members) >= top):
                 settled.extend(members)
         return settled
+
+    @objc.python_method
+    def _desktop_tile_for(self):
+        """The Show Desktop button's tile: bottom-right of the display holding
+        the Dock, above a bottom Dock / left of a right-side one. Computed once
+        per Mission Control session (once the overview has settled) so it never
+        moves."""
+        if self._desktop_tile is not None:
+            return self._desktop_tile
+        if not self._dock_items_at:
+            self._dock_items_at = time.time()
+            try:
+                self._dock_items = ax.dock_app_items()
+            except Exception:
+                self._dock_items = []
+        items = self._dock_items or []
+        screens = self._screen_rects or [
+            (0.0, 0.0, self._screen_width or 0.0, self._screen_height or 0.0)]
+        screen = self._screen_for(items[0]) if items else None
+        if screen is None:
+            screen = next((r for r in screens if r[0] == 0 and r[1] == 0),
+                          screens[0])
+        sx, sy, sw, sh = screen
+        right, bottom = sx + sw, sy + sh
+        on = [i for i in items if self._screen_for(i) == screen]
+        if on:
+            xs = [i["x"] for i in on]
+            ys = [i["y"] for i in on]
+            if max(ys) - min(ys) <= max(xs) - min(xs):   # a row: bottom Dock
+                bottom = min(bottom, min(ys) - _DOCK_PAD)
+            elif min(xs) > sx + sw / 2.0:                # right-side Dock
+                right = min(right, min(xs) - _DOCK_PAD)
+        size = ui.CLOSE_BUTTON_SIZE
+        self._desktop_tile = {
+            "title": "Show Desktop", "label": "▭", "hover": ui.HOVER_BLUE,
+            "slot": 0,
+            "x": right - _DESKTOP_MARGIN - size - _BUTTON_INSET,
+            "y": bottom - _DESKTOP_MARGIN - size - _BUTTON_INSET,
+            # tall enough that _sync_panels gives it the full button size
+            "width": size + 2 * _BUTTON_INSET, "height": 60.0}
+        return self._desktop_tile
 
     @objc.python_method
     def _screen_for(self, tile):
@@ -2831,6 +2884,9 @@ class MissionControlButtons(NSObject):
             # Take back a pending window action; its buttons return next frame.
             self._cancel_deferred_action(title)
             return
+        if kind == "desktop":
+            self._show_desktop()
+            return
         _geom_log("CLICK %s on %r" % (kind, title))
         if kind in ("fullscreen", "unfullscreen", "makefullscreen", "splitall"):
             # Each of these switches spaces / runs a full-screen animation and
@@ -3451,6 +3507,36 @@ class MissionControlButtons(NSObject):
         ax.press_element(element)
         self.performSelector_withObject_afterDelay_(
             "finishPendingClose", None, 0.6)
+
+    @objc.python_method
+    def _show_desktop(self):
+        """Leave Mission Control into Show Desktop. Ask the Dock directly
+        first; if Mission Control is still up a moment later, close it and ask
+        again once it's gone."""
+        self._latch_exit()
+        sent = ax.show_desktop()
+        _geom_log("DESKTOP sent=%s (in MC)" % sent)
+        self._desktop_wait = 0
+        self.performSelector_withObject_afterDelay_(
+            "showDesktopCheck", None, 0.6)
+
+    def showDesktopCheck(self):
+        if ax.mission_control_group() is None:
+            return  # it took
+        _geom_log("DESKTOP still in MC: closing it first")
+        subprocess.Popen(["open", "-b", "com.apple.exposelauncher"])
+        self.performSelector_withObject_afterDelay_(
+            "showDesktopAfterExit", None, 0.15)
+
+    def showDesktopAfterExit(self):
+        if ax.mission_control_group() is not None:
+            self._desktop_wait += 1
+            if self._desktop_wait < 20:
+                self.performSelector_withObject_afterDelay_(
+                    "showDesktopAfterExit", None, 0.1)
+            return
+        sent = ax.show_desktop()
+        _geom_log("DESKTOP sent=%s (after exit)" % sent)
 
     @objc.python_method
     def _reopen_mission_control(self, delay):

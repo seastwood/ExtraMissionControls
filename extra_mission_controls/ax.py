@@ -1069,6 +1069,69 @@ def quit_pid(pid):
     return False
 
 
+def _core_dock_notify(name):
+    """Post a Dock notification through the private CoreDockSendNotification
+    (what the Show Desktop gesture and hot corner use). Returns False if the
+    symbol can't be found."""
+    import ctypes
+    import objc
+    from Foundation import NSString
+    for path in ("/System/Library/Frameworks/ApplicationServices.framework/"
+                 "Frameworks/HIServices.framework/HIServices",
+                 "/System/Library/Frameworks/ApplicationServices.framework/"
+                 "ApplicationServices"):
+        try:
+            fn = ctypes.CDLL(path).CoreDockSendNotification
+        except (OSError, AttributeError):
+            continue
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        fn.restype = None
+        fn(objc.pyobjc_id(NSString.stringWithString_(name)), None)
+        return True
+    return False
+
+
+def _show_desktop_hotkey():
+    """The user's Show Desktop shortcut (symbolic hot key 36, F11 by default)
+    as (keycode, flags), or None when it's turned off."""
+    from CoreFoundation import CFPreferencesCopyAppValue
+    keys = CFPreferencesCopyAppValue("AppleSymbolicHotKeys",
+                                     "com.apple.symbolichotkeys") or {}
+    entry = keys.get("36") or keys.get(36)
+    if entry is None:
+        return 103, 0x800000  # never customised: F11 (fn)
+    if not entry.get("enabled", True):
+        return None
+    params = (entry.get("value") or {}).get("parameters") or ()
+    if len(params) < 3:
+        return None
+    return int(params[1]), int(params[2])
+
+
+def show_desktop(method="dock"):
+    """Toggle Show Desktop. `method` 'dock' posts the Dock notification (falls
+    back to the shortcut if unavailable); 'key' presses the user's Show Desktop
+    shortcut. Returns True if something was sent."""
+    if method == "dock":
+        try:
+            if _core_dock_notify("com.apple.showdesktop.awake"):
+                return True
+        except Exception:
+            pass
+    try:
+        hotkey = _show_desktop_hotkey()
+    except Exception:
+        hotkey = (103, 0x800000)
+    if hotkey is None:
+        return False
+    keycode, flags = hotkey
+    for down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(None, keycode, down)
+        Quartz.CGEventSetFlags(event, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+    return True
+
+
 def close_all_windows(pid):
     """Press the close button of every window the app reports. Returns how
     many were pressed (apps report only the current space's windows)."""

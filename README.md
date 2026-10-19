@@ -63,6 +63,9 @@ Mission Control, so the overview never breaks.
   to take it back). macOS may ask for *Input Monitoring* permission the first
   time; without it everything else still works
 - **Middle-click** a window thumbnail to close it
+- **Show Desktop**: a **▭** button sits alone in the bottom-right corner,
+  just above the Dock — click it to leave Mission Control straight to the
+  desktop (no gesture needed)
 - **Dock bubble**: in Mission Control, rest the pointer on a running app's
   Dock icon for a menu to **Close All Windows**, **Quit**, or **Force Quit**
   — with the app's name as the caption, sitting over the Dock's own name
