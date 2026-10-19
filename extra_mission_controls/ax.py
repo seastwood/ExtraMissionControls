@@ -322,25 +322,6 @@ _PULSE_SKIP_OWNERS = {"Dock", "WindowManager", "Window Server", "Control Center"
 pulse_owners = {}  # debug: window number -> (owner, w, h)
 
 
-def small_system_windows():
-    """Debug: on-screen windows owned by system processes (any layer) that
-    are small enough to be a control — (owner, layer, x, y, w, h, alpha)."""
-    out = []
-    for entry in Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
-        owner = entry.get(Quartz.kCGWindowOwnerName)
-        if owner not in _PULSE_SKIP_OWNERS:
-            continue
-        b = entry.get(Quartz.kCGWindowBounds) or {}
-        w, h = b.get("Width", 0), b.get("Height", 0)
-        if w > 120 or h > 120:
-            continue
-        out.append((owner, entry.get(Quartz.kCGWindowLayer, 0),
-                    round(b.get("X", 0)), round(b.get("Y", 0)), round(w), round(h),
-                    round(float(entry.get(Quartz.kCGWindowAlpha, 1.0)), 2)))
-    return sorted(out)
-
-
 def mission_control_pulse(exclude_pid):
     """(present, real_window_sig, watch_ids) from ONE WindowServer query —
     the sync tick's per-frame heartbeat. `present` is the backdrop rule.
@@ -929,21 +910,6 @@ def _action_names(element):
         return list(names or []) if err == AX.kAXErrorSuccess else []
     except Exception:
         return []
-
-
-def describe_actions(element, depth=0):
-    """Debug: an element's actions plus its children's (role, subrole,
-    title/description, actions), two levels down."""
-    parts = ["actions=%s" % _action_names(element)]
-    if depth < 2:
-        for child in _attribute(element, AX.kAXChildrenAttribute) or []:
-            parts.append("[%s/%s %r %r %s]" % (
-                _attribute(child, AX.kAXRoleAttribute),
-                _attribute(child, AX.kAXSubroleAttribute),
-                _attribute(child, AX.kAXTitleAttribute),
-                _attribute(child, AX.kAXDescriptionAttribute),
-                describe_actions(child, depth + 1)))
-    return " ".join(parts)
 
 
 def describe_mc_tree(group, max_depth=4):

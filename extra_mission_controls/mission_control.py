@@ -353,14 +353,12 @@ _CORNER_PROBE_SIZE = 4.0
 # window joining/leaving the desktop and re-lays out the whole overview on
 # each click. All-spaces panels are ignored by its layout.
 _PANEL_SPACES = NSWindowCollectionBehaviorCanJoinAllSpaces
-# macOS 27: use the native Spaces Bar control. Direct AXFullScreen writes
-# can report success while leaving the window visually broken.
-_NATIVE_FS_DROP = ax._macos_major() >= 27
-_NATIVE_BUTTON_OFFSET = 2.0
-_NATIVE_REVEAL_DELAY = 0.7
-# Our ✕ on a full-screen tile appears a beat after macOS reveals its button.
-_CLOSE_REVEAL_DELAY = 0.85
-_BAR_BUTTONS = not _NATIVE_FS_DROP   # Spaces Bar tile buttons (off on macOS 27)
+_MACOS_27 = ax._macos_major() >= 27
+# Spaces Bar tile buttons: through macOS 26 only. On macOS 27 the only way to
+# act on a full-screen tile without leaving Mission Control is macOS's own
+# hover-only exit button, which is invisible to AX and window lists, so a
+# click on it can't be guaranteed to land (a miss opens the app).
+_BAR_BUTTONS = not _MACOS_27
 # Identify only our posted mouse events. A time-based exemption also let real
 # mouse-up events through, leaving a consumed button's release armed and
 # swallowing the next desktop click's release instead.
@@ -444,13 +442,7 @@ class MissionControlButtons(NSObject):
         # exit, by name with retries while the window un-parks.
         self._deferred_app_closes = []
         self._last_thumbs = []
-        self._tile_hover = None
-        self._tile_hover_since = 0.0
-        self._close_revealed = False
         self._pulse_prev_dbg = None
-        self._last_spaces = []
-        self._native_job = None
-        self._pending_unfs_as_window = False
         self._fs_busy_until = 0.0      # one full-screen transition at a time
         self._no_max_titles = set()    # thumbnails whose window can't maximize
         self._dock_items = []          # running apps' Dock icons (in MC)
@@ -950,16 +942,28 @@ class MissionControlButtons(NSObject):
             self._latch_exit()
         # Wait out the space-switch animation, then capture whatever
         # fullscreen windows just became visible to AX.
-        self.performSelector_withObject_afterDelay_("rescanRegistry", None, 0.6)
+        self._schedule_rescan(0.6)
 
     def appActivated_(self, notification):
         # New/changed windows almost always coincide with an app activation;
-        # refresh the held references then (coalesced by _REGISTRY_MIN_GAP).
-        self.performSelector_withObject_afterDelay_("rescanRegistry", None, 0.8)
+        # refresh the held references then. Debounced: ⌘-Tabbing through
+        # several apps ends in ONE scan, after the switching stops.
+        self._schedule_rescan(0.8)
+
+    @objc.python_method
+    def _schedule_rescan(self, delay):
+        NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+            self, "rescanRegistry", None)
+        self.performSelector_withObject_afterDelay_("rescanRegistry", None, delay)
 
     def rescanRegistry(self):
-        if not self._active:
-            self._scan_registry()
+        if self._active:
+            return
+        wait = self._last_registry_scan + _REGISTRY_MIN_GAP - time.time()
+        if self._last_registry_scan and wait > 0:
+            self._schedule_rescan(wait)  # don't drop it: run when the gap ends
+            return
+        self._scan_registry()
 
     @objc.python_method
     def _scan_registry(self):
@@ -1018,10 +1022,7 @@ class MissionControlButtons(NSObject):
         # tiles, and the mc.windows child count — instead of three.
         thumbs, spaces, window_count = ax.mission_control_snapshot(group)
         self._log_geometry(group, thumbs, spaces)
-        if _DEBUG:
-            self._log_tile_actions(spaces)
         self._last_thumbs = thumbs
-        self._last_spaces = spaces
         _write_diag(group, thumbs, spaces)
 
         # A full-screen app closed from the Spaces Bar un-fullscreens in place
@@ -1032,12 +1033,6 @@ class MissionControlButtons(NSObject):
         if self._pending_unfs_baseline is not None:
             if now < self._pending_unfs_expires:
                 for title in current_titles - self._pending_unfs_baseline:
-                    if self._pending_unfs_as_window:
-                        self._pending_unfs_as_window = False
-                        self._pending_unfs_baseline = None
-                        _geom_log("CLOSE-FULLSCREEN dropped as %r -> deferred close" % title)
-                        self._defer_window_action("close", title)
-                        break
                     if title not in self._marked:
                         self._marked[title] = "✕"
                         if self._pending_unfs_app is not None:
@@ -1314,22 +1309,11 @@ class MissionControlButtons(NSObject):
                 targets.append(("splitall",
                                 self._slot(space, 0, "✕%d" % len(apps))))
             elif self._is_fullscreen_tile(space):
-                # No ❏ any more: macOS's own exit-full-screen button (top-left
-                # of the preview, on hover) does that. Our ✕ appears only once
-                # the pointer has rested on the tile long enough for macOS to
-                # have revealed that button — the ✕ presses it, so it can
-                # never click before it's there — and sits top-RIGHT, clear of
-                # it.
-                if _NATIVE_FS_DROP and not self._close_revealed_for(space["title"]):
-                    continue
-                size = min(ui.CLOSE_BUTTON_SIZE,
-                           max(_MIN_BUTTON_SIZE, space["height"] * 0.45))
-                corner = dict(space)
-                corner["x"] = (space["x"] + space["width"] - size
-                               - 2 * _BUTTON_INSET)
-                targets.append(("fullscreen", self._slot(corner, 0)))
+                targets.append(("fullscreen", self._slot(space, 0)))
             else:
                 continue
+            targets.append(("unfullscreen",
+                            self._slot(space, 1, "❏", ui.HOVER_GREEN)))
         self._trace_gate("full emit n=%d" % len(targets), window_count, spaces, thumbs)
         return targets, marks
 
@@ -1359,13 +1343,6 @@ class MissionControlButtons(NSObject):
         related = [(a, t) for a, t in self._deferred_actions
                    if ax.titles_related(title, t)]
         return related[0] if len(related) == 1 else None
-
-    @objc.python_method
-    def _close_revealed_for(self, title):
-        """True while the pointer has rested on this Spaces Bar tile long
-        enough that macOS shows its own exit-full-screen button."""
-        return (self._tile_hover == title
-                and time.time() - self._tile_hover_since >= _CLOSE_REVEAL_DELAY)
 
     @objc.python_method
     def _slot(self, tile, slot, label=None, hover=None):
@@ -1557,22 +1534,6 @@ class MissionControlButtons(NSObject):
                  if big else "thumb(none)")
         _geom_log("GATE %.3f wc=%d pa=%d %s %s -> %s"
                   % (time.time() % 1000, wc, pa, bar, thumb, decision))
-
-    @objc.python_method
-    def _log_tile_actions(self, spaces):
-        """Debug: every Spaces Bar tile's AX actions and children (with their
-        roles, descriptions and actions), logged whenever that changes — e.g.
-        when hovering a tile reveals macOS's own exit-full-screen button."""
-        rows = []
-        for space in spaces:
-            element = space.get("element")
-            if element is None:
-                continue
-            rows.append((space["title"], ax.describe_actions(element)))
-        if rows != getattr(self, "_logged_tile_actions", None):
-            self._logged_tile_actions = rows
-            for title, info in rows:
-                _action_log("TILE %r %s" % (title, info))
 
     @objc.python_method
     def _log_geometry(self, group, thumbs, spaces):
@@ -1808,8 +1769,6 @@ class MissionControlButtons(NSObject):
             # frozen at the settled layout through the whole exit animation.
             # If Mission Control survives (a drag, the '+' button), the layout
             # moves and the latch releases. The event passes through untouched.
-            if self._native_job is not None:
-                self._native_job["user_exit"] = True
             _geom_log("EXIT-HIDE click at (%.0f,%.0f)" % (x, y))
             AppHelper.callAfter(self._latch_exit)
         elif event_type == Quartz.kCGEventRightMouseDown:
@@ -1956,37 +1915,6 @@ class MissionControlButtons(NSObject):
             self._hover_index = None
             self._maybe_autoclose_menu(x, y_top)
             return
-        # Which Spaces Bar tile the real pointer rests on, and since when:
-        # macOS reveals its exit-full-screen button only after a short hover,
-        # and the no-movement click (below) relies on that reveal.
-        tile_under = None
-        for space in self._last_spaces:
-            if (space["x"] <= x <= space["x"] + space["width"]
-                    and space["y"] <= y_top <= space["y"] + space["height"]):
-                tile_under = space["title"]
-                break
-        if tile_under != self._tile_hover:
-            self._tile_hover, self._tile_hover_since = tile_under, time.time()
-            self._close_revealed = False
-            self._watch_sig = None  # re-evaluate the tile buttons now
-        elif (_BAR_BUTTONS and tile_under is not None and not self._close_revealed
-                and time.time() - self._tile_hover_since >= _CLOSE_REVEAL_DELAY):
-            # macOS has revealed its button by now: show our ✕ right away.
-            self._close_revealed = True
-            self._watch_sig = None
-            self._bar_burst_until = time.time() + 0.3
-            self._set_sync_interval(_SYNC_INTERVAL_FAST)
-            if _DEBUG:
-                self._tile_probe_until = time.time() + 1.5
-        if _DEBUG and time.time() < getattr(self, "_tile_probe_until", 0.0):
-            # Debug: small system windows over the Spaces Bar while hovering a
-            # tile — looking for macOS's exit-full-screen button as a window.
-            small = ax.small_system_windows()
-            if small != getattr(self, "_tile_probe_last", None):
-                self._tile_probe_last = small
-                _action_log("TILE-PROBE hover=%r t=%.2f %s"
-                            % (self._tile_hover,
-                               time.time() - self._tile_hover_since, small))
         hit = self._button_index_at(x, y_top)
         # Only message buttons on hover TRANSITIONS — poking all ~26 of them
         # 30 times a second (mostly to say "still not hovered") was a steady
@@ -2209,10 +2137,26 @@ class MissionControlButtons(NSObject):
         return None
 
     @objc.python_method
+    def _near_dock(self, x, y, slop=40.0):
+        items = self._dock_items or []
+        if not items:
+            return True  # nothing read yet (hidden Dock?): keep looking
+        return (min(i["x"] for i in items) - slop <= x
+                <= max(i["x"] + i["width"] for i in items) + slop
+                and min(i["y"] for i in items) - slop <= y
+                <= max(i["y"] + i["height"] for i in items) + slop)
+
+    @objc.python_method
     def _update_dock_hover(self, x, y):
         """Hovering a running app's Dock icon in Mission Control opens a small
         Close / Force Quit menu above it after the usual dwell."""
         now = time.time()
+        # Re-read the Dock (an AX walk) only while the pointer is in the Dock's
+        # area — not every _DOCK_REFRESH for the whole session.
+        if self._dock_items_at and not self._near_dock(x, y):
+            if self._dock_hover is not None:
+                self._dock_hover, self._dock_hover_since = None, 0.0
+            return
         if now - self._dock_items_at > _DOCK_REFRESH:
             self._dock_items_at = now
             try:
@@ -2941,7 +2885,7 @@ class MissionControlButtons(NSObject):
             # then (often) reopens Mission Control. Overlapping them wedged
             # macOS 27's WindowManager (Mission Control stopped opening), so
             # only one runs at a time; extra clicks meanwhile are ignored.
-            if self._native_job is not None or time.time() < self._fs_busy_until:
+            if time.time() < self._fs_busy_until:
                 _geom_log("UNFULLSCREEN busy: ignored %s on %r" % (kind, title))
                 return
             self._fs_busy_until = time.time() + _FS_ACTION_GAP
@@ -3317,7 +3261,7 @@ class MissionControlButtons(NSObject):
         # exit animation is still running wedged WindowManager (Spaces Bar
         # stuck on screen). Wait until Mission Control and its backdrop are
         # fully gone, then a further beat, before touching the window.
-        if _NATIVE_FS_DROP:
+        if _MACOS_27:
             waited = getattr(self, "_fs_make_waits", 0)
             gone = ax.mission_control_group() is None
             if not gone and waited < 20:
@@ -3388,7 +3332,7 @@ class MissionControlButtons(NSObject):
         # macOS 27: no blind green-button click. Traffic lights sit in
         # app-specific spots (inset toolbars), so the click hit other controls
         # and toggled windows twice. One AX retry instead.
-        if _NATIVE_FS_DROP:
+        if _MACOS_27:
             self._fs_make_rect = None
             if ax.element_alive(window):
                 ok = ax.set_fullscreen(window, True)
@@ -3441,9 +3385,6 @@ class MissionControlButtons(NSObject):
             return
         self._panels[index].orderOut_(None)
         self._rects.pop(index, None)
-        if _NATIVE_FS_DROP:
-            self._native_drop(title, element, close=False)
-            return
         if self._drop_to_desktop(title, element):
             _geom_log("UNFULLSCREEN tile=%r" % title)
             self._recently_closed[("acted", title)] = time.time() + 2.5
@@ -3508,9 +3449,6 @@ class MissionControlButtons(NSObject):
         entry = self._fullscreen_registry.get(title)
         self._panels[index].orderOut_(None)
         self._rects.pop(index, None)
-        if _NATIVE_FS_DROP:
-            self._native_drop(title, element, close=True)
-            return
         if self._drop_to_desktop(title, element):
             _geom_log("CLOSE-FULLSCREEN %r: un-fullscreened, deferring close"
                       % title)
@@ -3726,175 +3664,6 @@ class MissionControlButtons(NSObject):
             self._pending_chain_failed(title)
 
     # -- native exit-full-screen (macOS 27) -------------------------------------
-
-    @objc.python_method
-    def _native_drop(self, title, element, close):
-        if self._native_job is not None:
-            return False
-        tile = next((s for s in self._last_spaces if s["title"] == title), None)
-        if tile is None or not self._active:
-            self._fs_busy_until = 0.0
-            self._watch_sig = None
-            return False
-        here = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-        self._native_job = {
-            "title": title, "element": element, "close": close,
-            "restore": (here.x, here.y),
-            "point": (tile["x"] + _NATIVE_BUTTON_OFFSET,
-                      tile["y"] + _NATIVE_BUTTON_OFFSET),
-            "attempt": 1, "layout_waits": 0,
-        }
-        self._recently_closed[("acted", title)] = time.time() + 5.0
-        self._watch_sig = None
-        if close:
-            self._pending_unfs_baseline = set(self._prev_thumb_titles)
-            self._pending_unfs_expires = time.time() + 5.0
-            self._pending_unfs_app = None
-            self._pending_unfs_as_window = True
-        _geom_log("NATIVE-DROP %r close=%s at (%.0f,%.0f)"
-                  % ((title, close) + self._native_job["point"]))
-        if self._tile_hover == title:
-            # The real pointer is on this tile (EMC's buttons let hover through
-            # to it), so macOS is revealing its button there. Once it has had
-            # time to, click it by posting straight to WindowManager — the
-            # pointer never moves. The pointer hop below is the fallback.
-            self._native_job["mode"] = "pid"
-            dwell = time.time() - self._tile_hover_since
-            self.performSelector_withObject_afterDelay_(
-                "nativePidClick", None, max(0.0, _NATIVE_REVEAL_DELAY - dwell))
-        else:
-            self._native_hover()
-        return True
-
-    def nativePidClick(self):
-        job = self._native_job
-        if not job:
-            return
-        if not self._active or job.get("user_exit"):
-            self._finish_native_drop(failed=True)
-            return
-        if self._tile_hover != job["title"]:
-            # The pointer left the tile while we waited (macOS hides its
-            # button then): use the pointer hop instead.
-            _geom_log("NATIVE-DROP %r pointer left tile; hop" % job["title"])
-            job["mode"] = "hid"
-            self._native_hover()
-            return
-        spaces = ax.mission_control_spaces(self._mc_group)
-        tile = next((s for s in spaces if s["title"] == job["title"]), None)
-        if tile is None:
-            self._finish_native_drop(failed=True)
-            return
-        job["point"] = (tile["x"] + _NATIVE_BUTTON_OFFSET,
-                        tile["y"] + _NATIVE_BUTTON_OFFSET)
-        pid = ax._bundle_pid(ax._WINDOW_MANAGER)
-        if pid is None:
-            job["mode"] = "hid"
-            self._native_hover()
-            return
-        x, y = job["point"]
-        for kind in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown,
-                     Quartz.kCGEventLeftMouseUp):
-            event = Quartz.CGEventCreateMouseEvent(
-                None, kind, Quartz.CGPointMake(x, y), Quartz.kCGMouseButtonLeft)
-            Quartz.CGEventSetIntegerValueField(
-                event, Quartz.kCGEventSourceUserData, _SYNTHETIC_MOUSE_TAG)
-            Quartz.CGEventPostToPid(pid, event)
-        _geom_log("NATIVE-DROP %r pid click (no pointer move)" % job["title"])
-        self.performSelector_withObject_afterDelay_("nativeDropVerify", None, 0.8)
-
-    @objc.python_method
-    def _native_post(self, kind):
-        x, y = self._native_job["point"]
-        event = Quartz.CGEventCreateMouseEvent(
-            None, kind, Quartz.CGPointMake(x, y), Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventSetIntegerValueField(
-            event, Quartz.kCGEventSourceUserData, _SYNTHETIC_MOUSE_TAG)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-
-    @objc.python_method
-    def _native_hover(self):
-        # Process-local events don't reliably reveal the native button. A real
-        # hover gets a full reveal interval even if our overlay had hover dwell.
-        self._native_post(Quartz.kCGEventMouseMoved)
-        self.performSelector_withObject_afterDelay_(
-            "nativeDropClick", None, _NATIVE_REVEAL_DELAY)
-
-    @objc.python_method
-    def _native_pointer_at_target(self, job):
-        here = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-        return (abs(here.x - job["point"][0]) <= 3
-                and abs(here.y - job["point"][1]) <= 3)
-
-    def nativeDropClick(self):
-        job = self._native_job
-        if not job:
-            return
-        if not self._active or job.get("user_exit"):
-            self._finish_native_drop(failed=True)
-            return
-        if self._swallow_mouse_up:
-            self.performSelector_withObject_afterDelay_("nativeDropClick", None, 0.05)
-            return
-        if not self._native_pointer_at_target(job):
-            self._finish_native_drop(failed=True)
-            return
-        spaces = ax.mission_control_spaces(self._mc_group)
-        tile = next((s for s in spaces if s["title"] == job["title"]), None)
-        if tile is None:
-            self._finish_native_drop(failed=True)
-            return
-        point = (tile["x"] + _NATIVE_BUTTON_OFFSET,
-                 tile["y"] + _NATIVE_BUTTON_OFFSET)
-        if (self._scene_streak < _SCENE_STREAK_MIN
-                or tile["y"] < 0 or tile["height"] < _MIN_BAR_TILE_HEIGHT
-                or any(abs(a - b) > 1 for a, b in zip(point, job["point"]))):
-            job["layout_waits"] += 1
-            if job["layout_waits"] >= 6:
-                self._finish_native_drop(failed=True)
-                return
-            job["point"] = point
-            self._native_hover()
-            return
-        self._native_post(Quartz.kCGEventMouseMoved)
-        self._native_post(Quartz.kCGEventLeftMouseDown)
-        self._native_post(Quartz.kCGEventLeftMouseUp)
-        self._post_mouse(Quartz.kCGEventMouseMoved, *job["restore"])
-        self.performSelector_withObject_afterDelay_("nativeDropVerify", None, 1.0)
-
-    def nativeDropVerify(self):
-        job = self._native_job
-        if not job:
-            return
-        if not self._active or job.get("user_exit"):
-            self._finish_native_drop(failed=True)
-            return
-        spaces = ax.mission_control_spaces(self._mc_group)
-        still = any(s["title"] == job["title"] for s in spaces)
-        _geom_log("NATIVE-DROP %r attempt=%d still_fullscreen=%s"
-                  % (job["title"], job["attempt"], still))
-        if still and job["attempt"] == 1:
-            job["attempt"] = 2
-            if job.get("mode") == "pid":
-                _geom_log("NATIVE-DROP %r pid click missed; hop" % job["title"])
-                job["mode"] = "hid"
-                here = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-                job["restore"] = (here.x, here.y)
-            self._native_hover()
-            return
-        self._finish_native_drop(failed=still)
-
-    @objc.python_method
-    def _finish_native_drop(self, failed=False):
-        job, self._native_job = self._native_job, None
-        if failed and job is not None:
-            _geom_log("NATIVE-DROP %r stopped; no space-switch fallback" % job["title"])
-            self._recently_closed.pop(("acted", job["title"]), None)
-            if job["close"]:
-                self._pending_unfs_as_window = False
-                self._pending_unfs_baseline = None
-        self._fs_busy_until = 0.0
-        self._watch_sig = None
 
     @objc.python_method
     def _post_mouse(self, kind, x, y):
