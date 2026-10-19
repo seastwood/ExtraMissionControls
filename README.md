@@ -64,9 +64,9 @@ Mission Control, so the overview never breaks.
   time; without it everything else still works
 - **Middle-click** a window thumbnail to close it
 - **Dock bubble**: in Mission Control, rest the pointer on a running app's
-  Dock icon for a menu to **Hide** it, **Close All Windows**, **Quit**, or
-  **Force Quit** — with the app's name as the caption, sitting over the
-  Dock's own name label. The icon dims with the pending action and shows a
+  Dock icon for a menu to **Close All Windows**, **Quit**, or **Force Quit**
+  — with the app's name as the caption, sitting over the Dock's own name
+  label. Clicking the icon itself still opens the app in one click. The icon dims with the pending action and shows a
   **↺** to undo
 - **Open at Login** from the menu-bar dropdown
 - Split View tiles get a single **✕2** button that closes both apps of the

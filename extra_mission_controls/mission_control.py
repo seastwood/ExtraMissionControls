@@ -169,8 +169,8 @@ _MIN_BAR_TILE_HEIGHT = 50.0
 _QUIT_MENU_ACTIONS = ("quit", "forcequit", "kill")
 _ARRANGE_MENU_ACTIONS = ("snapleft", "snapright", "snapmax")
 # Dock overlay menu: graceful quit, force quit.
-_DOCK_MENU_ACTIONS = ("hide", "closeall", "quit", "forcequit")
-_DOCK_GLYPHS = {"hide": "◐", "closeall": "✕", "quit": "⏻", "forcequit": "⏼"}
+_DOCK_MENU_ACTIONS = ("closeall", "quit", "forcequit")
+_DOCK_GLYPHS = {"closeall": "✕", "quit": "⏻", "forcequit": "⏼"}
 # Keyboard shortcuts over a thumbnail in Mission Control (ANSI key codes):
 # W close, M minimize, Q quit the app.
 _SHORTCUT_KEYS = {13: "close", 46: "minimize", 12: "quit"}
@@ -1686,15 +1686,22 @@ class MissionControlButtons(NSObject):
             return event
         if event_type == Quartz.kCGEventLeftMouseDown:
             if self._menu_open:
-                # A click while the quit menu is up: pick its row, or dismiss
-                # (like a real menu, the dismiss click is consumed).
-                self._swallow_mouse_up = True
+                # A click while a menu is up: pick its row, or dismiss. The
+                # Dock bubble opens by itself on hover, so a click outside it
+                # (usually on the Dock icon under it) dismisses it AND goes
+                # through — one click opens the app. Other menus were opened
+                # deliberately and consume their dismiss click like a real menu.
                 row = self._menu_row_at(x, y)
                 if row is not None:
+                    self._swallow_mouse_up = True
                     AppHelper.callAfter(self._menu_pick, row)
-                else:
+                    return None
+                if self._menu_kind != "dock":
+                    self._swallow_mouse_up = True
                     AppHelper.callAfter(self._close_menu)
-                return None
+                    return None
+                self._menu_open = False  # route this click normally below
+                AppHelper.callAfter(self._close_menu)
             index = self._button_index_at(x, y)
             if index is not None:
                 self._swallow_mouse_up = True
@@ -2133,7 +2140,7 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _queue_dock_action(self, action, item):
-        """Hide / close-all / quit / force-quit the app when Mission Control
+        """Close-all / quit / force-quit the app when Mission Control
         exits (acting while it is up leaves ghost thumbnails); mark its
         windows meanwhile."""
         pid = ax.pid_for_bundle(item["bundle"]) if item.get("bundle") else None
@@ -2164,8 +2171,6 @@ class MissionControlButtons(NSObject):
         for action, pid, name in actions:
             if action == "forcequit":
                 ok = ax.force_quit_pid(pid)
-            elif action == "hide":
-                ok = ax.hide_pid(pid)
             elif action == "closeall":
                 ok = ax.close_all_windows(pid) > 0
             else:

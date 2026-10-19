@@ -69,11 +69,9 @@ ARRANGE_MENU_ITEMS = (
 )
 
 
-# Dock overlay (hover a running app's Dock icon in Mission Control): hide the
-# app, close all its windows, quit it gracefully (⌘Q — the app may ask to
-# save) or force-quit it.
+# Dock overlay (hover a running app's Dock icon in Mission Control): close all
+# its windows, quit it gracefully (⌘Q — the app may ask to save) or force-quit it.
 DOCK_MENU_ITEMS = (
-    ("◐", "Hide", HOVER_BLUE),
     ("✕", "Close All Windows", HOVER_RED),
     ("⏻", "Quit", HOVER_PURPLE),
     ("⏼", "Force Quit", HOVER_RED),
