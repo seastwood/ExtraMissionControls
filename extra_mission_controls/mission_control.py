@@ -253,7 +253,7 @@ _ACTION_LOG = os.path.join(
     "emc_actions.log")
 _ACTION_PREFIXES = ("UNFULLSCREEN", "CLOSE-FULLSCREEN", "APPLY-DEFERRED",
                     "NATIVE-DROP",
-                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK", "DOCK", "DESKTOP",
+                    "MAKE-FULLSCREEN", "PANELS", "ARRANGE", "CLICK", "DOCK", "DESKTOP", "PIN",
                     "registry")
 
 
@@ -681,6 +681,7 @@ class MissionControlButtons(NSObject):
         # liveness); parking it saves ~7 no-op Python wakeups a second.
         self._stop_detect_timer()
         self._mc_group = group  # cached; syncTick revalidates with one AX call
+        ax.pinned.clear()  # last session's same-title pins have been applied
         _geom_log("ACTIVATE %.3f host=%s backdrop=%s"
                   % (time.time() % 1000, ax.mission_control_host(group),
                      ax.backdrop_rule_mode()))
@@ -1044,6 +1045,7 @@ class MissionControlButtons(NSObject):
         # One batched walk for everything this frame needs — thumbnails, bar
         # tiles, and the mc.windows child count — instead of three.
         thumbs, spaces, window_count = ax.mission_control_snapshot(group)
+        self._key_duplicates(thumbs)
         self._log_geometry(group, thumbs, spaces)
         self._last_thumbs = thumbs
         _write_diag(group, thumbs, spaces)
@@ -1350,7 +1352,7 @@ class MissionControlButtons(NSObject):
         if glyph is not None:
             return glyph
         related = [g for t, g in self._marked.items()
-                   if ax.titles_related(title, t)]
+                   if self._loosely_same(title, t)]
         return related[0] if len(related) == 1 else None
 
     @objc.python_method
@@ -1364,8 +1366,20 @@ class MissionControlButtons(NSObject):
         if exact:
             return exact[0]
         related = [(a, t) for a, t in self._deferred_actions
-                   if ax.titles_related(title, t)]
+                   if self._loosely_same(title, t)]
         return related[0] if len(related) == 1 else None
+
+    @objc.python_method
+    def _loosely_same(self, title, marked):
+        """A thumbnail inherits a mark made under a different but related
+        title (one a prefix of the other — the Dock shortens titles, and an
+        un-fullscreened window comes back retitled) only when no thumbnail
+        carries the marked title exactly. Otherwise that title belongs to its
+        own thumbnail: Finder's "ExtraMissionControls" is not Terminal's
+        "ExtraMissionControls — Python main.py — 120×30"."""
+        if not ax.titles_related(title, marked):
+            return False
+        return not any(t["title"] == marked for t in self._last_thumbs)
 
     @objc.python_method
     def _slot(self, tile, slot, label=None, hover=None):
@@ -2951,6 +2965,8 @@ class MissionControlButtons(NSObject):
             # No action can resolve an untitled window; queueing one could only
             # ever mis-target (title matching is how actions find windows).
             return
+        if ax.KEY_SEP in title and title not in ax.pinned:
+            self._pin_same_titled(title)
         self._watch_sig = None  # show the scrim on the very next frame
         # One pending action per thumbnail; a later menu pick (e.g. Force Quit
         # after a plain quit) replaces the earlier one.
@@ -2967,6 +2983,54 @@ class MissionControlButtons(NSObject):
                 self._panels[i].orderOut_(None)
                 self._rects.pop(i, None)
         _geom_log("DEFER %s window=%r (applies on MC exit)" % (action, title))
+
+    @objc.python_method
+    def _key_duplicates(self, thumbs):
+        """Thumbnails sharing a title (Terminal windows, untitled documents)
+        get distinct keys "<title><KEY_SEP><n>", numbered in reading order, so
+        marks, scrims and actions stay on the one that was clicked."""
+        groups = {}
+        for thumb in thumbs:
+            if thumb["title"]:
+                groups.setdefault(thumb["title"], []).append(thumb)
+        for title, members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda t: (round((t["y"] + t["height"] / 2.0) / 60.0),
+                                        t["x"] + t["width"] / 2.0))
+            for n, thumb in enumerate(members, 1):
+                thumb["title"] = "%s%s%d" % (title, ax.KEY_SEP, n)
+
+    @objc.python_method
+    def _pin_same_titled(self, key):
+        """Pin every thumbnail of this key's app to its real window. Mission
+        Control keeps the windows' relative layout and shapes, so matching the
+        app's thumbnails against its on-screen windows (equal counts) tells
+        twins apart; the action later resolves the key to exactly that window
+        (ax.pinned). No pin when the counts don't line up — then the usual
+        title matching applies."""
+        base = ax.base_title(key)
+        group = [t for t in self._last_thumbs if ax.base_title(t["title"]) == base]
+        bundle = next((t.get("bundle") for t in group if t.get("bundle")), None)
+        pid = ax.pid_for_bundle(bundle) if bundle else ax.pid_for_title(base)
+        if pid is None:
+            return
+        app_thumbs = ([t for t in self._last_thumbs if t.get("bundle") == bundle]
+                      if bundle else group)
+        windows_ = ax.app_window_rects(pid)
+        if not app_thumbs or len(windows_) != len(app_thumbs):
+            _geom_log("PIN %r: %d thumbnails vs %d windows, not pinned"
+                      % (base, len(app_thumbs), len(windows_)))
+            return
+        order = ax.match_layout(
+            [(t["x"], t["y"], t["width"], t["height"]) for t in app_thumbs],
+            [rect for _, rect in windows_])
+        for thumb, j in zip(app_thumbs, order):
+            if ax.KEY_SEP in thumb["title"]:
+                ax.pinned[thumb["title"]] = (pid, windows_[j][0])
+        _geom_log("PIN %r -> %s" % (base, {k.split(ax.KEY_SEP)[-1]: v[1]
+                                           for k, v in ax.pinned.items()
+                                           if ax.base_title(k) == base}))
 
     @objc.python_method
     def _cancel_deferred_action(self, title):
@@ -2993,7 +3057,7 @@ class MissionControlButtons(NSObject):
         # Window actions queued via _defer_window_action.
         kept = []
         for action, t in self._deferred_actions:
-            if t == title or ax.titles_related(title, t):
+            if t == title or self._loosely_same(title, t):
                 self._marked.pop(t, None)
                 cancelled = True
             else:
@@ -3060,7 +3124,8 @@ class MissionControlButtons(NSObject):
             else:
                 ok = (ax.close_window_by_title(title, pids)
                       or self._press_held_window(title, infos))
-            if not ok and action in ("close", "minimize"):
+            if not ok and action in ("close", "minimize") \
+                    and title not in ax.pinned:  # never a twin's traffic light
                 # AX-opaque window (Steam and other CEF/game windows expose no
                 # close/minimize button): fall back to a synthetic click on the
                 # native traffic light, queued so we can raise then click.
@@ -3137,6 +3202,7 @@ class MissionControlButtons(NSObject):
         title or owner, else a unique prefix relation (the Dock shortens the
         titles it shows, and a window may be owned by a helper process, e.g.
         Steam's visible window belongs to 'Steam Helper')."""
+        title = ax.base_title(title)
         exact = [i for i in infos if title in (i.title, i.owner)]
         if exact:
             return exact[0]
@@ -3239,6 +3305,13 @@ class MissionControlButtons(NSObject):
         slot 1 = close, slot 2 = minimize. Match the thumbnail title to a held
         window: exact title, else a UNIQUE prefix match (the Dock shortens the
         title it shows), else the pid single-window fallback."""
+        if title in ax.pinned:  # a same-titled twin: only its pinned window
+            window = ax.pinned_window(title)
+            attr = (ax.AX.kAXCloseButtonAttribute if slot == 1
+                    else ax.AX.kAXMinimizeButtonAttribute)
+            button = ax._attribute(window, attr) if window is not None else None
+            return button is not None and ax.press_element(button)
+        title = ax.base_title(title)
         entries = [e for es in self._window_registry.values() for e in es]
         for entry in entries:  # exact title
             if entry[0] == title and entry[slot] is not None \
