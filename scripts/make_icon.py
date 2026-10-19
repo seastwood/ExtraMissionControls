@@ -2,7 +2,8 @@
 
 App icon (assets/icon.icns): full-bleed graphite (macOS rounds it) holding
 a 2x2 grid — three grey window tiles and, in the top-left, a
-pink-to-violet ring: Mission Control's windows plus the control EMC adds.
+pink-to-violet mark: Mission Control's windows plus the control EMC adds.
+The mark is an "E" by default; EMC_ICON_MARK=ring draws the original ring.
 
 README image (assets/icon_256.png): the same icon with the macOS rounded
 shape baked in, since GitHub shows it as-is.
@@ -29,6 +30,24 @@ N = 1024 * S              # app-icon canvas (designed on a 1024 grid)
 BODY = (0, 0, 1024, 1024)
 BODY_RADIUS = 0
 TILE, GAP = 350, 64
+MARK = os.environ.get("EMC_ICON_MARK", "E").lower()   # "e" or "ring"
+STROKE = 56  # the mark's line weight (1024 grid)
+
+
+def _e_bars(x1, y1, x2, y2, stroke, scale):
+    """An "E" as four rounded bars (spine + three arms) filling a cell, so it
+    is exactly the size of the window tiles; the ring's line weight, its
+    middle arm a touch shorter."""
+    w, h = (x2 - x1), (y2 - y1)
+    left = x1 + ((x2 - x1) - w) / 2
+    top = y1 + ((y2 - y1) - h) / 2
+    r = stroke / 2
+    bars = [(left, top, left + stroke, top + h),                       # spine
+            (left, top, left + w, top + stroke),                       # top arm
+            (left, top + (h - stroke) / 2, left + w * 0.84,
+             top + (h + stroke) / 2),                                  # middle
+            (left, top + h - stroke, left + w, top + h)]               # bottom
+    return [([v * scale for v in b], r * scale) for b in bars]
 X0 = 512 - (2 * TILE + GAP) / 2
 
 
@@ -102,10 +121,16 @@ def app_icon():
         edge.putalpha(ImageChops.multiply(edge.getchannel("A"), fade))
         img.alpha_composite(edge)
 
-    # The ring: pink -> violet gradient with a soft drop shadow.
+    # The mark: pink -> violet gradient with a soft drop shadow.
     x1, y1, x2, y2 = _cell(0, 0)
-    ring = _mask(lambda d: d.ellipse(_box((x1 + 21, y1 + 21, x2 - 21, y2 - 21)),
-                                     outline=255, width=56 * S))
+    if MARK == "ring":
+        ring = _mask(lambda d: d.ellipse(_box((x1 + 21, y1 + 21, x2 - 21, y2 - 21)),
+                                         outline=255, width=STROKE * S))
+    else:
+        def draw_e(d):
+            for box, radius in _e_bars(x1, y1, x2, y2, STROKE, S):
+                d.rounded_rectangle(box, radius=radius, fill=255)
+        ring = _mask(draw_e)
     _shadow(img, ring, dy=10, blur=12, alpha=120)
     fill = Image.new("RGBA", (N, N), (0, 0, 0, 0))
     fill.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True), (0, 0), ring)
@@ -137,9 +162,13 @@ def tray_icon(px=36):
     for r, c in ((0, 1), (1, 0), (1, 1)):
         d.rounded_rectangle(cell(r, c), radius=3.2 * k, fill=ink)
     x1, y1, x2, y2 = cell(0, 0)
-    inset = 0.6 * k
-    d.ellipse([x1 + inset, y1 + inset, x2 - inset, y2 - inset],
-              outline=ink, width=int(2.6 * k))
+    if MARK == "ring":
+        inset = 0.6 * k
+        d.ellipse([x1 + inset, y1 + inset, x2 - inset, y2 - inset],
+                  outline=ink, width=int(2.6 * k))
+    else:
+        for box, radius in _e_bars(x1 / k, y1 / k, x2 / k, y2 / k, 2.6, k):
+            d.rounded_rectangle(box, radius=radius, fill=ink)
     return img.resize((px, px), Image.LANCZOS)
 
 
