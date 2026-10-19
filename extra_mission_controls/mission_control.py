@@ -57,6 +57,7 @@ from PyObjCTools import AppHelper
 
 from . import ax, ui, windows
 
+_DOZE_INTERVAL = 5.0     # detect poll while the displays sleep (self-heals wake)
 _DETECT_INTERVAL = 0.15   # Mission Control open/close detection (was 0.25;
                           # tightened with its tolerance so the buttons appear
                           # sooner after MC opens — the check is one ~0.1ms
@@ -395,6 +396,7 @@ class MissionControlButtons(NSObject):
         self._mc_group = None   # cached MC tree root (Dock 'mc' / WindowManager)
         self._sync_interval = 0.0   # current sync cadence (fast until settled)
         self._timer = None
+        self._dozing = False
         self._sync_timer = None
         self._hover_timer = None
         self._screen_height = None
@@ -597,14 +599,24 @@ class MissionControlButtons(NSObject):
             self, "screensSlept:", "NSWorkspaceScreensDidSleepNotification", None)
         center.addObserver_selector_name_object_(
             self, "screensWoke:", "NSWorkspaceScreensDidWakeNotification", None)
+        # The screens-wake notice isn't always posted after a full system
+        # sleep (lid closed, long sleep), so any of these also wakes the poll.
+        for name in ("NSWorkspaceDidWakeNotification",
+                     "NSWorkspaceSessionDidBecomeActiveNotification"):
+            center.addObserver_selector_name_object_(
+                self, "screensWoke:", name, None)
 
     @objc.python_method
-    def _start_detect_timer(self):
-        if self._timer is None:
-            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                _DETECT_INTERVAL, self, "tick:", None, True)
-            # Let macOS coalesce the idle wake-ups with other system work.
-            self._timer.setTolerance_(0.05)
+    def _start_detect_timer(self, interval=_DETECT_INTERVAL):
+        timer = self._timer
+        if timer is not None and timer.isValid() \
+                and abs(timer.timeInterval() - interval) < 1e-6:
+            return
+        self._stop_detect_timer()
+        self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            interval, self, "tick:", None, True)
+        # Let macOS coalesce the idle wake-ups with other system work.
+        self._timer.setTolerance_(min(interval * 0.3, 1.0))
 
     @objc.python_method
     def _stop_detect_timer(self):
@@ -615,10 +627,16 @@ class MissionControlButtons(NSObject):
     def screensSlept_(self, note):
         if self._active:
             self._deactivate()
-        self._stop_detect_timer()
+        # Doze rather than stop: a slow tick costs next to nothing, and it
+        # notices the displays are back even if no wake notice ever arrives
+        # (which left EMC dead after a long sleep).
+        self._dozing = True
+        self._start_detect_timer(_DOZE_INTERVAL)
 
     def screensWoke_(self, note):
-        self._start_detect_timer()
+        self._dozing = False
+        if not self._active:
+            self._start_detect_timer()
 
     def stop(self):
         NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(self)
@@ -630,6 +648,11 @@ class MissionControlButtons(NSObject):
 
     def tick_(self, timer):
         try:
+            if self._dozing:
+                if Quartz.CGDisplayIsAsleep(Quartz.CGMainDisplayID()):
+                    return
+                self.screensWoke_(None)  # awake again; no notice came
+                return
             self._do_tick()
         except Exception:
             traceback.print_exc()
