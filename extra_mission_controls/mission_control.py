@@ -144,7 +144,7 @@ _BUTTON_GAP = 5.0         # spacing between the traffic-light-style buttons
 # Show Desktop button: bottom-right of the Dock's display, just above the Dock
 # (or the screen edge), inset clear of the hot corner.
 _DESKTOP_MARGIN = 16.0
-_DOCK_PAD = 10.0          # the Dock's backdrop reaches a little above its icons
+_DOCK_PAD = 14.0          # the Dock's backdrop reaches a little above its icons
 _MIN_BUTTON_SIZE = 14.0   # shrink ✕ on collapsed Spaces Bar tiles
 _DEBUG = bool(os.environ.get("EMC_DEBUG"))
 # When EMC_DEBUG is set, also append to this file so geometry can be captured
@@ -1415,46 +1415,70 @@ class MissionControlButtons(NSObject):
 
     @objc.python_method
     def _desktop_tile_for(self):
-        """The Show Desktop button's tile: bottom-right of the display holding
-        the Dock, above a bottom Dock / left of a right-side one. Computed once
-        per Mission Control session (once the overview has settled) so it never
-        moves."""
+        """The Show Desktop button's tile: always the same spot — bottom-right
+        of the primary display, a Dock's height up (left of a right-side Dock),
+        whether or not the Dock is showing at that moment. The Dock's height is
+        measured from its icons when they're readable and remembered (per icon
+        size), so a hidden or still-sliding Dock can't move the button."""
         if self._desktop_tile is not None:
             return self._desktop_tile
+        sw = self._screen_width or 0.0
+        sh = self._screen_height or 0.0
+        tilesize, orientation = 48.0, "bottom"
+        try:
+            from CoreFoundation import CFPreferencesCopyAppValue
+            tilesize = float(CFPreferencesCopyAppValue("tilesize", "com.apple.dock")
+                             or tilesize)
+            orientation = str(CFPreferencesCopyAppValue("orientation",
+                                                         "com.apple.dock")
+                              or orientation)
+        except Exception:
+            pass
+        band = self._dock_band(tilesize, orientation, sw, sh)
+        right, bottom = sw, sh
+        if orientation == "right":
+            right -= band
+        elif orientation != "left":
+            bottom -= band
+        size = ui.CLOSE_BUTTON_SIZE
+        self._desktop_tile = {
+            "title": "Show Desktop",
+            # a screen with arrows pushing outward — windows swept to the edges
+            "label": "sf:rectangle.arrowtriangle.2.outward@90|▭",
+            "hover": ui.HOVER_BLUE, "slot": 0,
+            "x": right - _DESKTOP_MARGIN - size - _BUTTON_INSET,
+            "y": bottom - _DESKTOP_MARGIN - size - _BUTTON_INSET,
+            # tall enough that _sync_panels gives it the full button size
+            "width": size + 2 * _BUTTON_INSET, "height": 60.0}
+        return self._desktop_tile
+
+    @objc.python_method
+    def _dock_band(self, tilesize, orientation, sw, sh):
+        """How far the Dock reaches in from its screen edge (backdrop included):
+        the largest measured for this icon size, remembered across launches;
+        an estimate from the icon size until the Dock has been seen."""
+        from Foundation import NSUserDefaults
+        defaults = NSUserDefaults.standardUserDefaults()
+        key = "EMCDockBand.%s.%d" % (orientation, int(tilesize))
+        known = float(defaults.floatForKey_(key) or 0.0)
+        measured = 0.0
         if not self._dock_items_at:
             self._dock_items_at = time.time()
             try:
                 self._dock_items = ax.dock_app_items()
             except Exception:
                 self._dock_items = []
-        items = self._dock_items or []
-        screens = self._screen_rects or [
-            (0.0, 0.0, self._screen_width or 0.0, self._screen_height or 0.0)]
-        screen = self._screen_for(items[0]) if items else None
-        if screen is None:
-            screen = next((r for r in screens if r[0] == 0 and r[1] == 0),
-                          screens[0])
-        sx, sy, sw, sh = screen
-        right, bottom = sx + sw, sy + sh
-        on = [i for i in items if self._screen_for(i) == screen]
-        if on:
-            xs = [i["x"] for i in on]
-            ys = [i["y"] for i in on]
-            if max(ys) - min(ys) <= max(xs) - min(xs):   # a row: bottom Dock
-                bottom = min(bottom, min(ys) - _DOCK_PAD)
-            elif min(xs) > sx + sw / 2.0:                # right-side Dock
-                right = min(right, min(xs) - _DOCK_PAD)
-        size = ui.CLOSE_BUTTON_SIZE
-        self._desktop_tile = {
-            "title": "Show Desktop",
-            # a screen with arrows pushing outward — windows swept to the edges
-            "label": "sf:rectangle.arrowtriangle.2.outward@90|▭", "hover": ui.HOVER_BLUE,
-            "slot": 0,
-            "x": right - _DESKTOP_MARGIN - size - _BUTTON_INSET,
-            "y": bottom - _DESKTOP_MARGIN - size - _BUTTON_INSET,
-            # tall enough that _sync_panels gives it the full button size
-            "width": size + 2 * _BUTTON_INSET, "height": 60.0}
-        return self._desktop_tile
+        items = [i for i in (self._dock_items or [])
+                 if 0 <= i["x"] <= sw and 0 <= i["y"] <= sh]
+        if items:
+            if orientation == "right":
+                measured = sw - min(i["x"] for i in items) + _DOCK_PAD
+            elif orientation != "left":
+                measured = sh - min(i["y"] for i in items) + _DOCK_PAD
+        if tilesize * 0.8 <= measured <= tilesize * 3.0 and measured > known:
+            known = measured
+            defaults.setFloat_forKey_(known, key)
+        return known or tilesize * 1.3 + 2 * _DOCK_PAD
 
     @objc.python_method
     def _screen_for(self, tile):
