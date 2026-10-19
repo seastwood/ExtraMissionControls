@@ -673,7 +673,8 @@ def _active_space_ids():
     CGSGetActiveSpace only answers for the display with the menu-bar focus,
     so on its own it filtered out every window on a second display (an iPad
     in Sidecar). Falls back to {CGSGetActiveSpace()} when unavailable."""
-    global _cgs_spaces
+    global _cgs_spaces, _space_types
+    _space_types = {}
     ids = set()
     try:
         import ctypes
@@ -691,6 +692,10 @@ def _active_space_ids():
             if ptr:
                 displays = objc.objc_object(c_void_p=ptr)
                 for display in displays:
+                    for space in display.get("Spaces") or []:
+                        sid = space.get("ManagedSpaceID") or space.get("id64")
+                        if sid is not None and space.get("type") is not None:
+                            _space_types[int(sid)] = int(space["type"])
                     current = display.get("Current Space") or {}
                     space_id = current.get("ManagedSpaceID") or current.get("id64")
                     if space_id:
@@ -705,6 +710,23 @@ def _active_space_ids():
 
 
 _cgs_spaces = None
+_space_types = {}
+
+
+def _fullscreen_thumbnail(thumb, spaces):
+    """Identify full-screen previews by Space, not by app or preview size.
+
+    The same app can have desktop windows and full-screen windows at once.
+    The Space metadata is refreshed by _drop_other_space_thumbs each snapshot.
+    If unavailable, use an exact native full-screen tile title match.
+    """
+    kind = _space_types.get(thumb.get("space"))
+    if kind is not None:
+        return kind == 4  # native full-screen Space (including Split View)
+    title = thumb.get("title")
+    return bool(title and any(s.get("title") == title
+                             and s.get("desc", "").startswith("exit to full screen")
+                             for s in spaces))
 
 
 def _drop_other_space_thumbs(thumbs, spaces):
@@ -875,6 +897,8 @@ def mission_control_snapshot(group):
         before = len(thumbs)
         thumbs = _drop_other_space_thumbs(thumbs, spaces)
         window_count -= before - len(thumbs)
+        for thumb in thumbs:
+            thumb["fullscreen"] = _fullscreen_thumbnail(thumb, spaces)
     return thumbs, spaces, window_count
 
 
@@ -1194,17 +1218,19 @@ def scan_closable_windows():
         if ax_windows:
             visible.add(name)
         entries = []
+        _remember_windows(pid, ax_windows)
         if ax_windows:
             # Re-read this app's windows from scratch (drop closed ones).
             for key in [k for k in window_caps if k[0] == pid]:
                 window_caps.pop(key, None)
                 caps_debug.pop(key, None)
+                window_action_caps.pop(key, None)
         for window in ax_windows:
             close_button = _attribute(window, AX.kAXCloseButtonAttribute)
-            if close_button is None:
-                continue
             title = _attribute(window, AX.kAXTitleAttribute) or ""
             _note_caps(pid, title, window)
+            if close_button is None:
+                continue
             minimize_button = _attribute(window, AX.kAXMinimizeButtonAttribute)
             entries.append((title, close_button, minimize_button))
             if name not in fullscreen and _attribute(window, "AXFullScreen"):
@@ -1219,10 +1245,92 @@ def scan_closable_windows():
 # thumbnails can drop buttons a window can't honour (System Settings has a
 # disabled full-screen button and a fixed width).
 window_caps = {}
+window_refs = {}  # pid -> [(title, retained AX window, window number)]
+window_action_caps = {}  # close/minimize, including windows with no close button
 caps_debug = {}
 
 
+def _remember_windows(pid, windows):
+    if windows:
+        window_refs[pid] = [(_attribute(w, AX.kAXTitleAttribute) or "",
+                             w, ax_window_number(w)) for w in windows]
+
+
+def refresh_front_window_caps():
+    """Bound idle refresh to the foreground app; never poll all apps per frame."""
+    from AppKit import NSWorkspace
+    app = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if app is None:
+        return
+    pid = app.processIdentifier()
+    windows = _ax_windows(pid)
+    _remember_windows(pid, windows)
+    if windows:
+        for cache in (window_caps, window_action_caps):
+            for key in [k for k in cache if k[0] == pid]:
+                cache.pop(key, None)
+        for w in windows:
+            _note_caps(pid, _attribute(w, AX.kAXTitleAttribute) or "", w)
+
+
+def capture_window(title):
+    """Retain an unambiguous window identity while its preview is selected."""
+    pin = pinned.get(title)
+    pid = pin[0] if pin else pid_for_title(title)
+    if pid is None:
+        return None
+    entries = window_refs.get(pid, [])
+    if pin:
+        hits = [e for e in entries if e[2] == pin[1]]
+    elif KEY_SEP in title:
+        return None  # never reduce an unresolved twin to a plain title
+    else:
+        base = base_title(title)
+        hits = [e for e in entries if e[0] == base]
+        if not hits:
+            hits = [e for e in entries if titles_related(base, e[0])]
+        if not hits and len(entries) == 1 and not entries[0][0]:
+            hits = entries
+    if len(hits) != 1:
+        return None
+    return (pid, hits[0][1], hits[0][2])
+
+
+def perform_captured_action(target, action):
+    """Act on the retained window, never a replacement with the same title."""
+    pid, window, number = target
+    if number is not None and ax_window_number(window) != number:
+        return False
+    attr = AX.kAXCloseButtonAttribute if action == "close" else AX.kAXMinimizeButtonAttribute
+    button = _attribute(window, attr)
+    if button is None or _attribute(button, "AXEnabled") is False:
+        return False
+    _foreground_window(window)
+    return press_element(button)
+
+
+def captured_action_state(target, action):
+    """True = observed completion, False = still pending, None = unreadable.
+
+    Do not infer a close from an empty AXWindows list: off-Space apps hide it.
+    """
+    window = target[1]
+    attr = AX.kAXMinimizedAttribute if action == "minimize" else AX.kAXRoleAttribute
+    err, value = AX.AXUIElementCopyAttributeValue(window, attr, None)
+    if action == "close" and err == AX.kAXErrorInvalidUIElement:
+        return True
+    if err != AX.kAXErrorSuccess:
+        return None
+    return bool(value) if action == "minimize" else False
+
+
 def _note_caps(pid, title, window):
+    actions = []
+    for attr in (AX.kAXCloseButtonAttribute, AX.kAXMinimizeButtonAttribute):
+        button = _attribute(window, attr)
+        actions.append(button is not None
+                       and _attribute(button, "AXEnabled") is not False)
+    window_action_caps[(pid, title)] = tuple(actions)
     fs_button = _attribute(window, "AXFullScreenButton")
     can_fs = True
     if fs_button is not None:
@@ -1258,19 +1366,28 @@ def _note_caps(pid, title, window):
 def caps_for(pid, title):
     """(can_fullscreen, can_maximize) for a thumbnail, or (True, True) when
     unknown — never hide a button on a guess."""
+    return _cached_caps_for(window_caps, pid, title)
+
+
+def action_caps_for(pid, title):
+    """Known close/minimize support; unknown windows retain legacy fallbacks."""
+    return _cached_caps_for(window_action_caps, pid, title)
+
+
+def _cached_caps_for(cache, pid, title):
     if pid is None:
         return True, True
     title = base_title(title)
-    caps = window_caps.get((pid, title))
+    caps = cache.get((pid, title))
     if caps is not None:
         return caps
-    related = [c for (p, t), c in window_caps.items()
+    related = [c for (p, t), c in cache.items()
                if p == pid and titles_related(title, t)]
     if len(related) == 1:
         return related[0]
     # Apps whose AX window title is blank (System Settings) can't be matched
     # by title; if the app has just one known window, it's that one.
-    mine = [c for (p, _), c in window_caps.items() if p == pid]
+    mine = [c for (p, _), c in cache.items() if p == pid]
     return mine[0] if len(mine) == 1 else (True, True)
 
 
@@ -1541,26 +1658,39 @@ def titles_related(a, b):
     return a.startswith(b) or b.startswith(a)
 
 
-def close_window_by_title(title, pids):
+def close_window_by_title(title, pids, foreground=False):
     """Find the window matching a Mission Control thumbnail title among the
     given pids and press its close button."""
-    return _press_window_button_by_title(title, pids, AX.kAXCloseButtonAttribute)
+    return _press_window_button_by_title(
+        title, pids, AX.kAXCloseButtonAttribute, foreground)
 
 
-def minimize_window_by_title(title, pids):
+def minimize_window_by_title(title, pids, foreground=False):
     """Find the window matching a thumbnail title among the given pids and
     press its minimize button (apps that report windows during MC)."""
     return _press_window_button_by_title(
-        title, pids, AX.kAXMinimizeButtonAttribute)
+        title, pids, AX.kAXMinimizeButtonAttribute, foreground)
 
 
-def _press_window_button_by_title(title, pids, button_attr):
+def _press_window_button_by_title(title, pids, button_attr, foreground=False):
     """Press a window's close/minimize button, matching the thumbnail title to
     the live window: exact title first, else a UNIQUE prefix match (the Dock
     routinely shortens the title it shows on the thumbnail). Ambiguous prefix
     matches are ignored so the wrong window is never touched."""
     if not title:
         return False
+    if foreground:
+        # Resolve once so raising and pressing refer to the same window.
+        # No timer/sleep: let macOS order the raise before its native action.
+        window = _find_window_by_title(title, pids)
+        if window is None:
+            return False
+        target = _attribute(window, button_attr)
+        if target is None:
+            return False
+        _foreground_window(window)
+        return AX.AXUIElementPerformAction(
+            target, AX.kAXPressAction) == AX.kAXErrorSuccess
     if title in pinned:
         window = pinned_window(title)
         target = _attribute(window, button_attr) if window is not None else None
@@ -1578,7 +1708,7 @@ def _press_window_button_by_title(title, pids, button_attr):
                 exact.append(button)
             elif titles_related(title, window_title):
                 related.append(button)
-    target = exact[0] if exact else (related[0] if len(related) == 1 else None)
+    target = exact[0] if len(exact) == 1 else (related[0] if not exact and len(related) == 1 else None)
     if target is None:
         window = _untitled_window_of(title, pids)
         target = _attribute(window, button_attr) if window is not None else None
@@ -1632,7 +1762,7 @@ def _find_window_by_title(title, pids):
             elif titles_related(title, window_title):
                 related.append(window)
     if exact:
-        return exact[0]
+        return exact[0] if len(exact) == 1 else None
     if len(related) == 1:
         return related[0]
     return _untitled_window_of(title, pids) or _owner_window_for(title)
@@ -1758,6 +1888,11 @@ def focus_window_by_title(title, pids):
     window = _find_window_by_title(title, pids)
     if window is None:
         return None
+    return _foreground_window(window)
+
+
+def _foreground_window(window):
+    """Request foreground ordering without adding an animation delay."""
     err, pid = AX.AXUIElementGetPid(window, None)
     if err != AX.kAXErrorSuccess or not pid:
         return None
