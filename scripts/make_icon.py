@@ -1,15 +1,16 @@
 """Generate the app icon and the menu-bar icon.
 
 App icon (assets/icon.icns): full-bleed graphite (macOS rounds it) holding
-a 2x2 grid — three grey window tiles and, in the top-left, a
-pink-to-violet mark: Mission Control's windows plus the control EMC adds.
-The mark is an "E", with an "M" and a squared "C" on the bottom tiles
-(E-M-C); EMC_ICON_MARK=ring draws the original ring and plain tiles.
+a 2x2 grid of window tiles spelling E-M-C: a gold "E" in the top-left,
+a plain grey tile top-right, and a mid-grey "M" and squared "C" on dark
+bottom tiles. EMC_ICON_COLOR picks another palette for the E (pink, the
+old pink-to-violet, among them); EMC_ICON_MARK=ring draws the original
+ring and plain tiles.
 
 README image (assets/icon_256.png): the same icon with the macOS rounded
 shape baked in, since GitHub shows it as-is.
 
-Menu-bar icon (assets/tray_icon.png): the same grid and ring with no
+Menu-bar icon (assets/tray_icon.png): the same grid and letters with no
 background, drawn as a macOS *template* image (black + alpha) — macOS shows
 it white on a dark menu bar and dark on a light one.
 
@@ -157,7 +158,7 @@ def app_icon():
         edge.putalpha(ImageChops.multiply(edge.getchannel("A"), fade))
         img.alpha_composite(edge)
 
-    # The mark: pink -> violet gradient with a soft drop shadow.
+    # The mark: a gradient from MARK_COLORS with a soft drop shadow.
     x1, y1, x2, y2 = _cell(0, 0)
     if MARK == "ring":
         ring = _mask(lambda d: d.ellipse(_box((x1 + 21, y1 + 21, x2 - 21, y2 - 21)),
