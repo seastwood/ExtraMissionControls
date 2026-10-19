@@ -1352,7 +1352,7 @@ class MissionControlButtons(NSObject):
         if glyph is not None:
             return glyph
         related = [g for t, g in self._marked.items()
-                   if ax.titles_related(title, t)]
+                   if self._loosely_same(title, t)]
         return related[0] if len(related) == 1 else None
 
     @objc.python_method
@@ -1366,8 +1366,20 @@ class MissionControlButtons(NSObject):
         if exact:
             return exact[0]
         related = [(a, t) for a, t in self._deferred_actions
-                   if ax.titles_related(title, t)]
+                   if self._loosely_same(title, t)]
         return related[0] if len(related) == 1 else None
+
+    @objc.python_method
+    def _loosely_same(self, title, marked):
+        """A thumbnail inherits a mark made under a different but related
+        title (one a prefix of the other — the Dock shortens titles, and an
+        un-fullscreened window comes back retitled) only when no thumbnail
+        carries the marked title exactly. Otherwise that title belongs to its
+        own thumbnail: Finder's "ExtraMissionControls" is not Terminal's
+        "ExtraMissionControls — Python main.py — 120×30"."""
+        if not ax.titles_related(title, marked):
+            return False
+        return not any(t["title"] == marked for t in self._last_thumbs)
 
     @objc.python_method
     def _slot(self, tile, slot, label=None, hover=None):
@@ -3045,7 +3057,7 @@ class MissionControlButtons(NSObject):
         # Window actions queued via _defer_window_action.
         kept = []
         for action, t in self._deferred_actions:
-            if t == title or ax.titles_related(title, t):
+            if t == title or self._loosely_same(title, t):
                 self._marked.pop(t, None)
                 cancelled = True
             else:
