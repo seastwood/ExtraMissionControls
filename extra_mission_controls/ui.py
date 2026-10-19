@@ -116,9 +116,10 @@ def _glyph_image(text, point, size=CLOSE_BUTTON_SIZE):
     return image
 
 
-# Labels of the form "sf:<name>|<fallback>" draw that SF Symbol (white),
-# falling back to the plain glyph if the symbol isn't on this system.
-def _symbol_image(name, point, size):
+# Labels of the form "sf:<name>[@<degrees>]|<fallback>" draw that SF Symbol
+# (white, optionally rotated), falling back to the plain glyph if the symbol
+# isn't on this system.
+def _symbol_image(name, point, size, degrees=0.0):
     base = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
     if base is None:
         return None
@@ -131,6 +132,12 @@ def _symbol_image(name, point, size):
     rect = NSMakeRect((size - w) / 2.0, (size - h) / 2.0, w, h)
     image = NSImage.alloc().initWithSize_(NSMakeSize(size, size))
     image.lockFocus()
+    if degrees:
+        turn = AppKit.NSAffineTransform.transform()
+        turn.translateXBy_yBy_(size / 2.0, size / 2.0)
+        turn.rotateByDegrees_(degrees)
+        turn.translateXBy_yBy_(-size / 2.0, -size / 2.0)
+        turn.concat()
     symbol.drawInRect_(rect)
     NSColor.whiteColor().set()
     AppKit.NSRectFillUsingOperation(rect, AppKit.NSCompositingOperationSourceAtop)
@@ -142,8 +149,9 @@ def _symbol_image(name, point, size):
 def _render_centered_glyph(text, point, size):
     if text.startswith("sf:"):
         name, _, fallback = text[3:].partition("|")
+        name, _, degrees = name.partition("@")
         try:
-            image = _symbol_image(name, point, size)
+            image = _symbol_image(name, point, size, float(degrees or 0))
         except Exception:
             image = None
         if image is not None:

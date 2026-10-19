@@ -1448,7 +1448,7 @@ class MissionControlButtons(NSObject):
         self._desktop_tile = {
             "title": "Show Desktop",
             # a screen with arrows pushing outward — windows swept to the edges
-            "label": "sf:rectangle.arrowtriangle.2.outward|▭", "hover": ui.HOVER_BLUE,
+            "label": "sf:rectangle.arrowtriangle.2.outward@90|▭", "hover": ui.HOVER_BLUE,
             "slot": 0,
             "x": right - _DESKTOP_MARGIN - size - _BUTTON_INSET,
             "y": bottom - _DESKTOP_MARGIN - size - _BUTTON_INSET,
