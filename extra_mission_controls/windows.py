@@ -45,10 +45,11 @@ class WindowInfo:
             self.window_id, self.owner, self.title)
 
 
-def list_windows(exclude_pid=None):
+def list_windows(exclude_pid=None, all_spaces=False):
     """Return WindowInfo for every normal window on the current space,
     front-to-back order (same order Mission Control uses as its input)."""
-    options = (Quartz.kCGWindowListOptionOnScreenOnly
+    options = ((Quartz.kCGWindowListOptionAll if all_spaces
+                else Quartz.kCGWindowListOptionOnScreenOnly)
                | Quartz.kCGWindowListExcludeDesktopElements)
     raw = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []
     windows = []

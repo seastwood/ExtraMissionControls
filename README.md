@@ -56,8 +56,9 @@ Mission Control, so the overview never breaks.
 - **Fullscreen apps in the Spaces Bar (top section)**: through macOS 26 they
   get a **✕** that closes the app's window and a **❏** that exits full screen,
   both without leaving Mission Control. On macOS 27 the Spaces Bar has no EMC
-  buttons: use macOS's own exit-full-screen button on the tile, then close the
-  window from its thumbnail.
+  buttons, and fullscreen window previews have no EMC controls either. Use
+  macOS's own exit-full-screen button on the tile, then manage the resulting
+  desktop window from its thumbnail.
 - **Keyboard shortcuts**: point at a window thumbnail and press **W** to close
   it, **M** to minimize it, or **Q** to quit its app (press the same key again
   to take it back). macOS may ask for *Input Monitoring* permission the first

@@ -54,7 +54,9 @@ def frame(c, thumbs, spaces=None, cg=None):
     if cg is not None:
         c._cg_sig = cg
     ax.mission_control_snapshot = lambda group: (thumbs, spaces, 1)
-    return c._collect_targets(object())
+    targets, marks = c._collect_targets(object())
+    # This suite measures window controls; Show Desktop is independent.
+    return [t for t in targets if t[0] != "desktop"], marks
 
 
 def confirm_settle(c):

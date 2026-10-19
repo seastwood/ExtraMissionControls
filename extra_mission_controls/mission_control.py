@@ -444,6 +444,11 @@ class MissionControlButtons(NSObject):
         # [(action, title)] window closes/minimizes queued to run once Mission
         # Control is dismissed (closing in place leaves a ghost thumbnail).
         self._deferred_actions = []
+        self._deferred_retries = {}
+        self._action_targets = {}
+        self._action_started = {}
+        self._action_verifications = []
+        self._caps_refreshed_at = 0.0
         # Synthetic traffic-light clicks for AX-opaque windows (Steam etc.)
         # whose deferred AX close/minimize no-oped — [(action, title, pid, x, y)].
         self._tl_queue = []
@@ -698,6 +703,9 @@ class MissionControlButtons(NSObject):
         if group is not None:
             self._activate(group)
             return
+        if time.monotonic() - self._caps_refreshed_at >= 2.0:
+            self._caps_refreshed_at = time.monotonic()
+            ax.refresh_front_window_caps()
         if self._last_registry_scan == 0.0:
             self._scan_registry()  # first scan / forced post-MC rescan
 
@@ -1091,6 +1099,9 @@ class MissionControlButtons(NSObject):
         # One batched walk for everything this frame needs — thumbnails, bar
         # tiles, and the mc.windows child count — instead of three.
         thumbs, spaces, window_count = ax.mission_control_snapshot(group)
+        # Full-screen previews belong to macOS's native Space controls. Do
+        # not expose desktop actions, scrims, or keyboard targets for them.
+        thumbs = [t for t in thumbs if not t.get("fullscreen")]
         self._key_duplicates(thumbs)
         self._log_geometry(group, thumbs, spaces)
         self._last_thumbs = thumbs
@@ -1288,12 +1299,15 @@ class MissionControlButtons(NSObject):
                 can_fs, can_max = ax.caps_for(pid, thumb["title"])
                 if not can_max:
                     self._no_max_titles.add(thumb["title"])
+                can_close, can_minimize = ax.action_caps_for(pid, thumb["title"])
                 slot = 0
-                targets.append(("window", self._slot(thumb, slot)))
-                slot += 1
-                targets.append(("minimize",
-                                self._slot(thumb, slot, "−", ui.HOVER_YELLOW)))
-                slot += 1
+                if can_close:
+                    targets.append(("window", self._slot(thumb, slot)))
+                    slot += 1
+                if can_minimize:
+                    targets.append(("minimize",
+                                    self._slot(thumb, slot, "−", ui.HOVER_YELLOW)))
+                    slot += 1
                 if can_fs:  # hidden for windows that can't go full screen
                     targets.append(("makefullscreen",
                                     self._slot(thumb, slot, "⤢", ui.HOVER_GREEN)))
@@ -3011,14 +3025,24 @@ class MissionControlButtons(NSObject):
             # No action can resolve an untitled window; queueing one could only
             # ever mis-target (title matching is how actions find windows).
             return
+        can_close, can_minimize = ax.action_caps_for(ax.pid_for_title(title), title)
+        if (action == "close" and not can_close
+                or action == "minimize" and not can_minimize):
+            return
         if ax.KEY_SEP in title and title not in ax.pinned:
             self._pin_same_titled(title)
+        if ax.KEY_SEP in title and title not in ax.pinned:
+            _geom_log("REFUSED ambiguous window %r" % title)
+            return
+        self._action_targets[title] = ax.capture_window(title)
+        self._action_started[title] = time.monotonic()
         self._watch_sig = None  # show the scrim on the very next frame
         # One pending action per thumbnail; a later menu pick (e.g. Force Quit
         # after a plain quit) replaces the earlier one.
         self._deferred_actions = [(a, t) for a, t in self._deferred_actions
                                   if t != title]
         self._deferred_actions.append((action, title))
+        self._deferred_retries.pop(title, None)
         # Show a dim "marked" overlay on this thumbnail instead of its buttons.
         self._marked[title] = {"minimize": "−", "quit": "⏻",
                                "forcequit": "⏼", "kill": "⭘", "snapleft": "◧",
@@ -3107,6 +3131,9 @@ class MissionControlButtons(NSObject):
         for action, t in self._deferred_actions:
             if t == title or self._loosely_same(title, t):
                 self._marked.pop(t, None)
+                self._action_targets.pop(t, None)
+                self._action_started.pop(t, None)
+                self._deferred_retries.pop(t, None)
                 cancelled = True
             else:
                 kept.append((action, t))
@@ -3145,11 +3172,17 @@ class MissionControlButtons(NSObject):
                 "applyDeferredActions", None, 0.4)
             return
         actions, self._deferred_actions = self._deferred_actions, []
-        infos = windows.list_windows(exclude_pid=os.getpid())
+        # MC can return to the full-screen Space it was opened from. Desktop
+        # windows still exist there, but are absent from the on-screen list.
+        infos = windows.list_windows(exclude_pid=os.getpid(), all_spaces=True)
         pids = list({i.pid for i in infos})
         for action, title in actions:
-            if action == "minimize":
-                ok = (ax.minimize_window_by_title(title, pids)
+            target = self._action_targets.get(title)
+            dispatched_at = time.monotonic()
+            if target is not None and action in ("close", "minimize"):
+                ok = ax.perform_captured_action(target, action)
+            elif action == "minimize":
+                ok = (ax.minimize_window_by_title(title, pids, foreground=True)
                       or self._press_held_minimize(title, infos))
             elif action == "quit":
                 # Quit the whole app (⌘Q), by pid — no title/AX-button matching.
@@ -3170,24 +3203,74 @@ class MissionControlButtons(NSObject):
                 self._arrange_queue.append((region, title))
                 ok = True  # deferred to processArrangeQueue
             else:
-                ok = (ax.close_window_by_title(title, pids)
+                ok = (ax.close_window_by_title(title, pids, foreground=True)
                       or self._press_held_window(title, infos))
+            if not ok and action in ("close", "minimize"):
+                attempts = self._deferred_retries.get(title, 0)
+                if attempts < 8:
+                    # Off-Space apps may hide their AX windows until activated.
+                    # Give activation and the Space animation time to finish,
+                    # then resolve the original title again (never click old
+                    # traffic-light coordinates on the fullscreen app).
+                    pid = target[0] if target is not None else ax.pid_for_title(title)
+                    if pid is not None:
+                        if attempts == 0:
+                            ax.activate_pid(pid)
+                        self._deferred_retries[title] = attempts + 1
+                        self._deferred_actions.append((action, title))
+                        continue
+            self._deferred_retries.pop(title, None)
             if not ok and action in ("close", "minimize") \
-                    and title not in ax.pinned:  # never a twin's traffic light
+                    and target is None and title not in ax.pinned:  # never retarget a captured window
                 # AX-opaque window (Steam and other CEF/game windows expose no
                 # close/minimize button): fall back to a synthetic click on the
                 # native traffic light, queued so we can raise then click.
-                info = self._match_window_info(title, infos)
+                info = self._match_window_info(
+                    title, windows.list_windows(exclude_pid=os.getpid()))
                 if info is not None:
                     self._tl_queue.append(
                         (action, title, info.pid, info.x, info.y))
-            _geom_log("APPLY-DEFERRED %s %r -> %s" % (action, title, ok))
+            started = self._action_started.pop(title, dispatched_at)
+            self._action_targets.pop(title, None)
+            _geom_log("ACTION-TIMING %s %r queued=%.3fs dispatch=%.3fs accepted=%s"
+                      % (action, title, dispatched_at - started,
+                         time.monotonic() - dispatched_at, ok))
+            if ok and target is not None and action in ("close", "minimize"):
+                self._action_verifications.append(
+                    (target, action, title, time.monotonic()))
+            elif not ok:
+                print("Extra Mission Controls: could not apply %s to %r" % (action, title))
+        if self._action_verifications:
+            NSObject.cancelPreviousPerformRequestsWithTarget_selector_object_(
+                self, "verifyWindowActions", None)
+            self.performSelector_withObject_afterDelay_("verifyWindowActions", None, 0.1)
+        if self._deferred_actions:
+            self.performSelector_withObject_afterDelay_(
+                "applyDeferredActions", None, 0.2)
         if self._tl_queue:
             self.performSelector_withObject_afterDelay_(
                 "processTrafficLightQueue", None, 0.05)
         if self._arrange_queue and self._arrange_current is None:
             self.performSelector_withObject_afterDelay_(
                 "processArrangeQueue", None, 0.05)
+
+    def verifyWindowActions(self):
+        pending = []
+        for target, action, title, started in self._action_verifications:
+            state = ax.captured_action_state(target, action)
+            elapsed = time.monotonic() - started
+            if state is True:
+                _geom_log("ACTION-VERIFIED %s %r after %.3fs" % (action, title, elapsed))
+            elif elapsed < 2.0:
+                pending.append((target, action, title, started))
+            else:
+                # A save sheet or inaccessible window is not a reason to
+                # repeat a close, dismiss a dialog, or click another window.
+                print("Extra Mission Controls: %s not confirmed for %r (may need attention)"
+                      % (action, title))
+        self._action_verifications = pending
+        if pending:
+            self.performSelector_withObject_afterDelay_("verifyWindowActions", None, 0.2)
 
     def processArrangeQueue(self):
         """Apply the next queued tile: focus its window now, then press the
@@ -3198,7 +3281,7 @@ class MissionControlButtons(NSObject):
         if not self._arrange_queue:
             return
         region, title = self._arrange_queue.pop(0)
-        infos = windows.list_windows(exclude_pid=os.getpid())
+        infos = windows.list_windows(exclude_pid=os.getpid(), all_spaces=True)
         pids = list({i.pid for i in infos})
         pid = ax.focus_window_by_title(title, pids)
         self._arrange_current = (title, pids, pid, region)
