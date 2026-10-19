@@ -3,7 +3,8 @@
 App icon (assets/icon.icns): full-bleed graphite (macOS rounds it) holding
 a 2x2 grid — three grey window tiles and, in the top-left, a
 pink-to-violet mark: Mission Control's windows plus the control EMC adds.
-The mark is an "E" by default; EMC_ICON_MARK=ring draws the original ring.
+The mark is an "E", with an "M" and a squared "C" on the bottom tiles
+(E-M-C); EMC_ICON_MARK=ring draws the original ring and plain tiles.
 
 README image (assets/icon_256.png): the same icon with the macOS rounded
 shape baked in, since GitHub shows it as-is.
@@ -32,23 +33,32 @@ BODY_RADIUS = 0
 TILE, GAP = 350, 64
 MARK = os.environ.get("EMC_ICON_MARK", "E").lower()   # "e" or "ring"
 STROKE = 56  # the mark's line weight (1024 grid)
-
-
-def _e_bars(x1, y1, x2, y2, stroke, scale):
-    """An "E" as four rounded bars (spine + three arms) filling a cell, so it
-    is exactly the size of the window tiles; the ring's line weight, its
-    middle arm a touch shorter."""
-    w, h = (x2 - x1), (y2 - y1)
-    left = x1 + ((x2 - x1) - w) / 2
-    top = y1 + ((y2 - y1) - h) / 2
-    r = stroke / 2
-    bars = [(left, top, left + stroke, top + h),                       # spine
-            (left, top, left + w, top + stroke),                       # top arm
-            (left, top + (h - stroke) / 2, left + w * 0.84,
-             top + (h + stroke) / 2),                                  # middle
-            (left, top + h - stroke, left + w, top + h)]               # bottom
-    return [([v * scale for v in b], r * scale) for b in bars]
+LETTER_INSET = 62   # M / C sit this far inside their tiles
+LETTER_STROKE = 46
 X0 = 512 - (2 * TILE + GAP) / 2
+
+
+def _letter_bars(letter, x1, y1, x2, y2, stroke, scale, inset=0.0):
+    """A blocky letter as rounded bars filling a cell (less `inset`), with
+    the ring's line weight:
+      E — spine + three arms, the middle arm a touch shorter;
+      M — the same E turned 90° clockwise (a top bar with three legs);
+      C — a squared C (spine + top and bottom arms)."""
+    x1, y1, x2, y2 = x1 + inset, y1 + inset, x2 - inset, y2 - inset
+    w, h = x2 - x1, y2 - y1
+    t = stroke
+    if letter == "M":
+        bars = [(x1, y1, x2, y1 + t),                                  # top
+                (x1, y1, x1 + t, y2),                                  # left
+                (x1 + (w - t) / 2, y1, x1 + (w + t) / 2, y1 + h * 0.84),
+                (x2 - t, y1, x2, y2)]                                  # right
+    else:
+        bars = [(x1, y1, x1 + t, y2),                                  # spine
+                (x1, y1, x2, y1 + t),                                  # top arm
+                (x1, y2 - t, x2, y2)]                                  # bottom
+        if letter == "E":
+            bars.append((x1, y1 + (h - t) / 2, x1 + w * 0.84, y1 + (h + t) / 2))
+    return [([v * scale for v in b], t / 2 * scale) for b in bars]
 
 
 def _box(b, scale=S):
@@ -128,7 +138,7 @@ def app_icon():
                                          outline=255, width=STROKE * S))
     else:
         def draw_e(d):
-            for box, radius in _e_bars(x1, y1, x2, y2, STROKE, S):
+            for box, radius in _letter_bars("E", x1, y1, x2, y2, STROKE, S):
                 d.rounded_rectangle(box, radius=radius, fill=255)
         ring = _mask(draw_e)
     _shadow(img, ring, dy=10, blur=12, alpha=120)
@@ -140,6 +150,20 @@ def app_icon():
                                            fill=70)).filter(ImageFilter.GaussianBlur(30 * S))
     sheen.putalpha(ImageChops.multiply(ring, top_half))
     img.alpha_composite(sheen)
+
+    if MARK != "ring":
+        # "M" and "C" on the bottom tiles: the same gradient strokes, inset
+        # so each tile shows around its letter.
+        for letter, cell in (("M", _cell(1, 0)), ("C", _cell(1, 1))):
+            m = _mask(lambda d, c=cell, l=letter: [
+                d.rounded_rectangle(box, radius=radius, fill=255)
+                for box, radius in _letter_bars(l, *c, LETTER_STROKE, S,
+                                                inset=LETTER_INSET)])
+            _shadow(img, m, dy=6, blur=8, alpha=110)
+            ink = Image.new("RGBA", (N, N), (0, 0, 0, 0))
+            ink.paste(_grad((255, 96, 140), (128, 108, 255), horizontal=True),
+                      (0, 0), m)
+            img.alpha_composite(ink)
 
     return img.resize((1024, 1024), Image.LANCZOS)
 
@@ -161,13 +185,20 @@ def tray_icon(px=36):
 
     for r, c in ((0, 1), (1, 0), (1, 1)):
         d.rounded_rectangle(cell(r, c), radius=3.2 * k, fill=ink)
+    if MARK != "ring":
+        # M / C cut out of their squares (template images are alpha only).
+        for letter, (r, c) in (("M", (1, 0)), ("C", (1, 1))):
+            x1, y1, x2, y2 = cell(r, c)
+            for box, radius in _letter_bars(letter, x1 / k, y1 / k, x2 / k,
+                                            y2 / k, 1.9, k, inset=2.6):
+                d.rounded_rectangle(box, radius=radius, fill=(0, 0, 0, 0))
     x1, y1, x2, y2 = cell(0, 0)
     if MARK == "ring":
         inset = 0.6 * k
         d.ellipse([x1 + inset, y1 + inset, x2 - inset, y2 - inset],
                   outline=ink, width=int(2.6 * k))
     else:
-        for box, radius in _e_bars(x1 / k, y1 / k, x2 / k, y2 / k, 2.6, k):
+        for box, radius in _letter_bars("E", x1 / k, y1 / k, x2 / k, y2 / k, 2.6, k):
             d.rounded_rectangle(box, radius=radius, fill=ink)
     return img.resize((px, px), Image.LANCZOS)
 
