@@ -1355,8 +1355,35 @@ def _press_window_button_by_title(title, pids, button_attr):
     if target is None:
         window = _untitled_window_of(title, pids)
         target = _attribute(window, button_attr) if window is not None else None
+    if target is None:
+        window = _owner_window_for(title, button_attr)
+        target = _attribute(window, button_attr) if window is not None else None
     return target is not None and AX.AXUIElementPerformAction(
         target, AX.kAXPressAction) == AX.kAXErrorSuccess
+
+
+def _owner_window_for(title, button_attr=None):
+    """Last-resort match through the thumbnail's own app (its bundle id from
+    Mission Control), for apps whose AX window title differs from the title
+    Mission Control shows — Safari's do (page vs window titles, a blank Start
+    Page). The app's only window if it has one; else the single window whose
+    title contains, or is contained in, the thumbnail's (case-insensitive)."""
+    pid = pid_for_title(title)
+    if pid is None:
+        return None
+    windows = [w for w in _ax_windows(pid)
+               if button_attr is None or _attribute(w, button_attr) is not None]
+    if len(windows) == 1:
+        return windows[0]
+    wanted = (title or "").strip().lower()
+    if not wanted:
+        return None
+    hits = []
+    for window in windows:
+        have = (_attribute(window, AX.kAXTitleAttribute) or "").strip().lower()
+        if have and (wanted in have or have in wanted):
+            hits.append(window)
+    return hits[0] if len(hits) == 1 else None
 
 
 def _find_window_by_title(title, pids):
@@ -1378,7 +1405,7 @@ def _find_window_by_title(title, pids):
         return exact[0]
     if len(related) == 1:
         return related[0]
-    return _untitled_window_of(title, pids)
+    return _untitled_window_of(title, pids) or _owner_window_for(title)
 
 
 def _untitled_window_of(app_name, pids):
