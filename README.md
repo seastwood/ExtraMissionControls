@@ -25,8 +25,7 @@ Apple never shipped a close button in Mission Control. This menu-bar app adds
 a whole row of them: open Mission Control the way you always do (swipe up / ⌃↑
 / F3) and every window thumbnail gains **macOS-style controls in its top-left
 corner** — close, minimize, full screen, arrange (snap to a half or maximize),
-and quit — with hover highlighting. Fullscreen apps in the Spaces Bar get their
-own close and exit-full-screen buttons. Click one and it applies as you leave
+and quit — with hover highlighting. Click one and it applies as you leave
 Mission Control, so the overview never breaks.
 
 ## Features
@@ -54,10 +53,11 @@ Mission Control, so the overview never breaks.
   (blue) — click it to call off the pending action and bring the buttons back,
   so you can pick a different one or leave the window alone (for a fullscreen
   app that already dropped to the desktop, cancel keeps it open as a window)
-- **Fullscreen apps in the Spaces Bar (top section)** get a **✕** that closes
-  the app's window and a **❏** that exits full screen. On macOS 27 both switch
-  to the app's space, act there, and leave you on the desktop (through macOS 26
-  the window drops back into the overview and Mission Control stays open)
+- **Fullscreen apps in the Spaces Bar (top section)**: through macOS 26 they
+  get a **✕** that closes the app's window and a **❏** that exits full screen,
+  both without leaving Mission Control. On macOS 27 the Spaces Bar has no EMC
+  buttons: use macOS's own exit-full-screen button on the tile, then close the
+  window from its thumbnail.
 - **Keyboard shortcuts**: point at a window thumbnail and press **W** to close
   it, **M** to minimize it, or **Q** to quit its app (press the same key again
   to take it back). macOS may ask for *Input Monitoring* permission the first
@@ -117,12 +117,12 @@ reads whichever host has the populated tree. This app:
    close/minimize button, resizing it for a left/right/maximize snap, or asking
    its app to quit (⌘Q) — runs as you leave.
 
-Fullscreen apps take a different route. Closing one from the Spaces Bar first
-drops it back to the desktop in place (`AXRemoveDesktop` — you stay in Mission
-Control), where it reappears as an ordinary window thumbnail with the dim ✕
-scrim; the app's window is then closed by name as you leave, exactly like a
-desktop close. The **❏** button uses the same `AXRemoveDesktop` step but stops
-there, leaving the app windowed. (An accumulative registry of fullscreen
+Fullscreen apps take a different route (through macOS 26). Closing one from
+the Spaces Bar first drops it back to the desktop in place (`AXRemoveDesktop` —
+you stay in Mission Control), where it reappears as an ordinary window thumbnail with the dim ✕
+scrim; the window is queued for closing as you leave. The **❏** button performs
+just the fullscreen exit, leaving the
+app windowed. (An accumulative registry of fullscreen
 windows — scanned while Mission Control is closed, refreshed on every space
 switch — keeps AX references pressable from any space for the fallback paths.)
 
@@ -298,9 +298,12 @@ Debugging: run with `EMC_DEBUG=1` to log actions and button layouts to
 - Windows are matched to thumbnails by title; two windows with identical
   titles in the same app may close the wrong twin.
 - Buttons appear on the current display only (multi-monitor support TODO).
-- Fullscreen windows the app has never had AX sight of (fullscreened before
-  the app launched, space never visited since) close via a fallback that
-  briefly leaves Mission Control and returns.
+- On macOS 27, Spaces Bar tiles get no EMC buttons. macOS's exit-full-screen
+  button there is invisible to accessibility and window lists, so a synthetic
+  click on it can't be guaranteed to land (a miss opens the app), and direct
+  `AXFullScreen` writes left Notes visually broken while reporting success.
+  On earlier systems, fullscreen windows the app has never had AX sight of may
+  close via a fallback that briefly leaves Mission Control and returns.
 
 ## Support
 

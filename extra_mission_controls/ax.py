@@ -314,6 +314,33 @@ _onscreen_ids = frozenset()
 _onscreen_at = 0.0
 
 
+# System processes whose layer-0 windows are never app windows.
+_PULSE_SKIP_OWNERS = {"Dock", "WindowManager", "Window Server", "Control Center",
+                      "Control Centre", "Notification Center",
+                      "Notification Centre", "Spotlight", "Wallpaper",
+                      "screencapture", "TextInputMenuAgent", "loginwindow"}
+pulse_owners = {}  # debug: window number -> (owner, w, h)
+
+
+def small_system_windows():
+    """Debug: on-screen windows owned by system processes (any layer) that
+    are small enough to be a control — (owner, layer, x, y, w, h, alpha)."""
+    out = []
+    for entry in Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
+        owner = entry.get(Quartz.kCGWindowOwnerName)
+        if owner not in _PULSE_SKIP_OWNERS:
+            continue
+        b = entry.get(Quartz.kCGWindowBounds) or {}
+        w, h = b.get("Width", 0), b.get("Height", 0)
+        if w > 120 or h > 120:
+            continue
+        out.append((owner, entry.get(Quartz.kCGWindowLayer, 0),
+                    round(b.get("X", 0)), round(b.get("Y", 0)), round(w), round(h),
+                    round(float(entry.get(Quartz.kCGWindowAlpha, 1.0)), 2)))
+    return sorted(out)
+
+
 def mission_control_pulse(exclude_pid):
     """(present, real_window_sig, watch_ids) from ONE WindowServer query —
     the sync tick's per-frame heartbeat. `present` is the backdrop rule.
@@ -326,6 +353,7 @@ def mission_control_pulse(exclude_pid):
     the top region). One list pass; no extra queries over the old check."""
     sig = []
     watch_ids = []
+    onscreen = []
     band = {}
     for entry in _window_list():
         layer = entry.get(Quartz.kCGWindowLayer, 0)
@@ -333,7 +361,19 @@ def mission_control_pulse(exclude_pid):
             if entry.get(Quartz.kCGWindowOwnerPID) == exclude_pid:
                 continue
             number = entry.get(Quartz.kCGWindowNumber, 0)
+            onscreen.append(number)  # every on-screen window, for filtering
             bounds = entry.get(Quartz.kCGWindowBounds) or {}
+            owner = entry.get(Quartz.kCGWindowOwnerName)
+            # Only real app windows: macOS 27 adds short-lived system windows
+            # while you hover in Mission Control (title labels, Spaces Bar
+            # previews), and counting them read as windows opening/closing,
+            # which hid every button on each hover.
+            if (owner in _PULSE_SKIP_OWNERS
+                    or bounds.get("Width", 0) < 80 or bounds.get("Height", 0) < 80):
+                continue
+            if _DEBUG:
+                pulse_owners[number] = (owner, round(bounds.get("Width", 0)),
+                                        round(bounds.get("Height", 0)))
             sig.append((number,
                         round(bounds.get("X", 0)), round(bounds.get("Y", 0)),
                         round(bounds.get("Width", 0)),
@@ -345,7 +385,7 @@ def mission_control_pulse(exclude_pid):
                 watch_ids.append(entry.get(Quartz.kCGWindowNumber, 0))
                 band[(owner, layer)] = band.get((owner, layer), 0) + 1
     global _onscreen_ids, _onscreen_at
-    _onscreen_ids, _onscreen_at = frozenset(watch_ids), time.time()
+    _onscreen_ids, _onscreen_at = frozenset(onscreen + watch_ids), time.time()
     # The legacy rule only looks at layers 18-20; other modes ignore counts.
     present = _backdrop.present(band)
     return present, tuple(sig), tuple(watch_ids)
@@ -881,6 +921,29 @@ def mission_control_window_count(group=None):
         return 0
     return sum(len(_current_space_only(_display_parts(display)[0]))
                for display in _displays(group))
+
+
+def _action_names(element):
+    try:
+        err, names = AX.AXUIElementCopyActionNames(element, None)
+        return list(names or []) if err == AX.kAXErrorSuccess else []
+    except Exception:
+        return []
+
+
+def describe_actions(element, depth=0):
+    """Debug: an element's actions plus its children's (role, subrole,
+    title/description, actions), two levels down."""
+    parts = ["actions=%s" % _action_names(element)]
+    if depth < 2:
+        for child in _attribute(element, AX.kAXChildrenAttribute) or []:
+            parts.append("[%s/%s %r %r %s]" % (
+                _attribute(child, AX.kAXRoleAttribute),
+                _attribute(child, AX.kAXSubroleAttribute),
+                _attribute(child, AX.kAXTitleAttribute),
+                _attribute(child, AX.kAXDescriptionAttribute),
+                describe_actions(child, depth + 1)))
+    return " ".join(parts)
 
 
 def describe_mc_tree(group, max_depth=4):

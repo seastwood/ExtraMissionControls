@@ -24,3 +24,4 @@ emc_diag.txt
 emc_actions.log*
 mnt_preview.png
 Claude outputs/
+emc_trace.log
