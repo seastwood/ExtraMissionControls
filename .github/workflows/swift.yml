@@ -23,6 +23,7 @@ jobs:
           sw_vers
           xcodebuild -version
           swift --version
+          echo "::notice title=Toolchain::$(sw_vers -productVersion) / $(xcodebuild -version | head -1) / $(swift --version 2>&1 | head -1)"
 
       - name: Build
         run: |
@@ -33,6 +34,9 @@ jobs:
         run: |
           set -o pipefail
           swift test 2>&1 | tee test.log
+          echo "::notice title=Tests::$(grep -E 'Executed [0-9]+ tests' test.log | tail -1)"
+          warn=$(grep -c "warning:" build.log || true)
+          echo "::notice title=Build warnings::$warn (first: $(grep -m5 'warning:' build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'))"
 
       - name: Package app (ad-hoc signed)
         env:
