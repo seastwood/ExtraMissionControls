@@ -59,7 +59,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" >/dev/null
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           id="$(security find-identity -p codesigning "$KC" \
-            | grep -m1 -E '"(Developer ID Application|ExtraMissionControls Signing)' | sed -E 's/.*"(.*)"/\1/')"
+            | grep -m1 -E '"(Developer ID Application|ExtraMissionControls Signing)' | sed -E 's/^[^"]*"([^"]*)".*$/\1/')"
           if [ -z "$id" ]; then
             echo "::error::No Developer ID Application or ExtraMissionControls Signing identity in the .p12"
             exit 1
