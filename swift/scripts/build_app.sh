@@ -73,7 +73,7 @@ if [[ -n "${EMC_SIGN_IDENTITY:-}" ]]; then
     IDENTITY="$EMC_SIGN_IDENTITY"
 elif security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
     IDENTITY="$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 \
-        | sed -E 's/.*"(.*)"/\1/')"
+        | sed -E 's/^[^"]*"([^"]*)".*$/\1/')"
 else
     IDENTITY="$SELF_SIGNED"
     if ! security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null | grep -qF "$SELF_SIGNED"; then
