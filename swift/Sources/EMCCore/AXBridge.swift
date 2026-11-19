@@ -402,25 +402,50 @@ class AXBridge {
     /// desktop's thumbnails — stacked, invisible, at one centred frame (the
     /// "ghost window"). Keep only the shown space's thumbnails.
     private func dropOtherSpaceThumbs(_ thumbs: [Tile], _ spaces: [Tile]) -> [Tile] {
-        let numbered = thumbs.filter { $0.space != nil }
-        if numbered.isEmpty { return thumbs }
+        guard thumbs.contains(where: { $0.space != nil }) else { return thumbs }
         let active = activeSpaceIDs()
-        if !active.isEmpty, numbered.contains(where: { active.contains($0.space!) }) {
-            spaceIDsVerified = true
-            return thumbs.filter { $0.space == nil || active.contains($0.space!) }
+        let result = Self.filterToShownSpace(thumbs, spaces, active: active, spaceTypes: spaceTypes,
+                                             verified: spaceIDsVerified)
+        spaceIDsVerified = result.verified
+        if Log.debugEnabled && result.thumbs.count != thumbs.count {
+            let kept = Set(result.thumbs.map { $0.title })
+            let dropped = thumbs.filter { !kept.contains($0.title) }
+                .map { "\($0.title)@space\($0.space.map(String.init) ?? "-")" }
+            Log.geom("SPACE-FILTER dropped \(dropped) active=\(active.sorted())")
         }
-        if !active.isEmpty && spaceIDsVerified {
+        return result.thumbs
+    }
+
+    /// Keep only the thumbnails of the space Mission Control is showing.
+    ///
+    /// A thumbnail whose space WindowServer no longer knows (absent from
+    /// `spaceTypes`) is kept: on macOS 27, an app dragged down out of the
+    /// Spaces Bar becomes a desktop window whose thumbnail still carries the
+    /// id of the full-screen space that was just destroyed, until Mission
+    /// Control is reopened. Treating that as "another space" hid its buttons.
+    static func filterToShownSpace(_ thumbs: [Tile], _ spaces: [Tile], active: Set<Int>,
+                                   spaceTypes: [Int: Int], verified: Bool) -> (thumbs: [Tile], verified: Bool) {
+        let numbered = thumbs.filter { $0.space != nil }
+        if numbered.isEmpty { return (thumbs, verified) }
+        // A space id WindowServer still lists; unknown when the list is unavailable.
+        func gone(_ space: Int) -> Bool { !spaceTypes.isEmpty && spaceTypes[space] == nil }
+        func keep(_ t: Tile) -> Bool { t.space == nil || active.contains(t.space!) || gone(t.space!) }
+        if !active.isEmpty, numbered.contains(where: { active.contains($0.space!) }) {
+            return (thumbs.filter(keep), true)
+        }
+        if !active.isEmpty && verified {
             // The ids have matched real thumbnails before: no match now means
-            // an EMPTY desktop, whose overview lists other desktops' windows.
-            return thumbs.filter { $0.space == nil }
+            // an EMPTY desktop, whose overview lists other desktops' windows
+            // (but a window just dropped out of full screen is still ours).
+            return (thumbs.filter(keep), true)
         }
         let fsTitles = Set(spaces.filter { $0.desc.hasPrefix("exit to full screen") }.map { $0.title })
         var bySpace: [Int: [Tile]] = [:]
         for t in numbered { bySpace[t.space!, default: []].append(t) }
-        let fsSpaces = Set(bySpace.filter { _, members in
-            members.allSatisfy { fsTitles.contains($0.title) } && bySpace.count > 1
+        let fsSpaces = Set(bySpace.filter { space, members in
+            !gone(space) && members.allSatisfy { fsTitles.contains($0.title) } && bySpace.count > 1
         }.keys)
-        return thumbs.filter { $0.space == nil || !fsSpaces.contains($0.space!) }
+        return (thumbs.filter { $0.space == nil || !fsSpaces.contains($0.space!) }, verified)
     }
 
     /// Record {title: bundle} for every thumbnail BEFORE any space filter, so
@@ -710,6 +735,15 @@ class AXBridge {
 
     private func noteCaps(_ pid: pid_t, _ title: String, _ window: AXUIElement) {
         let key = CapKey(pid: pid, title: title)
+        // A full-screen window's buttons don't describe it as a desktop window
+        // (minimize is disabled there). Learning them hid buttons on a window
+        // dragged out of full screen while Mission Control was open, until
+        // the next rescan. Leave it unknown so nothing is hidden on a guess.
+        if AX.bool(window, "AXFullScreen") == true {
+            windowActionCaps[key] = nil
+            windowCaps[key] = nil
+            return
+        }
         let canClose = AX.child(window, "AXCloseButton").map { AX.bool($0, "AXEnabled") != false } ?? false
         let canMin = AX.child(window, "AXMinimizeButton").map { AX.bool($0, "AXEnabled") != false } ?? false
         windowActionCaps[key] = WindowCaps(first: canClose, second: canMin)

@@ -77,3 +77,36 @@ final class TypedActionTests: XCTestCase {
         XCTAssertEqual(c.marked["Doc"], "⏼")
     }
 }
+
+/// macOS 27: an app dragged down out of the Spaces Bar keeps the id of its
+/// destroyed full-screen space on its thumbnail until Mission Control reopens.
+final class SpaceFilterTests: XCTestCase {
+    func t(_ title: String, _ space: Int?) -> Tile {
+        Tile(title: title, x: 100, y: 300, width: 400, height: 260, space: space)
+    }
+
+    func testDroppedOutOfFullScreenKeepsItsThumbnail() {
+        // Desktop is space 1; space 7 (the app's full-screen space) is gone.
+        let thumbs = [t("Notes", 1), t("Safari", 7)]
+        let r = AXBridge.filterToShownSpace(thumbs, [], active: [1], spaceTypes: [1: 0, 3: 4],
+                                            verified: true)
+        XCTAssertEqual(r.thumbs.map { $0.title }, ["Notes", "Safari"])
+    }
+
+    func testOnlyWindowOnDesktopAfterDropIsKept() {
+        let r = AXBridge.filterToShownSpace([t("Safari", 7)], [], active: [1], spaceTypes: [1: 0],
+                                            verified: true)
+        XCTAssertEqual(r.thumbs.map { $0.title }, ["Safari"], "not mistaken for an empty desktop's ghost")
+    }
+
+    func testOtherLiveFullScreenSpacesStillFiltered() {
+        // Space 3 is a live full-screen space: its windows are the "ghosts".
+        let r = AXBridge.filterToShownSpace([t("Notes", 1), t("Ghost", 3)], [], active: [1],
+                                            spaceTypes: [1: 0, 3: 4], verified: false)
+        XCTAssertEqual(r.thumbs.map { $0.title }, ["Notes"])
+        XCTAssertTrue(r.verified)
+        let empty = AXBridge.filterToShownSpace([t("Ghost", 3)], [], active: [1], spaceTypes: [1: 0, 3: 4],
+                                                verified: true)
+        XCTAssertTrue(empty.thumbs.isEmpty, "an empty desktop still hides other spaces' windows")
+    }
+}
