@@ -107,5 +107,5 @@ jobs:
           files=("dist/Extra Mission Controls $VERSION.dmg" "dist/ExtraMissionControls-$VERSION.zip")
           [ -f dist/appcast.xml ] && files+=("dist/appcast.xml")
           gh release create "$GITHUB_REF_NAME" --draft --generate-notes \
-            --title "Extra Mission Controls $VERSION" "${files[@]}"
+            --title "EMC $VERSION" "${files[@]}"
           echo "::notice title=Release::Draft release $GITHUB_REF_NAME created — test it, then publish on GitHub"
