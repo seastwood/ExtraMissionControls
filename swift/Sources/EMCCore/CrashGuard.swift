@@ -2,15 +2,16 @@ import AppKit
 import Darwin
 import Foundation
 
-// Everything the signal handler touches is prepared up front: a handler may
-// only use async-signal-safe calls (fork, execv, signal, raise).
+// Everything the signal handler touches is prepared up front, so the handler
+// itself only spawns the relaunch shell (posix_spawn is a single system call
+// on Darwin; Swift doesn't offer fork) and re-raises the signal.
 private var relaunchArgv: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 private var shellPath: UnsafeMutablePointer<CChar>?
 
 private func emcCrashHandler(_ sig: Int32) {
-    if let argv = relaunchArgv, let sh = shellPath, fork() == 0 {
-        execv(sh, argv)
-        _exit(1)
+    if let argv = relaunchArgv, let sh = shellPath {
+        var child: pid_t = 0
+        _ = posix_spawn(&child, sh, nil, nil, argv, environ)
     }
     // Let macOS write its usual crash report, then die as before.
     signal(sig, SIG_DFL)

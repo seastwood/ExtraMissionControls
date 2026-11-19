@@ -103,7 +103,7 @@ extension MissionControlController {
             }
             if moved {
                 Log.debug(String(format: "panel %d (%@ '%@') shown at (%.0f,%.0f) size=%.0f",
-                                 index, target.kind, tile.title, x, yTop, size))
+                                 index, target.kind.rawValue, tile.title, x, yTop, size))
             }
             showPanel(panel)
         }
@@ -116,7 +116,7 @@ extension MissionControlController {
             loggedPanelKeys = keys
             let sample = zip(assigned, keys).prefix(6).map { index, key -> String in
                 let p = panels[index]
-                return String(format: "%d:%@/%@ vis=%d a=%.2f @(%.0f,%.0f %.0fx%.0f)", index, key.kind,
+                return String(format: "%d:%@/%@ vis=%d a=%.2f @(%.0f,%.0f %.0fx%.0f)", index, key.kind.rawValue,
                               String(key.title.prefix(18)), p.isVisible ? 1 : 0, p.alphaValue,
                               p.frame.origin.x, p.frame.origin.y, p.frame.width, p.frame.height)
             }
