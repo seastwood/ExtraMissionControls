@@ -25,3 +25,9 @@ emc_actions.log*
 mnt_preview.png
 Claude outputs/
 emc_trace.log
+
+# Swift port
+swift/.build/
+swift/dist/
+swift/.swiftpm/
+swift/*.log
