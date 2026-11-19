@@ -1,0 +1,69 @@
+name: Swift build
+
+on:
+  push:
+    branches: [main, swift-port]
+    paths: ["swift/**", ".github/workflows/swift.yml"]
+  pull_request:
+    paths: ["swift/**", ".github/workflows/swift.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: swift
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+          echo "::notice title=Toolchain::$(sw_vers -productVersion) / $(xcodebuild -version | head -1) / $(swift --version 2>&1 | head -1)"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          swift build 2>&1 | tee build.log
+
+      - name: Test
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee test.log
+          echo "::notice title=Tests::$(grep -E 'Executed [0-9]+ tests' test.log | tail -1)"
+          warn=$(grep -c "warning:" build.log || true)
+          echo "::notice title=Build warnings::$warn (first: $(grep -m5 'warning:' build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}'))"
+
+      - name: Package app (ad-hoc signed)
+        env:
+          EMC_SIGN_IDENTITY: "-"
+        run: |
+          chmod +x scripts/build_app.sh
+          ./scripts/build_app.sh
+          cd dist && ditto -c -k --keepParent "Extra Mission Controls.app" ExtraMissionControls-app.zip
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExtraMissionControls-swift
+          path: |
+            swift/dist/ExtraMissionControls-app.zip
+            swift/dist/*.dmg
+          if-no-files-found: warn
+
+      # Surface compiler/test failures as annotations (readable from the
+      # check-run API, not just the raw log).
+      - name: Report failures
+        if: failure()
+        run: |
+          for f in build.log test.log; do
+            [ -f "$f" ] || continue
+            lines=$(grep -E "error:|failed|XCTAssert|Fatal" "$f" | grep -v "^warning" | head -60 \
+              | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            [ -n "$lines" ] && echo "::error title=$f::$lines"
+          done
+          true

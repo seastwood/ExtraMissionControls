@@ -1,0 +1,111 @@
+name: Release
+
+# Push a tag like v0.11.0 (or EMC_0.11.0) to build, sign, notarize (if set
+# up) and attach the app to a DRAFT release. Nothing is published until you
+# press Publish on GitHub, so you can test the exact build first.
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   EMC_SIGNING_P12            required: base64 of a .p12 with the signing identity
+#   EMC_SIGNING_P12_PASSWORD   required: its password
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   optional: notarize (Developer ID only)
+#   SPARKLE_PRIVATE_KEY        optional: sign the Sparkle appcast (needs
+#                              swift/Resources/sparkle_public_key.txt filled in)
+on:
+  push:
+    tags: ["v*", "EMC_*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: swift
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the app version
+        run: |
+          tag="${GITHUB_REF_NAME#EMC_}"; tag="${tag#v}"
+          ver="$(sed -n 's/.*static let fallback = "\(.*\)".*/\1/p' Sources/EMCCore/Log.swift)"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match EMCVersion.fallback ($ver) in Sources/EMCCore/Log.swift"
+            exit 1
+          fi
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: swift test
+
+      - name: Import signing identity
+        env:
+          P12: ${{ secrets.EMC_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.EMC_SIGNING_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then
+            echo "::error::Add the EMC_SIGNING_P12 and EMC_SIGNING_P12_PASSWORD secrets (see swift/README.md → Releases). An ad-hoc signed release would reset everyone's Accessibility permission."
+            exit 1
+          fi
+          KC="$RUNNER_TEMP/emc-release.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/identity.p12"
+          security import "$RUNNER_TEMP/identity.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/identity.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          id="$(security find-identity -p codesigning "$KC" \
+            | grep -m1 -E '"(Developer ID Application|ExtraMissionControls Signing)' | sed -E 's/.*"(.*)"/\1/')"
+          if [ -z "$id" ]; then
+            echo "::error::No Developer ID Application or ExtraMissionControls Signing identity in the .p12"
+            exit 1
+          fi
+          echo "::notice title=Signing::$id"
+          echo "EMC_SIGN_IDENTITY=$id" >> "$GITHUB_ENV"
+          echo "EMC_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize
+        env:
+          EMC_NOTARIZE: ${{ secrets.APPLE_ID != '' && '1' || '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          chmod +x scripts/build_app.sh
+          ./scripts/build_app.sh
+          ditto -c -k --keepParent "dist/Extra Mission Controls.app" "dist/ExtraMissionControls-$VERSION.zip"
+
+      - name: Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "::notice title=Sparkle::No SPARKLE_PRIVATE_KEY secret; release has no appcast (in-app updates stay off)"
+            exit 0
+          fi
+          if [ -z "$(tr -d '[:space:]' < Resources/sparkle_public_key.txt)" ]; then
+            echo "::error::SPARKLE_PRIVATE_KEY is set but Resources/sparkle_public_key.txt is empty"
+            exit 1
+          fi
+          tool="$(find .build/artifacts -type f -name generate_appcast | head -1)"
+          mkdir -p dist/updates
+          cp "dist/ExtraMissionControls-$VERSION.zip" dist/updates/
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle.key"
+          "$tool" --ed-key-file "$RUNNER_TEMP/sparkle.key" \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/" \
+            -o dist/appcast.xml dist/updates
+          rm -f "$RUNNER_TEMP/sparkle.key"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=("dist/Extra Mission Controls $VERSION.dmg" "dist/ExtraMissionControls-$VERSION.zip")
+          [ -f dist/appcast.xml ] && files+=("dist/appcast.xml")
+          gh release create "$GITHUB_REF_NAME" --draft --generate-notes \
+            --title "Extra Mission Controls $VERSION" "${files[@]}"
+          echo "::notice title=Release::Draft release $GITHUB_REF_NAME created — test it, then publish on GitHub"
