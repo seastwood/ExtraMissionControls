@@ -6,6 +6,15 @@ enum Updates {
     static let releasesPage = "https://github.com/seastwood/ExtraMissionControls/releases"
     static let ignoreKey = "EMCIgnoredUpdateVersion"
 
+    /// Sparkle runs only when the build embedded a public EdDSA key and a feed
+    /// (scripts/build_app.sh does when one is configured). Otherwise the
+    /// lightweight GitHub check below stays in charge.
+    static var sparkleConfigured: Bool {
+        let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String ?? ""
+        let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String ?? ""
+        return !key.isEmpty && !feed.isEmpty
+    }
+
     /// The release the user chose to skip. A newer release still notifies.
     static var ignoredVersion: String? {
         get { UserDefaults.standard.string(forKey: ignoreKey) }

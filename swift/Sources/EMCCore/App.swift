@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Sparkle
 
 /// Menu-bar app shell: status item, permission prompt, and the run loop.
 public enum EMCApp {
@@ -7,6 +8,7 @@ public enum EMCApp {
 
     public static func run() {
         replaceRunningInstance()
+        CrashGuard.install()
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)  // menu-bar app: no Dock icon
         let delegate = AppDelegate()
@@ -62,7 +64,7 @@ public enum EMCApp {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static let updateCheckInterval = 6 * 3600.0
 
     var missionControl: MissionControlController!
@@ -75,16 +77,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var updateURL: String?
     var updateVersion: String?
     var updateTimer: Timer?
+    var updater: SPUStandardUpdaterController?
+    var crashItem: NSMenuItem?
+    let settingsWindow = SettingsWindowController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         LoginItem.migrateLegacyAgent()
         missionControl = MissionControlController()
         missionControl.start()
+        settingsWindow.model.onStyleChange = { [weak self] in self?.missionControl.rebuildStyle() }
+        if Updates.sparkleConfigured {
+            // Sparkle schedules its own checks and installs updates itself.
+            updater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil,
+                                                   userDriverDelegate: nil)
+        }
         setupStatusItem()
-        // Release notifier: first check shortly after launch, then every 6h.
-        perform(#selector(checkForUpdates(_:)), with: nil, afterDelay: 10)
-        updateTimer = Timer.scheduledTimer(timeInterval: Self.updateCheckInterval, target: self,
-                                           selector: #selector(checkForUpdates(_:)), userInfo: nil, repeats: true)
+        if updater == nil {
+            // Release notifier: first check shortly after launch, then every 6h.
+            perform(#selector(checkForUpdates(_:)), with: nil, afterDelay: 10)
+            updateTimer = Timer.scheduledTimer(timeInterval: Self.updateCheckInterval, target: self,
+                                               selector: #selector(checkForUpdates(_:)), userInfo: nil,
+                                               repeats: true)
+        }
+        if CrashGuard.relaunchedAfterCrash() {
+            Log.error("relaunch", "restarted after a crash; see Show Crash Reports in the menu")
+        }
         if !missionControl.ax.ensurePermissions() {
             Log.note("Accessibility permission missing — nothing will work until it is granted "
                      + "(System Settings → Privacy & Security → Accessibility).")
@@ -144,11 +161,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(colorsItem)
         loginItem = toggleItem("Open at Login", #selector(toggleOpenAtLogin(_:)), LoginItem.enabled)
         menu.addItem(loginItem)
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings(_:)), keyEquivalent: ",")
+        settings.target = self
+        menu.addItem(settings)
         menu.addItem(.separator())
+        if updater != nil {
+            let check = NSMenuItem(title: "Check for Updates…", action: #selector(checkWithSparkle(_:)),
+                                   keyEquivalent: "")
+            check.target = self
+            menu.addItem(check)
+        }
+        let crash = NSMenuItem(title: "Show Crash Reports…", action: #selector(showCrashReports(_:)),
+                               keyEquivalent: "")
+        crash.target = self
+        crash.isHidden = CrashGuard.crashReports().isEmpty
+        menu.addItem(crash)
+        crashItem = crash
         menu.addItem(symbolItem("Restart", #selector(restartApp(_:)), "arrow.clockwise"))
         // Our own selector, not terminate: (macOS 26 decorates the stock item).
         menu.addItem(symbolItem("Quit", #selector(quitApp(_:)), "power"))
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    /// Keep the toggles in step with the Settings window.
+    func menuWillOpen(_ menu: NSMenu) {
+        glassItem.state = UI.liquidGlassEnabled ? .on : .off
+        colorsItem.state = UI.colorsEnabled ? .on : .off
+        loginItem.state = LoginItem.enabled ? .on : .off
+        crashItem?.isHidden = CrashGuard.crashReports().isEmpty
+    }
+
+    @objc func openSettings(_ sender: Any?) { settingsWindow.show() }
+
+    @objc func checkWithSparkle(_ sender: Any?) { updater?.checkForUpdates(sender) }
+
+    /// Reveal macOS's crash reports for EMC in Finder (attach one to an issue).
+    @objc func showCrashReports(_ sender: Any?) {
+        let reports = CrashGuard.crashReports()
+        if reports.isEmpty { return }
+        NSWorkspace.shared.activateFileViewerSelecting(Array(reports.prefix(5)))
     }
 
     @objc func quitApp(_ sender: Any?) { NSApp.terminate(nil) }

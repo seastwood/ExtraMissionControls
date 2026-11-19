@@ -2,7 +2,8 @@ import AppKit
 
 /// Shared UI constants, settings, and view factories (a port of ui.py).
 enum UI {
-    static let closeButtonSize: CGFloat = 24
+    /// The round button's diameter (Settings → Button size; 24 by default).
+    static var closeButtonSize: CGFloat { CGFloat(Settings.buttonSize) }
 
     // Hover fills echo the traffic lights: close red, minimize yellow, full
     // screen green; quit purple, cancel (↺) blue, arrange (◫) teal.
@@ -332,9 +333,11 @@ final class CloseButton: NSButton {
         } else {
             point = text.count <= 1 ? 12 : 9
         }
+        // Glyph sizes are tuned for the default 24pt disc; scale with it.
+        let size = UI.closeButtonSize
         imagePosition = .imageOnly
         imageScaling = .scaleProportionallyDown
-        image = UI.glyphImage(text, point: point)
+        image = UI.glyphImage(text, point: point * size / 24, size: size)
     }
 
     func setHovered(_ value: Bool) {

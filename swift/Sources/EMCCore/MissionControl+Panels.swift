@@ -87,6 +87,7 @@ extension MissionControlController {
                 trayOrder.append(trayKey)
             }
             if moved {
+                hoverDirty = true  // a button may now sit under a still cursor
                 let y = (screenHeight ?? 0) - yTop - size  // flip to bottom-left
                 panel.setFrame(NSRect(x: x, y: y, width: size, height: size), display: true)
             }
@@ -437,5 +438,6 @@ extension MissionControlController {
         rects = [:]
         markApplied = [:]
         trayApplied = [:]
+        hoverDirty = true
     }
 }

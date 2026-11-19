@@ -2,7 +2,7 @@ import AppKit
 import ApplicationServices
 import Foundation
 
-typealias Target = (kind: String, tile: Tile)
+typealias Target = (kind: ButtonKind, tile: Tile)
 typealias Mark = (tile: Tile, glyph: String)
 
 extension MissionControlController {
@@ -144,7 +144,7 @@ extension MissionControlController {
                     // The pending action can be taken back: float ↺ over it.
                     if deferredAction(for: thumb.title) != nil || unfsPending[thumb.title] != nil
                         || dockMarked[thumb.title] != nil {
-                        targets.append(("cancel", slot(thumb, 0, "↺", UI.hoverBlue)))
+                        targets.append((.cancel, slot(thumb, 0, "↺", UI.hoverBlue)))
                     }
                     continue
                 }
@@ -152,37 +152,35 @@ extension MissionControlController {
                 let caps = ax.capsFor(pid, thumb.title)
                 if !caps.second { noMaxTitles.insert(thumb.title) }
                 let actionCaps = ax.actionCapsFor(pid, thumb.title)
+                // Laid out left to right like the traffic lights; a button the
+                // window can't honour, or the user turned off, leaves no gap.
+                let row: [(ButtonKind, Bool, String?, RGB?)] = [
+                    (.window, actionCaps.first, nil, nil),
+                    (.minimize, actionCaps.second, "−", UI.hoverYellow),
+                    (.makeFullscreen, caps.first, "⤢", UI.hoverGreen),  // hidden if it can't go full screen
+                    (.arrange, true, "◫", UI.hoverTeal),
+                    (.quit, true, "⏻", UI.hoverPurple),
+                ]
                 var n = 0
-                if actionCaps.first {
-                    targets.append(("window", slot(thumb, n)))
+                for (kind, capable, label, hover) in row where capable && Settings.shows(kind) {
+                    targets.append((kind, slot(thumb, n, label, hover)))
                     n += 1
                 }
-                if actionCaps.second {
-                    targets.append(("minimize", slot(thumb, n, "−", UI.hoverYellow)))
-                    n += 1
-                }
-                if caps.first {  // hidden for windows that can't go full screen
-                    targets.append(("makefullscreen", slot(thumb, n, "⤢", UI.hoverGreen)))
-                    n += 1
-                }
-                targets.append(("arrange", slot(thumb, n, "◫", UI.hoverTeal)))
-                n += 1
-                targets.append(("quit", slot(thumb, n, "⏻", UI.hoverPurple)))
             }
             // Show Desktop, alone in the bottom-right corner above the Dock.
-            if let desktop = desktopTileFor() { targets.append(("desktop", desktop)) }
+            if Settings.shows(.desktop), let desktop = desktopTileFor() { targets.append((.desktop, desktop)) }
         }
 
         // Dock icons with a pending Quit / Force Quit: dim the icon and float
         // ↺ just ABOVE it.
         for action in dockActions {
             guard let icon = dockItems.first(where: { $0.title == action.name }) else { continue }
-            marks.append((icon, Tuning.dockGlyphs[action.action] ?? "⏻"))
+            marks.append((icon, action.action.glyph))
             let size = min(Double(UI.closeButtonSize), max(Tuning.minButtonSize, icon.height * 0.45))
             var badge = icon
             badge.x = icon.x + icon.width / 2 - size / 2 - Tuning.buttonInset
             badge.y = icon.y - size - 6 - Tuning.buttonInset
-            targets.append(("cancel", slot(badge, 0, "↺", UI.hoverBlue)))
+            targets.append((.cancel, slot(badge, 0, "↺", UI.hoverBlue)))
         }
 
         // macOS 27: no Spaces Bar buttons at all (see Tuning.barButtons).
@@ -199,19 +197,19 @@ extension MissionControlController {
                 marks.append((space, glyph))
                 // A held-reference full-screen close still sits in the bar.
                 if deferredClose.contains(where: { $0.title == space.title }) {
-                    targets.append(("cancel", slot(space, 0, "↺", UI.hoverBlue)))
+                    targets.append((.cancel, slot(space, 0, "↺", UI.hoverBlue)))
                 }
                 continue
             }
             if let apps = splitApps(space) {
                 // Split View: one button closes BOTH, labeled ✕2.
-                targets.append(("splitall", slot(space, 0, "✕\(apps.count)")))
+                targets.append((.splitAll, slot(space, 0, "✕\(apps.count)")))
             } else if isFullscreenTile(space) {
-                targets.append(("fullscreen", slot(space, 0)))
+                targets.append((.fullscreen, slot(space, 0)))
             } else {
                 continue
             }
-            targets.append(("unfullscreen", slot(space, 1, "❏", UI.hoverGreen)))
+            targets.append((.unfullscreen, slot(space, 1, "❏", UI.hoverGreen)))
         }
         traceGate("full emit n=\(targets.count)", windowCount, spaces, thumbs)
         return (targets, marks)
@@ -295,7 +293,8 @@ extension MissionControlController {
         let tile = Tile(title: "Show Desktop",
                         x: right - Tuning.desktopMargin - size - Tuning.buttonInset,
                         y: bottom - Tuning.desktopMargin - size - Tuning.buttonInset,
-                        width: size + 2 * Tuning.buttonInset, height: 60,
+                        // tall enough that syncPanels gives it the full button size
+                        width: size + 2 * Tuning.buttonInset, height: max(60, size / 0.45 + 1),
                         slot: 0,
                         // a screen with arrows pushing outward
                         label: "sf:rectangle.arrowtriangle.2.outward@90|▭", hover: UI.hoverBlue)

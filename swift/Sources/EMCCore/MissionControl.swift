@@ -22,6 +22,9 @@ enum Tuning {
     static let watchdogInterval = 1.0   // detect poll while MC is up
     static let syncStall = 3.0          // no sync tick this long while active => reset
     static let detectInterval = 0.15    // Mission Control open/close detection
+    /// The idle poll once AX notifications have proven to announce openings.
+    static let detectIntervalAssisted = 0.5
+    static let observerHitsToTrust = 3
     static let syncInterval = 0.1       // button re-positioning while MC is active
     /// Until a session's FIRST settle the sync loop runs faster.
     static let syncIntervalFast = 0.05
@@ -65,14 +68,9 @@ enum Tuning {
     /// Identifies only our own posted mouse events.
     static let syntheticMouseTag: Int64 = 0x454D_434D
 
-    static let quitMenuActions = ["quit", "forcequit", "kill"]
-    static let arrangeMenuActions = ["snapleft", "snapright", "snapmax"]
-    static let dockMenuActions = ["closeall", "quit", "forcequit"]
-    static let dockGlyphs = ["closeall": "✕", "quit": "⏻", "forcequit": "⏼"]
-    /// W close, M minimize, Q quit (ANSI key codes).
-    static let shortcutKeys: [Int64: String] = [13: "close", 46: "minimize", 12: "quit"]
-    static let markGlyphs = ["minimize": "−", "quit": "⏻", "forcequit": "⏼", "kill": "⭘",
-                             "snapleft": "◧", "snapright": "◨", "snapmax": "■"]
+    static let quitMenuActions: [MenuAction] = [.window(.quit), .window(.forceQuit), .window(.kill)]
+    static let arrangeMenuActions: [MenuAction] = [.window(.snapLeft), .window(.snapRight), .window(.snapMax)]
+    static let dockMenuActions: [MenuAction] = [.dock(.closeAll), .dock(.quit), .dock(.forceQuit)]
 
     /// macOS 27: two tiny corner probes replace the screen-sized scene probe,
     /// which WindowManager painted black into every Spaces Bar preview.
@@ -86,9 +84,79 @@ enum Tuning {
     static var panelSharing: NSWindow.SharingType { AX.isMacOS27 ? .readOnly : .none }
 }
 
+/// The kinds of overlay button. Raw values match the Python names (logs).
+enum ButtonKind: String {
+    case window, minimize, arrange, quit, cancel, desktop, fullscreen, unfullscreen
+    case makeFullscreen = "makefullscreen"
+    case splitAll = "splitall"
+
+    /// Buttons that open a flyout (on dwell, right-click, or — arrange — click).
+    var hasMenu: Bool { self == .quit || self == .arrange }
+}
+
+/// A window action queued until Mission Control exits.
+enum WindowAction: String {
+    case close, minimize, quit, kill
+    case forceQuit = "forcequit"
+    case snapLeft = "snapleft"
+    case snapRight = "snapright"
+    case snapMax = "snapmax"
+
+    var markGlyph: String {
+        switch self {
+        case .close: return "✕"
+        case .minimize: return "−"
+        case .quit: return "⏻"
+        case .forceQuit: return "⏼"
+        case .kill: return "⭘"
+        case .snapLeft: return "◧"
+        case .snapRight: return "◨"
+        case .snapMax: return "■"
+        }
+    }
+
+    var region: SnapRegion? {
+        switch self {
+        case .snapLeft: return .left
+        case .snapRight: return .right
+        case .snapMax: return .max
+        default: return nil
+        }
+    }
+
+    /// Close/minimize act on one window (and can be verified and retried).
+    var isWindowButton: Bool { self == .close || self == .minimize }
+}
+
+/// What the Dock overlay menu can do to an app.
+enum DockActionKind: String {
+    case quit
+    case closeAll = "closeall"
+    case forceQuit = "forcequit"
+
+    var glyph: String {
+        switch self {
+        case .closeAll: return "✕"
+        case .quit: return "⏻"
+        case .forceQuit: return "⏼"
+        }
+    }
+}
+
+enum MenuAction: Equatable {
+    case window(WindowAction)
+    case dock(DockActionKind)
+}
+
+enum MenuKind: String { case quit, arrange, dock }
+
+enum SnapRegion: String { case left, right, max }
+
+enum QuitLevel: String { case graceful, force, kill }
+
 /// What a pooled button panel currently acts on.
 struct ButtonTarget: Equatable {
-    var kind: String
+    var kind: ButtonKind
     var title: String
     var element: AXUIElement?
 
@@ -103,12 +171,12 @@ struct ButtonTarget: Equatable {
 }
 
 struct DeferredAction: Equatable {
-    var action: String
+    var action: WindowAction
     var title: String
 }
 
 struct PanelKey: Hashable {
-    var kind: String
+    var kind: ButtonKind
     var title: String
     var slot: Int
     var x: Int
@@ -122,7 +190,7 @@ struct TileKey: Hashable {
 }
 
 struct DockAction {
-    var action: String
+    var action: DockActionKind
     var pid: pid_t
     var name: String
 }
@@ -199,10 +267,10 @@ class MissionControlController: NSObject {
     var deferredRetries: [String: Int] = [:]
     var actionTargets: [String: CapturedWindow] = [:]
     var actionStarted: [String: Double] = [:]
-    var actionVerifications: [(target: CapturedWindow, action: String, title: String, started: Double)] = []
+    var actionVerifications: [(target: CapturedWindow, action: WindowAction, title: String, started: Double)] = []
     /// Synthetic traffic-light clicks for AX-opaque windows.
-    var tlQueue: [(action: String, title: String, pid: pid_t, x: Double, y: Double)] = []
-    var tlPending: (action: String, title: String, x: Double, y: Double)?
+    var tlQueue: [(action: WindowAction, title: String, pid: pid_t, x: Double, y: Double)] = []
+    var tlPending: (action: WindowAction, title: String, x: Double, y: Double)?
     var deferredAppCloses: [String] = []
     var appCloseAttempts = 0
     var lastThumbs: [Tile] = []
@@ -216,7 +284,7 @@ class MissionControlController: NSObject {
     var dockHover: String?
     var dockHoverSince = 0.0
     var dockLatched: String?
-    var menuKind: String?
+    var menuKind: MenuKind?
     var menuDock: Tile?
     var dockActions: [DockAction] = []
     var dockMarked: [String: String] = [:]
@@ -235,8 +303,8 @@ class MissionControlController: NSObject {
     var fsMakeWindow: AXUIElement?
     var fsMakeWaits = 0
     var fsMakeSettled = false
-    var arrangeQueue: [(region: String, title: String)] = []
-    var arrangeCurrent: (title: String, pids: [pid_t], pid: pid_t?, region: String)?
+    var arrangeQueue: [(region: SnapRegion, title: String)] = []
+    var arrangeCurrent: (title: String, pids: [pid_t], pid: pid_t?, region: SnapRegion)?
     var desktopWait = 0
     var desktopBefore: [Int: RoundedRect] = [:]
 
@@ -280,6 +348,19 @@ class MissionControlController: NSObject {
     var quietFulls = 0
     var lastMouseY: Double?
     var hoverIndex: Int?
+    /// The cursor at the last hover pass; hover work is skipped while it
+    /// stays put. `hoverDirty` forces one pass (new buttons under a still
+    /// cursor need their highlight).
+    var lastHoverLocation: NSPoint?
+    var hoverDirty = true
+    var hoverSkips = 0
+
+    // -- Accessibility-notification-assisted detection ---------------------------
+    var mcObserver: MissionControlObserver?
+    var lastObserverEvent = 0.0
+    var observerHits = 0
+    var observerTrusted = false
+    var observerRefreshedAt = 0.0
     var perfFrames: [(Double, Double)] = []
 
     // -- marks -----------------------------------------------------------------------
@@ -290,7 +371,7 @@ class MissionControlController: NSObject {
     var menuOpen = false
     var menuTitle: String?
     var menuRects: [Int: Rect] = [:]
-    var menuActions: [String] = []
+    var menuActions: [MenuAction] = []
     var menuPanel: NSPanel?
     var menuView: MenuView?
     var hoverQuitIndex: Int?
@@ -319,6 +400,8 @@ class MissionControlController: NSObject {
     func start() {
         Log.prepareDebugLogs()
         startDetectTimer()
+        mcObserver = MissionControlObserver { [weak self] in self?.observerFired() }
+        refreshObserver()
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(spaceChanged(_:)),
                            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
@@ -339,6 +422,7 @@ class MissionControlController: NSObject {
     }
 
     func stop() {
+        mcObserver?.removeAll()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopDetectTimer()
         if active { deactivate() }
@@ -353,7 +437,13 @@ class MissionControlController: NSObject {
         NSObject.cancelPreviousPerformRequests(withTarget: self, selector: selector, object: nil)
     }
 
-    func startDetectTimer(_ interval: Double = Tuning.detectInterval) {
+    /// The idle detect cadence: slower once AX notifications are trusted.
+    var idleDetectInterval: Double {
+        observerTrusted ? Tuning.detectIntervalAssisted : Tuning.detectInterval
+    }
+
+    func startDetectTimer(_ requested: Double? = nil) {
+        let interval = requested ?? idleDetectInterval
         if let timer = detectTimer, timer.isValid, abs(timer.timeInterval - interval) < 1e-6 { return }
         stopDetectTimer()
         let timer = Timer(timeInterval: interval, target: self, selector: #selector(tick(_:)),
@@ -410,6 +500,7 @@ class MissionControlController: NSObject {
             activate(group)
             return
         }
+        if Clock.monotonic() - observerRefreshedAt >= 5.0 { refreshObserver() }
         if Clock.monotonic() - capsRefreshedAt >= 2.0 {
             capsRefreshedAt = Clock.monotonic()
             ax.refreshFrontWindowCaps()
@@ -418,6 +509,7 @@ class MissionControlController: NSObject {
     }
 
     func activate(_ group: AXUIElement) {
+        noteDetection()
         active = true
         activatedAt = Clock.now()
         lastSyncTick = Clock.now()
@@ -630,6 +722,49 @@ class MissionControlController: NSObject {
                             1000 * (collect.max() ?? 0), 1000 * panelCost.reduce(0, +) / Double(panelCost.count),
                             1000 * (panelCost.max() ?? 0)))
             perfFrames = []
+        }
+    }
+
+    // MARK: - notification-assisted detection
+
+    func refreshObserver() {
+        observerRefreshedAt = Clock.monotonic()
+        mcObserver?.refresh()
+    }
+
+    /// The Dock or WindowManager posted something: Mission Control may be
+    /// opening, so check now (and twice more as its windows appear) instead
+    /// of waiting for the next poll.
+    func observerFired() {
+        guard !active else { return }
+        let now = Clock.now()
+        if now - lastObserverEvent < 0.02 { return }  // bursts: one check is enough
+        lastObserverEvent = now
+        doTick()
+        cancelScheduled(#selector(observerFollowUp))
+        schedule(#selector(observerFollowUp), after: 0.05)
+    }
+
+    @objc func observerFollowUp() {
+        guard !active, !dozing else { return }
+        doTick()
+        if Clock.now() - lastObserverEvent < 0.2 { schedule(#selector(observerFollowUp), after: 0.06) }
+    }
+
+    /// Learn whether notifications announce openings: trust them (slower idle
+    /// poll) after several in a row, drop trust the moment one opening is
+    /// found by the poll alone.
+    func noteDetection() {
+        if Clock.now() - lastObserverEvent < 1.0 {
+            observerHits += 1
+            if !observerTrusted && observerHits >= Tuning.observerHitsToTrust {
+                observerTrusted = true
+                Log.geom("OBSERVER trusted after \(observerHits) announced openings")
+            }
+        } else {
+            if observerTrusted { Log.geom("OBSERVER missed an opening: back to the fast poll") }
+            observerTrusted = false
+            observerHits = 0
         }
     }
 

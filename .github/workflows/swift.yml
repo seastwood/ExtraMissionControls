@@ -2,7 +2,7 @@ name: Swift build
 
 on:
   push:
-    branches: [swift-port]
+    branches: [main, swift-port]
     paths: ["swift/**", ".github/workflows/swift.yml"]
   pull_request:
     paths: ["swift/**", ".github/workflows/swift.yml"]

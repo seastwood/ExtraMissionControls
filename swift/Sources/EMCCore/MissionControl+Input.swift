@@ -107,10 +107,10 @@ extension MissionControlController {
         switch type {
         case .otherMouseDown:
             let button = event.getIntegerValueField(.mouseEventButtonNumber)
-            if button == 2 && !menuOpen, let thumb = thumbAt(x, y) {
+            if button == 2 && !menuOpen && Settings.middleClickCloses, let thumb = thumbAt(x, y) {
                 swallowOtherUp = true
                 let title = thumb.title
-                DispatchQueue.main.async { self.shortcutAction("close", title) }
+                DispatchQueue.main.async { self.shortcutAction(.close, title) }
                 return false
             }
             return true
@@ -129,7 +129,7 @@ extension MissionControlController {
                     DispatchQueue.main.async { self.menuPick(row) }
                     return false
                 }
-                if menuKind != "dock" {
+                if menuKind != .dock {
                     swallowMouseUp = true
                     DispatchQueue.main.async { self.closeMenu() }
                     return false
@@ -142,7 +142,7 @@ extension MissionControlController {
                 let target = targets[index]
                 // The arrange button has no default action — a left-click
                 // opens its flyout.
-                let menu = target?.kind == "arrange"
+                let menu = target?.kind == .arrange
                 DispatchQueue.main.async { self.dispatchButton(index, target, menu: menu) }
                 return false  // consumed: don't let Mission Control see it
             }
@@ -157,8 +157,7 @@ extension MissionControlController {
                 DispatchQueue.main.async { self.closeMenu() }
                 return false
             }
-            if let index = buttonIndexAt(x, y), let target = targets[index],
-               target.kind == "quit" || target.kind == "arrange" {
+            if let index = buttonIndexAt(x, y), let target = targets[index], target.kind.hasMenu {
                 swallowRightUp = true
                 DispatchQueue.main.async { self.dispatchButton(index, target, menu: true) }
                 return false
@@ -186,7 +185,7 @@ extension MissionControlController {
         let modifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
         if !event.flags.intersection(modifiers).isEmpty || menuOpen { return true }
         if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return true }
-        guard let action = Tuning.shortcutKeys[event.getIntegerValueField(.keyboardEventKeycode)],
+        guard let action = Settings.shortcutAction(forKeycode: event.getIntegerValueField(.keyboardEventKeycode)),
               let thumb = thumbAt(x, y) else { return true }
         let title = thumb.title
         DispatchQueue.main.async { self.shortcutAction(action, title) }
@@ -196,12 +195,12 @@ extension MissionControlController {
     /// The window thumbnail under the pointer that currently shows buttons.
     func thumbAt(_ x: Double, _ y: Double) -> Tile? {
         guard active else { return nil }
-        let titles = Set(targets.values.filter { $0.kind == "window" || $0.kind == "cancel" }.map { $0.title })
+        let titles = Set(targets.values.filter { $0.kind == .window || $0.kind == .cancel }.map { $0.title })
         return lastThumbs.first { $0.rect.contains(x, y) && titles.contains($0.title) }
     }
 
     /// Queue (or, pressed again, take back) a deferred window action.
-    func shortcutAction(_ action: String, _ title: String) {
+    func shortcutAction(_ action: WindowAction, _ title: String) {
         if let pending = deferredAction(for: title), pending.action == action {
             cancelDeferredAction(title)
             return
@@ -239,6 +238,15 @@ extension MissionControlController {
     @objc func hoverTick(_ timer: Timer?) {
         checkSceneTransform()
         let location = NSEvent.mouseLocation  // global, bottom-left origin
+        // A still cursor changes nothing here unless a dwell clock is running
+        // (a flyout opening, a hover-opened menu closing itself).
+        let waiting = hoverQuitSince != 0 || dockHoverSince != 0 || (menuOpen && menuViaHover)
+        if location == lastHoverLocation && !waiting && !hoverDirty {
+            hoverSkips += 1
+            return
+        }
+        lastHoverLocation = location
+        hoverDirty = false
         let x = Double(location.x)
         let yTop = (screenHeight ?? 0) - Double(location.y)
         lastMouseY = yTop
@@ -255,7 +263,7 @@ extension MissionControlController {
                 setSyncInterval(Tuning.syncIntervalFast)
             }
         }
-        if menuOpen && menuKind == "dock" {
+        if menuOpen && menuKind == .dock {
             // Sliding along the Dock moves the bubble to the icon now under
             // the pointer right away, like a menu bar.
             if let other = dockItemAt(x, yTop), other.title != menuTitle,
@@ -283,12 +291,12 @@ extension MissionControlController {
             hoverIndex = hit
         }
         updateQuitHover(hit)
-        if hit == nil { updateDockHover(x, yTop) }
+        if hit == nil && Settings.dockMenuEnabled { updateDockHover(x, yTop) }
     }
 
     /// Open a button's flyout when the cursor dwells on it.
     func updateQuitHover(_ hit: Int?) {
-        guard let hit = hit, let kind = targets[hit]?.kind, kind == "quit" || kind == "arrange" else {
+        guard let hit = hit, let kind = targets[hit]?.kind, kind.hasMenu else {
             hoverQuitIndex = nil
             hoverQuitSince = 0
             return
@@ -332,20 +340,20 @@ extension MissionControlController {
 
     @objc func openMenuFor(_ index: Int, viaHover: Bool = false) {
         guard let target = targets[index] else { return }
-        if target.kind == "quit" {
-            openMenu(index, "quit", UI.quitMenuItems, Tuning.quitMenuActions, viaHover: viaHover)
-        } else if target.kind == "arrange" {
+        if target.kind == .quit {
+            openMenu(index, .quit, UI.quitMenuItems, Tuning.quitMenuActions, viaHover: viaHover)
+        } else if target.kind == .arrange {
             if noMaxTitles.contains(target.title) {
                 // Fixed-size window: Maximize can't do anything.
-                openMenu(index, "arrange", Array(UI.arrangeMenuItems.prefix(2)),
+                openMenu(index, .arrange, Array(UI.arrangeMenuItems.prefix(2)),
                          Array(Tuning.arrangeMenuActions.prefix(2)), viaHover: viaHover)
             } else {
-                openMenu(index, "arrange", UI.arrangeMenuItems, Tuning.arrangeMenuActions, viaHover: viaHover)
+                openMenu(index, .arrange, UI.arrangeMenuItems, Tuning.arrangeMenuActions, viaHover: viaHover)
             }
         }
     }
 
-    func openMenu(_ index: Int?, _ kind: String, _ items: [UI.MenuItem], _ actions: [String],
+    func openMenu(_ index: Int?, _ kind: MenuKind, _ items: [UI.MenuItem], _ actions: [MenuAction],
                   viaHover: Bool = false, anchor: Rect? = nil, title anchorTitle: String? = nil) {
         var rect: Rect
         var title: String?
@@ -353,16 +361,17 @@ extension MissionControlController {
             rect = anchor  // a Dock icon, not a button
             title = anchorTitle
         } else {
-            guard let index = index, let entry = targets[index], let r = rects[index], entry.kind == kind else {
+            guard let index = index, let entry = targets[index], let r = rects[index],
+                  entry.kind.rawValue == kind.rawValue else {
                 return
             }
             rect = r
             title = entry.title
         }
         menuKind = kind
-        let caption = kind == "dock" ? title : nil
+        let caption = kind == .dock ? title : nil
         let width: Double
-        if kind == "dock" {
+        if kind == .dock {
             let longest = items.map { Double(UI.captionWidth($0.label)) }.max() ?? 0
             width = max(Tuning.dockMenuWidth, Double(UI.captionWidth(caption)) + 36, 42 + longest + 16)
         } else {
@@ -375,7 +384,7 @@ extension MissionControlController {
             ?? Rect(0, 0, screenWidth ?? 0, sh)
         let mx: Double
         var myTop: Double
-        if kind == "dock" {
+        if kind == .dock {
             // Centred ABOVE the Dock's own app-name label; the column down to
             // the icon counts as part of the menu for hover.
             mx = max(d.x + 2, min(rect.x + rect.w / 2 - width / 2, d.x + d.w - width - 2))
@@ -407,7 +416,7 @@ extension MissionControlController {
         menuView?.frame = NSRect(x: 0, y: 0, width: width, height: height)
         menuOpen = true
         panel.orderFrontRegardless()
-        Log.geom(String(format: "MENU(%@) open for '%@' at (%.0f,%.0f)", kind, title ?? "", mx, myTop))
+        Log.geom(String(format: "MENU(%@) open for '%@' at (%.0f,%.0f)", kind.rawValue, title ?? "", mx, myTop))
     }
 
     func menuPanelEnsure() -> NSPanel {
@@ -431,11 +440,14 @@ extension MissionControlController {
         let title = menuTitle
         let kind = menuKind, item = menuDock
         closeMenu()
-        if kind == "dock" {
-            if let action = action, let item = item { queueDockAction(action, item) }
-            return
+        switch action {
+        case .dock(let dockAction)?:
+            if kind == .dock, let item = item { queueDockAction(dockAction, item) }
+        case .window(let windowAction)?:
+            if let title = title, !title.isEmpty { deferWindowAction(windowAction, title) }
+        case nil:
+            break
         }
-        if let action = action, let title = title, !title.isEmpty { deferWindowAction(action, title) }
     }
 
     func closeMenu() {
@@ -501,20 +513,20 @@ extension MissionControlController {
             dockHoverSince = 0
             dockLatched = hovered
             menuDock = found
-            openMenu(nil, "dock", UI.dockMenuItems, Tuning.dockMenuActions, viaHover: true,
+            openMenu(nil, .dock, UI.dockMenuItems, Tuning.dockMenuActions, viaHover: true,
                      anchor: found.rect, title: found.title)
         }
     }
 
     /// Close-all / quit / force-quit the app when Mission Control exits; mark
     /// its windows meanwhile.
-    func queueDockAction(_ action: String, _ item: Tile) {
+    func queueDockAction(_ action: DockActionKind, _ item: Tile) {
         let pid = item.bundle.flatMap { ax.pidForBundle($0) } ?? ax.pidsNamed(item.title).first
-        Log.geom("DOCK \(action) '\(item.title)' pid=\(pid.map(String.init) ?? "nil")")
+        Log.geom("DOCK \(action.rawValue) '\(item.title)' pid=\(pid.map(String.init) ?? "nil")")
         guard let pid = pid else { return }
         dockActions.removeAll { $0.pid == pid }
         dockActions.append(DockAction(action: action, pid: pid, name: item.title))
-        let glyph = Tuning.dockGlyphs[action] ?? "⏻"
+        let glyph = action.glyph
         for thumb in lastThumbs where !thumb.title.isEmpty {
             if (item.bundle != nil && thumb.bundle == item.bundle) || ax.pidForTitle(thumb.title) == pid {
                 marked[thumb.title] = glyph
@@ -535,11 +547,11 @@ extension MissionControlController {
         for item in actions {
             let ok: Bool
             switch item.action {
-            case "forcequit": ok = ax.forceQuitPid(item.pid)
-            case "closeall": ok = ax.closeAllWindows(item.pid) > 0
-            default: ok = ax.quitPid(item.pid)
+            case .forceQuit: ok = ax.forceQuitPid(item.pid)
+            case .closeAll: ok = ax.closeAllWindows(item.pid) > 0
+            case .quit: ok = ax.quitPid(item.pid)
             }
-            Log.geom("DOCK apply \(item.action) '\(item.name)' -> \(ok)")
+            Log.geom("DOCK apply \(item.action.rawValue) '\(item.name)' -> \(ok)")
         }
     }
 }

@@ -106,7 +106,7 @@ func frame(_ c: MissionControlController, _ thumbs: [Tile], _ spaces: [Tile]? = 
     if let cg = cg { c.cgSig = cg }
     (c.ax as! StubAX).snapshot = (thumbs, spaces ?? [barTile()], 1)
     let (targets, marks) = c.collectTargets(nil)
-    return (targets.filter { $0.kind != "desktop" }, marks)
+    return (targets.filter { $0.kind != .desktop }, marks)
 }
 
 /// Backdate the settle candidate past settleConfirm.

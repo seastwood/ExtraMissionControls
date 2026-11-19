@@ -25,7 +25,7 @@ final class ActionIdentityTests: XCTestCase {
         ax.windowNumberValue = 7
         ax.button = fakeElement(3)
         let target = CapturedWindow(pid: 12, window: fakeElement(4), number: 7)
-        XCTAssertTrue(ax.performCapturedAction(target, "close"))
+        XCTAssertTrue(ax.performCapturedAction(target, .close))
         XCTAssertEqual(ax.events, ["raise", "press"])
         XCTAssertTrue(ax.findCalls.isEmpty, "must not search again")
     }
@@ -34,7 +34,7 @@ final class ActionIdentityTests: XCTestCase {
         let ax = StubAX()
         ax.windowNumberValue = 8
         ax.button = fakeElement(3)
-        XCTAssertFalse(ax.performCapturedAction(CapturedWindow(pid: 12, window: fakeElement(4), number: 7), "close"))
+        XCTAssertFalse(ax.performCapturedAction(CapturedWindow(pid: 12, window: fakeElement(4), number: 7), .close))
         XCTAssertFalse(ax.events.contains("press"))
     }
 
@@ -42,17 +42,17 @@ final class ActionIdentityTests: XCTestCase {
         let ax = StubAX()
         let target = CapturedWindow(pid: 12, window: fakeElement(4), number: 7)
         ax.attributeResult = (.success, "AXWindow" as CFString)
-        XCTAssertEqual(ax.capturedActionState(target, "close"), false)
+        XCTAssertEqual(ax.capturedActionState(target, .close), false)
         ax.attributeResult = (.invalidUIElement, nil)
-        XCTAssertEqual(ax.capturedActionState(target, "close"), true)
-        XCTAssertNil(ax.capturedActionState(target, "minimize"))
+        XCTAssertEqual(ax.capturedActionState(target, .close), true)
+        XCTAssertNil(ax.capturedActionState(target, .minimize))
         ax.attributeResult = (.success, kCFBooleanTrue)
-        XCTAssertEqual(ax.capturedActionState(target, "minimize"), true)
+        XCTAssertEqual(ax.capturedActionState(target, .minimize), true)
     }
 
     func testCancelDropsRetainedTarget() {
         let c = makeController()
-        c.deferredActions = [DeferredAction(action: "close", title: "Doc")]
+        c.deferredActions = [DeferredAction(action: .close, title: "Doc")]
         c.actionTargets["Doc"] = CapturedWindow(pid: 12, window: fakeElement(4), number: 7)
         c.actionStarted["Doc"] = 1
         c.deferredRetries["Doc"] = 1
@@ -66,7 +66,7 @@ final class ActionIdentityTests: XCTestCase {
         ax.actionCaps = WindowCaps(first: false, second: false)
         let c = makeController(ax)
         frame(c, [thumb()])
-        let kinds = frame(c, [thumb()]).targets.map { $0.kind }
+        let kinds = frame(c, [thumb()]).targets.map { $0.kind.rawValue }
         XCTAssertFalse(kinds.contains("window"))
         XCTAssertFalse(kinds.contains("minimize"))
         XCTAssertTrue(kinds.contains("quit"))
@@ -82,9 +82,9 @@ final class DeferredSpacesTests: XCTestCase {
         ax.closeResults = [false, true]
         ax.titlePid = 42
         let c = makeController(ax)
-        c.deferredActions = [DeferredAction(action: "close", title: "Desktop document")]
+        c.deferredActions = [DeferredAction(action: .close, title: "Desktop document")]
         c.applyDeferredActions()
-        XCTAssertEqual(c.deferredActions, [DeferredAction(action: "close", title: "Desktop document")])
+        XCTAssertEqual(c.deferredActions, [DeferredAction(action: .close, title: "Desktop document")])
         XCTAssertEqual(ax.activated, [42])
         XCTAssertTrue(c.tlQueue.isEmpty)
         c.applyDeferredActions()

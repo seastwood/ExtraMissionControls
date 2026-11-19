@@ -635,10 +635,10 @@ class AXBridge {
         return frames
     }
 
-    /// Toggle Show Desktop: "dock" posts the Dock notification (falls back to
-    /// the shortcut); "key" presses the user's Show Desktop shortcut.
-    func showDesktop(method: String) -> Bool {
-        if method == "dock", PrivateAPI.coreDockNotify("com.apple.showdesktop.awake") {
+    /// Toggle Show Desktop: via the Dock notification (falling back to the
+    /// shortcut), or by pressing the user's Show Desktop shortcut.
+    func showDesktop(viaDock: Bool) -> Bool {
+        if viaDock, PrivateAPI.coreDockNotify("com.apple.showdesktop.awake") {
             return true
         }
         guard let hotkey = showDesktopHotkey() else { return false }
@@ -782,9 +782,9 @@ class AXBridge {
     }
 
     /// Act on the retained window, never a replacement with the same title.
-    func performCapturedAction(_ target: CapturedWindow, _ action: String) -> Bool {
+    func performCapturedAction(_ target: CapturedWindow, _ action: WindowAction) -> Bool {
         if let number = target.number, windowNumber(target.window) != number { return false }
-        let attr = action == "close" ? "AXCloseButton" : "AXMinimizeButton"
+        let attr = action == .close ? "AXCloseButton" : "AXMinimizeButton"
         guard let button = buttonOf(target.window, attr), AX.bool(button, "AXEnabled") != false else {
             return false
         }
@@ -794,12 +794,12 @@ class AXBridge {
 
     /// true = observed completion, false = still pending, nil = unreadable.
     /// Never infer a close from an empty AXWindows list: off-Space apps hide it.
-    func capturedActionState(_ target: CapturedWindow, _ action: String) -> Bool? {
-        let attr = action == "minimize" ? "AXMinimized" : "AXRole"
+    func capturedActionState(_ target: CapturedWindow, _ action: WindowAction) -> Bool? {
+        let attr = action == .minimize ? "AXMinimized" : "AXRole"
         let (err, value) = copyAttribute(target.window, attr)
-        if action == "close" && err == .invalidUIElement { return true }
+        if action == .close && err == .invalidUIElement { return true }
         guard err == .success else { return nil }
-        if action == "minimize" {
+        if action == .minimize {
             if let value = value, CFGetTypeID(value) == CFBooleanGetTypeID() {
                 return CFBooleanGetValue((value as! CFBoolean))
             }
@@ -1053,7 +1053,7 @@ class AXBridge {
 
     /// The AX frame for a snap region of the screen the window sits on, using
     /// that screen's *visible* area (clear of the menu bar and the Dock).
-    func snapFrame(_ region: String, _ win: Rect) -> Rect? {
+    func snapFrame(_ region: SnapRegion, _ win: Rect) -> Rect? {
         let screens = NSScreen.screens
         guard let primary = screens.first else { return nil }
         let primaryH = Double(primary.frame.height)
@@ -1064,15 +1064,15 @@ class AXBridge {
         let chosen = screens.first { toAX($0.frame).contains(cx, cy) } ?? primary
         let v = toAX(chosen.visibleFrame)
         switch region {
-        case "left": return Rect(v.x, v.y, v.w / 2, v.h)
-        case "right": return Rect(v.x + v.w / 2, v.y, v.w / 2, v.h)
-        default: return v  // 'max' — whole visible area (not macOS full screen)
+        case .left: return Rect(v.x, v.y, v.w / 2, v.h)
+        case .right: return Rect(v.x + v.w / 2, v.y, v.w / 2, v.h)
+        case .max: return v  // whole visible area (not macOS full screen)
         }
     }
 
     /// Move+resize the window matching a thumbnail title to a region of its
     /// screen's visible area. Best-effort.
-    func snapWindowByTitle(_ title: String, _ pids: [pid_t], _ region: String) -> Bool {
+    func snapWindowByTitle(_ title: String, _ pids: [pid_t], _ region: SnapRegion) -> Bool {
         guard let window = findWindowByTitle(title, pids), let frame = AX.frame(of: window),
               let target = snapFrame(region, frame) else { return false }
         var point = CGPoint(x: target.x, y: target.y)
@@ -1090,7 +1090,7 @@ class AXBridge {
     // Native macOS tiling (macOS 15+): Window ▸ Move & Resize ▸ Left/Right/Fill.
     static let tileWindowMenu = ["Window"]
     static let tileSubmenu = ["Move & Resize"]
-    static let tileLeaf: [String: [String]] = ["left": ["Left"], "right": ["Right"], "max": ["Fill", "Maximize"]]
+    static let tileLeaf: [SnapRegion: [String]] = [.left: ["Left"], .right: ["Right"], .max: ["Fill", "Maximize"]]
 
     private func submenuItems(_ element: AXUIElement) -> [AXUIElement] {
         for child in AX.children(element) where AX.string(child, "AXRole") == "AXMenu" {
@@ -1121,17 +1121,59 @@ class AXBridge {
     }
 
     /// Press the native tiling menu leaf for the app's focused window.
-    func tileFocusedApp(_ pid: pid_t, _ region: String) -> Bool {
+    func tileFocusedApp(_ pid: pid_t, _ region: SnapRegion) -> Bool {
         guard let leafTitles = Self.tileLeaf[region], pid != 0 else { return false }
         let app = AX.app(pid)
-        guard let menuBar = AX.child(app, "AXMenuBar"),
-              let windowMenu = menuItem(AX.children(menuBar), Self.tileWindowMenu) else { return false }
-        let items = submenuItems(windowMenu)
-        var candidates: [AXUIElement] = []
-        if let submenu = menuItem(items, Self.tileSubmenu) { candidates += submenuItems(submenu) }
-        candidates += items
+        guard let menuBar = AX.child(app, "AXMenuBar") else { return false }
+        let topLevel = AX.children(menuBar)
         // Don't pre-check AXEnabled: right after activation the item may still
         // read disabled; AXPress fails on a truly disabled item.
-        return AX.press(menuItem(candidates, leafTitles))
+        if let windowMenu = menuItem(topLevel, Self.tileWindowMenu) {
+            let items = submenuItems(windowMenu)
+            var candidates: [AXUIElement] = []
+            if let submenu = menuItem(items, Self.tileSubmenu) { candidates += submenuItems(submenu) }
+            candidates += items
+            if let leaf = menuItem(candidates, leafTitles) { return AX.press(leaf) }
+        }
+        // Other languages: find the Window menu by its ⌘M Minimize item, then
+        // the tile item by its keyboard shortcut (⌃fn← / ⌃fn→ / ⌃fnF).
+        guard let windowMenu = topLevel.first(where: { menu in
+            submenuItems(menu).contains { Self.shortcut(of: $0) == .commandM }
+        }), let leaf = Self.findTileItem(in: windowMenu, region, depth: 0, submenuItems) else { return false }
+        Log.geom("ARRANGE found '\(AX.string(leaf, "AXTitle") ?? "?")' by shortcut")
+        return AX.press(leaf)
+    }
+
+    enum MenuShortcut: Equatable {
+        case commandM, tileLeft, tileRight, tileFill, other
+    }
+
+    // kAXMenuItemModifier flags: Shift 1, Option 2, Control 4, No Command 8.
+    // Arrow keys show up as a virtual key code (123/124) or a menu glyph
+    // (kMenuLeftArrowGlyph 0x64 / kMenuRightArrowGlyph 0x65).
+    static func shortcut(of item: AXUIElement) -> MenuShortcut {
+        let vals = AX.multi(item, ["AXMenuItemCmdChar", "AXMenuItemCmdModifiers",
+                                   "AXMenuItemCmdVirtualKey", "AXMenuItemCmdGlyph"])
+        let char = (vals["AXMenuItemCmdChar"] as? String)?.uppercased()
+        let mods = (vals["AXMenuItemCmdModifiers"] as? NSNumber)?.intValue ?? 0
+        let key = (vals["AXMenuItemCmdVirtualKey"] as? NSNumber)?.intValue
+        let glyph = (vals["AXMenuItemCmdGlyph"] as? NSNumber)?.intValue
+        if char == "M" && mods == 0 { return .commandM }
+        let controlOnly = mods & 4 != 0 && mods & 8 != 0 && mods & 3 == 0
+        guard controlOnly else { return .other }
+        if key == 123 || glyph == 0x64 { return .tileLeft }
+        if key == 124 || glyph == 0x65 { return .tileRight }
+        if char == "F" { return .tileFill }
+        return .other
+    }
+
+    static func findTileItem(in element: AXUIElement, _ region: SnapRegion, depth: Int,
+                             _ children: (AXUIElement) -> [AXUIElement]) -> AXUIElement? {
+        let wanted: MenuShortcut = region == .left ? .tileLeft : region == .right ? .tileRight : .tileFill
+        for item in children(element) {
+            if shortcut(of: item) == wanted { return item }
+            if depth < 2, let found = findTileItem(in: item, region, depth: depth + 1, children) { return found }
+        }
+        return nil
     }
 }

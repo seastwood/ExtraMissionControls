@@ -25,6 +25,8 @@ on macOS 27, and the macOS 26 section if you still support 26.
 - [ ] Colors toggle: traffic-light hues on/off
 - [ ] Open at Login: turn on, log out and in, app starts once (not twice); turn off works
 - [ ] Restart relaunches a single copy
+- [ ] Settings… opens the Settings window in front; every toggle, the size slider and the key pickers take effect the next time Mission Control opens
+- [ ] Hiding a button leaves no gap in the row; Show Desktop and the Dock menu can be turned off
 - [ ] Quit quits
 - [ ] Launching a second copy replaces the first (no duplicate tray icons)
 
@@ -40,7 +42,7 @@ on macOS 27, and the macOS 26 section if you still support 26.
 - [ ] Opening Mission Control from a full-screen app: no stray buttons on the zoom
 - [ ] Empty desktop: no buttons; fullscreen previews have no EMC controls
 - [ ] Sleep and wake (lid closed for a while): still works afterwards
-- [ ] Sitting in Mission Control: CPU stays low (`scripts/diag_cpu.py` or Activity Monitor), compare with the Python app
+- [ ] Sitting in Mission Control: CPU stays low in Activity Monitor (compare with the Python app from an older release)
 
 ## Buttons (use disposable windows)
 
@@ -70,8 +72,15 @@ on macOS 27, and the macOS 26 section if you still support 26.
 - [ ] ❏ exits full screen without leaving Mission Control
 - [ ] Split View ✕2 closes both apps
 
+## New in the Swift app
+
+- [ ] After a few Mission Control openings, an `EMC_DEBUG=1` run logs `OBSERVER trusted`; openings still feel instant afterwards
+- [ ] Crash recovery: `kill -SEGV $(pgrep -x ExtraMissionControls)` relaunches the app within ~2s; Show Crash Reports… appears and reveals the report; four crashes inside 2 minutes stop relaunching
+- [ ] Arrange on a non-English macOS language (or note it as untested)
+
 ## Release
 
 - [ ] Update notifier: with an older version number, the red dot and "Update Available" appear; Ignore hides them
 - [ ] Bump `EMCVersion.fallback` in `Sources/EMCCore/Log.swift` (the build script reads it)
-- [ ] Decide when the Swift app replaces the Python one on `main` and in the README
+- [ ] Add the release secrets (swift/README.md → Releases), push the tag, and test the draft release's DMG before publishing
+- [ ] If Sparkle is set up: install the previous release, publish the new one, and check that Check for Updates… installs it

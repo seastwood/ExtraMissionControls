@@ -26,47 +26,49 @@ extension MissionControlController {
         // Whatever follows must show on the very next frame: bust the quiet skip.
         watchSig = nil
         switch kind {
-        case "cancel":
+        case .cancel:
             cancelDeferredAction(title)
             return
-        case "desktop":
+        case .desktop:
             showDesktopFromMC()
             return
         default:
             break
         }
-        Log.geom("CLICK \(kind) on '\(title)'")
-        if ["fullscreen", "unfullscreen", "makefullscreen", "splitall"].contains(kind) {
+        Log.geom("CLICK \(kind.rawValue) on '\(title)'")
+        if [.fullscreen, .unfullscreen, .makeFullscreen, .splitAll].contains(kind) {
             // Each switches spaces / runs a full-screen animation; overlapping
             // them wedged macOS 27's WindowManager. One at a time.
             if Clock.now() < fsBusyUntil {
-                Log.geom("UNFULLSCREEN busy: ignored \(kind) on '\(title)'")
+                Log.geom("UNFULLSCREEN busy: ignored \(kind.rawValue) on '\(title)'")
                 return
             }
             fsBusyUntil = Clock.now() + Tuning.fsActionGap
         }
         switch kind {
-        case "fullscreen": closeFullscreen(index, title, element)
-        case "splitall": closeSplitAll(index, title, element)
-        case "unfullscreen": unfullscreenTile(index, title, element)
-        case "makefullscreen": makeFullscreen(index, title, element)
-        case "minimize": deferWindowAction("minimize", title)
+        case .fullscreen: closeFullscreen(index, title, element)
+        case .splitAll: closeSplitAll(index, title, element)
+        case .unfullscreen: unfullscreenTile(index, title, element)
+        case .makeFullscreen: makeFullscreen(index, title, element)
+        case .minimize: deferWindowAction(.minimize, title)
         // Quit the whole app (⌘Q), deferred like a close so it leaves no ghost.
-        case "quit": deferWindowAction("quit", title)
+        case .quit: deferWindowAction(.quit, title)
         // Closing a windowed thumbnail WHILE Mission Control is open leaves a
         // ghost thumbnail the Dock never removes, so defer it to MC exit.
-        default: deferWindowAction("close", title)
+        case .window: deferWindowAction(.close, title)
+        // Arrange has no default action (its click opens the menu).
+        case .arrange, .cancel, .desktop: break
         }
     }
 
     /// Queue a window action to run when Mission Control exits. The buttons
     /// vanish now and the thumbnail gets a dim scrim glyph.
-    func deferWindowAction(_ action: String, _ title: String) {
+    func deferWindowAction(_ action: WindowAction, _ title: String) {
         // No action can resolve an untitled window; queueing one could only
         // ever mis-target.
         guard !title.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         let caps = ax.actionCapsFor(ax.pidForTitle(title), title)
-        if (action == "close" && !caps.first) || (action == "minimize" && !caps.second) { return }
+        if (action == .close && !caps.first) || (action == .minimize && !caps.second) { return }
         if title.contains(AXBridge.keySep) && ax.pinned[title] == nil { pinSameTitled(title) }
         if title.contains(AXBridge.keySep) && ax.pinned[title] == nil {
             Log.geom("REFUSED ambiguous window '\(title)'")
@@ -79,9 +81,9 @@ extension MissionControlController {
         deferredActions.removeAll { $0.title == title }
         deferredActions.append(DeferredAction(action: action, title: title))
         deferredRetries[title] = nil
-        marked[title] = Tuning.markGlyphs[action] ?? "✕"
+        marked[title] = action.markGlyph
         for (i, t) in targets where t.title == title { dropButton(i) }
-        Log.geom("DEFER \(action) window='\(title)' (applies on MC exit)")
+        Log.geom("DEFER \(action.rawValue) window='\(title)' (applies on MC exit)")
     }
 
     /// Pin every thumbnail of this key's app to its real window by layout
@@ -149,7 +151,7 @@ extension MissionControlController {
             cancelled = true
         }
         marked[title] = nil
-        for (i, t) in targets where t.kind == "cancel" && t.title == title { dropButton(i) }
+        for (i, t) in targets where t.kind == .cancel && t.title == title { dropButton(i) }
         if cancelled { Log.geom("CANCEL pending action for '\(title)'") }
     }
 
@@ -174,25 +176,27 @@ extension MissionControlController {
             let target = actionTargets[title]
             let dispatchedAt = Clock.monotonic()
             var ok: Bool
-            if let target = target, action == "close" || action == "minimize" {
+            if let target = target, action.isWindowButton {
                 ok = ax.performCapturedAction(target, action)
-            } else if action == "minimize" {
-                ok = ax.minimizeWindowByTitle(title, pids, foreground: true) || pressHeldButton(title, infos, close: false)
-            } else if action == "quit" {
-                ok = quitAppFor(title, infos)
-            } else if action == "forcequit" {
-                ok = quitAppFor(title, infos, level: "force")
-            } else if action == "kill" {
-                ok = quitAppFor(title, infos, level: "kill")
-            } else if let region = ["snapleft": "left", "snapright": "right", "snapmax": "max"][action] {
+            } else if let region = action.region {
                 // Staged by processArrangeQueue: native tiling needs the app
                 // frontmost, and back-to-back tiles collided.
                 arrangeQueue.append((region, title))
                 ok = true
             } else {
-                ok = ax.closeWindowByTitle(title, pids, foreground: true) || pressHeldButton(title, infos, close: true)
+                switch action {
+                case .minimize:
+                    ok = ax.minimizeWindowByTitle(title, pids, foreground: true)
+                        || pressHeldButton(title, infos, close: false)
+                case .quit: ok = quitAppFor(title, infos)
+                case .forceQuit: ok = quitAppFor(title, infos, level: .force)
+                case .kill: ok = quitAppFor(title, infos, level: .kill)
+                default:
+                    ok = ax.closeWindowByTitle(title, pids, foreground: true)
+                        || pressHeldButton(title, infos, close: true)
+                }
             }
-            if !ok && (action == "close" || action == "minimize") {
+            if !ok && action.isWindowButton {
                 let attempts = deferredRetries[title] ?? 0
                 if attempts < 8, let pid = target?.pid ?? ax.pidForTitle(title) {
                     // Off-Space apps may hide their AX windows until activated.
@@ -203,7 +207,7 @@ extension MissionControlController {
                 }
             }
             deferredRetries[title] = nil
-            if !ok && (action == "close" || action == "minimize") && target == nil && ax.pinned[title] == nil {
+            if !ok && action.isWindowButton && target == nil && ax.pinned[title] == nil {
                 // AX-opaque window (Steam etc.): fall back to a synthetic click
                 // on the native traffic light. Never retarget a captured one.
                 if let info = matchWindowInfo(title, ax.listWindows(excludePid: ownPid)) {
@@ -212,12 +216,12 @@ extension MissionControlController {
             }
             let started = actionStarted.removeValue(forKey: title) ?? dispatchedAt
             actionTargets[title] = nil
-            Log.geom(String(format: "ACTION-TIMING %@ '%@' queued=%.3fs dispatch=%.3fs accepted=%@", action, title,
+            Log.geom(String(format: "ACTION-TIMING %@ '%@' queued=%.3fs dispatch=%.3fs accepted=%@", action.rawValue, title,
                             dispatchedAt - started, Clock.monotonic() - dispatchedAt, ok ? "true" : "false"))
-            if ok, let target = target, action == "close" || action == "minimize" {
+            if ok, let target = target, action.isWindowButton {
                 actionVerifications.append((target, action, title, Clock.monotonic()))
             } else if !ok {
-                Log.note("could not apply \(action) to '\(title)'")
+                Log.note("could not apply \(action.rawValue) to '\(title)'")
             }
         }
         if !actionVerifications.isEmpty {
@@ -230,18 +234,18 @@ extension MissionControlController {
     }
 
     @objc func verifyWindowActions() {
-        var pending: [(target: CapturedWindow, action: String, title: String, started: Double)] = []
+        var pending: [(target: CapturedWindow, action: WindowAction, title: String, started: Double)] = []
         for v in actionVerifications {
             let state = ax.capturedActionState(v.target, v.action)
             let elapsed = Clock.monotonic() - v.started
             if state == true {
-                Log.geom(String(format: "ACTION-VERIFIED %@ '%@' after %.3fs", v.action, v.title, elapsed))
+                Log.geom(String(format: "ACTION-VERIFIED %@ '%@' after %.3fs", v.action.rawValue, v.title, elapsed))
             } else if elapsed < 2.0 {
                 pending.append(v)
             } else {
                 // A save sheet or inaccessible window is not a reason to repeat
                 // a close, dismiss a dialog, or click another window.
-                Log.note("\(v.action) not confirmed for '\(v.title)' (may need attention)")
+                Log.note("\(v.action.rawValue) not confirmed for '\(v.title)' (may need attention)")
             }
         }
         actionVerifications = pending
@@ -266,21 +270,21 @@ extension MissionControlController {
             arrangeCurrent = nil
             var ok = current.pid.map { ax.tileFocusedApp($0, current.region) } ?? false
             if !ok { ok = ax.snapWindowByTitle(current.title, current.pids, current.region) }
-            Log.geom("ARRANGE \(current.region) '\(current.title)' -> \(ok)")
+            Log.geom("ARRANGE \(current.region.rawValue) '\(current.title)' -> \(ok)")
         }
         if !arrangeQueue.isEmpty { schedule(#selector(processArrangeQueue), after: 0.5) }
     }
 
-    /// Quit the app owning the thumbnail, by pid: "graceful" ⌘Q, "force"
-    /// Force Quit, "kill" SIGKILL.
-    func quitAppFor(_ title: String, _ infos: [WindowInfo], level: String = "graceful") -> Bool {
+    /// Quit the app owning the thumbnail, by pid: graceful ⌘Q, force (Force
+    /// Quit), or kill (SIGKILL).
+    func quitAppFor(_ title: String, _ infos: [WindowInfo], level: QuitLevel = .graceful) -> Bool {
         let pid = ax.pidForTitle(title) ?? matchWindowInfo(title, infos)?.pid
-        Log.geom("APPLY-DEFERRED quit(\(level)) '\(title)' pid=\(pid.map(String.init) ?? "nil")")
+        Log.geom("APPLY-DEFERRED quit(\(level.rawValue)) '\(title)' pid=\(pid.map(String.init) ?? "nil")")
         guard let pid = pid else { return false }
         switch level {
-        case "force": return ax.forceQuitPid(pid)
-        case "kill": return ax.killPid(pid)
-        default: return ax.quitPid(pid)
+        case .force: return ax.forceQuitPid(pid)
+        case .kill: return ax.killPid(pid)
+        case .graceful: return ax.quitPid(pid)
         }
     }
 
@@ -307,9 +311,9 @@ extension MissionControlController {
         if !tlQueue.isEmpty { tlQueue.removeFirst() }
         if let p = pending {
             // Close ~x+20, minimize ~x+40, ~19px below the top edge.
-            let cx = p.x + (p.action == "minimize" ? 40 : 20), cy = p.y + 19
+            let cx = p.x + (p.action == .minimize ? 40 : 20), cy = p.y + 19
             clickAt(cx, cy)
-            Log.geom(String(format: "TRAFFIC-LIGHT %@ '%@' at (%.0f,%.0f)", p.action, p.title, cx, cy))
+            Log.geom(String(format: "TRAFFIC-LIGHT %@ '%@' at (%.0f,%.0f)", p.action.rawValue, p.title, cx, cy))
         }
         if !tlQueue.isEmpty { schedule(#selector(processTrafficLightQueue), after: 0.4) }
     }
@@ -346,7 +350,7 @@ extension MissionControlController {
     @discardableResult
     func clickAppClose(_ appName: String) -> Bool {
         guard let info = matchWindowInfo(appName, ax.listWindows(excludePid: ownPid)) else { return false }
-        tlQueue.append(("close", appName, info.pid, info.x, info.y))
+        tlQueue.append((.close, appName, info.pid, info.x, info.y))
         schedule(#selector(processTrafficLightQueue), after: 0.05)
         return true
     }
@@ -617,7 +621,7 @@ extension MissionControlController {
             return
         }
         desktopBefore = ax.appWindowFrames()
-        let sent = ax.showDesktop(method: "dock")
+        let sent = ax.showDesktop(viaDock: true)
         Log.geom("DESKTOP dock sent=\(sent) windows=\(desktopBefore.count)")
         schedule(#selector(showDesktopVerify), after: 0.8)
     }
@@ -628,7 +632,7 @@ extension MissionControlController {
         let moved = desktopBefore.filter { after[$0.key] != $0.value }.count
         Log.geom("DESKTOP verify moved=\(moved)/\(desktopBefore.count)")
         if !desktopBefore.isEmpty && moved == 0 {
-            Log.geom("DESKTOP shortcut sent=\(ax.showDesktop(method: "key"))")
+            Log.geom("DESKTOP shortcut sent=\(ax.showDesktop(viaDock: false))")
         }
     }
 

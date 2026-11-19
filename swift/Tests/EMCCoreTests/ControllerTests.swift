@@ -196,11 +196,11 @@ final class UntitledFilterTests: XCTestCase {
         XCTAssertTrue(c.untitled(Tile(title: "")))
         XCTAssertTrue(c.untitled(Tile(title: "  ")))
         XCTAssertFalse(c.untitled(Tile(title: "Songs")))
-        c.deferWindowAction("close", "")
-        c.deferWindowAction("quit", "   ")
+        c.deferWindowAction(.close, "")
+        c.deferWindowAction(.quit, "   ")
         XCTAssertTrue(c.deferredActions.isEmpty && c.marked.isEmpty, "empty-title actions are refused")
-        c.deferWindowAction("close", "Songs")
-        XCTAssertEqual(c.deferredActions, [DeferredAction(action: "close", title: "Songs")])
+        c.deferWindowAction(.close, "Songs")
+        XCTAssertEqual(c.deferredActions, [DeferredAction(action: .close, title: "Songs")])
         XCTAssertEqual(c.marked["Songs"], "✕")
         XCTAssertFalse(AXBridge.titlesRelated("", "Songs"))
         XCTAssertFalse(AXBridge.titlesRelated("Songs", ""))
@@ -224,7 +224,7 @@ final class InputDispatchTests: XCTestCase {
     func testQueuedClicksNeverActOnReplacements() {
         let c = RecordingController(ax: StubAX())
         c.active = true
-        let target = ButtonTarget(kind: "window", title: "Original", element: nil)
+        let target = ButtonTarget(kind: .window, title: "Original", element: nil)
         c.targets = [0: target]
         c.rects = [0: Rect(100, 100, 24, 24)]
         c.dispatchButton(0, target, menu: false)
@@ -232,7 +232,7 @@ final class InputDispatchTests: XCTestCase {
         XCTAssertEqual(c.calls, ["close 0", "menu 0"])
         c.calls = []
 
-        c.targets[0] = ButtonTarget(kind: "window", title: "Replacement", element: nil)
+        c.targets[0] = ButtonTarget(kind: .window, title: "Replacement", element: nil)
         c.dispatchButton(0, target, menu: false)
         c.dispatchButton(0, target, menu: true)
         XCTAssertTrue(c.calls.isEmpty, "a queued click must never act on a replacement window")
@@ -250,7 +250,7 @@ final class InputDispatchTests: XCTestCase {
 
     func testUndoBypassesQuietHeartbeat() {
         let c = makeController()
-        c.deferredActions = [DeferredAction(action: "close", title: "Original")]
+        c.deferredActions = [DeferredAction(action: .close, title: "Original")]
         c.marked = ["Original": "✕"]
         c.watchSig = [WindowSig(number: 1, x: 100, y: 100, w: 400, h: 300)]
         c.cancelDeferredAction("Original")
@@ -260,9 +260,9 @@ final class InputDispatchTests: XCTestCase {
 
     func testShortcutTogglesDeferredAction() {
         let c = makeController()
-        c.shortcutAction("close", "Doc")
-        XCTAssertEqual(c.deferredActions.map { $0.action }, ["close"])
-        c.shortcutAction("close", "Doc")
+        c.shortcutAction(.close, "Doc")
+        XCTAssertEqual(c.deferredActions.map { $0.action.rawValue }, ["close"])
+        c.shortcutAction(.close, "Doc")
         XCTAssertTrue(c.deferredActions.isEmpty, "pressing the same key again takes it back")
     }
 }
